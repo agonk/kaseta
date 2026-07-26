@@ -172,23 +172,39 @@ impl Track {
         self.chunks.iter().filter_map(|c| c.sample_count).sum()
     }
 
+    /// Nanoseconds during which this track was actually capturing.
+    ///
+    /// Wall time spanned by the track, minus every hole in it. Dropped audio and
+    /// a miscounting clock are unrelated failures with unrelated fixes, so time
+    /// the device was not delivering must not be charged against its rate.
+    pub fn capturing_ns(&self) -> Option<u64> {
+        let first = self.chunks.first()?;
+        let last = self.chunks.last()?;
+        let spanned = last.boottime_end_ns.checked_sub(first.boottime_start_ns)?;
+        let missing: u64 = self.chunks.iter().map(|c| c.gap_before_ns).sum();
+        Some(spanned.saturating_sub(missing))
+    }
+
+    /// Total audio known to be missing from this track.
+    pub fn missing_ns(&self) -> u64 {
+        self.chunks.iter().map(|c| c.gap_before_ns).sum()
+    }
+
     /// Measured sample rate implied by the canonical clock, compared against the
     /// rate the device claims. A meaningful gap between the two is drift.
     ///
     /// Returns `None` for tracks with no timed samples, e.g. a video track or a
     /// track that captured nothing.
     pub fn observed_sample_rate_hz(&self) -> Option<f64> {
-        let first = self.chunks.first()?;
-        let last = self.chunks.last()?;
-        let elapsed_ns = last.boottime_end_ns.checked_sub(first.boottime_start_ns)?;
-        if elapsed_ns == 0 {
+        let capturing_ns = self.capturing_ns()?;
+        if capturing_ns == 0 {
             return None;
         }
         let samples = self.sample_count();
         if samples == 0 {
             return None;
         }
-        Some(samples as f64 / (elapsed_ns as f64 / 1e9))
+        Some(samples as f64 / (capturing_ns as f64 / 1e9))
     }
 
     /// Accumulated drift against the nominal rate over the whole track.
@@ -417,6 +433,53 @@ mod tests {
         assert!(
             drift.offset_ms > 400.0,
             "expected roughly 500 ms of drift, got {}",
+            drift.offset_ms
+        );
+        assert!(drift.requires_resample());
+    }
+
+    #[test]
+    fn a_dropout_is_not_reported_as_clock_drift() {
+        // Sixty seconds of audio whose span includes a 21 ms hole. Charging the
+        // hole against the device's rate would report ~21 ms of drift on a clock
+        // that is actually keeping perfect time.
+        let rate = 48_000u32;
+        let mut first = chunk(0, rate as u64 * 30, 0, 30_000_000_000);
+        first.gap_before_ns = 0;
+
+        let mut second = chunk(1, rate as u64 * 30, 30_021_000_000, 60_021_000_000);
+        second.discontinuity = true;
+        second.gap_before_ns = 21_000_000;
+
+        let t = track_with(rate, vec![first, second]);
+
+        assert_eq!(t.missing_ns(), 21_000_000);
+        let drift = t.drift().unwrap();
+        assert!(
+            drift.offset_ms.abs() < 1.0,
+            "a clean clock with a dropout must not report drift, got {} ms",
+            drift.offset_ms
+        );
+        assert!(!drift.requires_resample());
+    }
+
+    #[test]
+    fn genuine_drift_is_still_detected_alongside_a_dropout() {
+        // Same hole, but the device also delivered 0.5 s too few samples.
+        let rate = 48_000u32;
+        let mut first = chunk(0, rate as u64 * 30, 0, 30_000_000_000);
+        first.gap_before_ns = 0;
+
+        let mut second = chunk(1, rate as u64 * 30 - 24_000, 30_021_000_000, 60_521_000_000);
+        second.discontinuity = true;
+        second.gap_before_ns = 21_000_000;
+
+        let t = track_with(rate, vec![first, second]);
+        let drift = t.drift().unwrap();
+
+        assert!(
+            drift.offset_ms > 400.0,
+            "expected roughly 500 ms of real drift, got {} ms",
             drift.offset_ms
         );
         assert!(drift.requires_resample());

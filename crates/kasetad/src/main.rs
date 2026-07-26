@@ -252,7 +252,11 @@ fn cmd_record(seconds: u64) -> Result<()> {
         // nothing, so byte counts cannot tell them apart.
         if let Some(o) = outcome.tracks.iter().find(|o| o.track_id == track.track_id) {
             if o.peak_level <= 0.0 {
-                println!("    peak  SILENT — no signal reached this track");
+                // Every sample was exactly zero. A live input always carries a
+                // noise floor, so this means the source is muted or the wrong
+                // device was opened — not that the room was quiet.
+                println!("    peak  SILENT — every sample was zero");
+                println!("          the source is muted or this is the wrong device");
             } else {
                 let dbfs = 20.0 * o.peak_level.log10();
                 println!("    peak  {:.1} dBFS", dbfs);
@@ -265,7 +269,10 @@ fn cmd_record(seconds: u64) -> Result<()> {
             }
         }
         if gaps > 0 {
-            println!("    {gaps} discontinuit(ies) — audio went missing");
+            println!(
+                "    {gaps} discontinuit(ies), {:.1} ms of audio missing",
+                track.missing_ns() as f64 / 1e6
+            );
         }
         if track.chunks.is_empty() {
             println!("    NO AUDIO CAPTURED");
