@@ -106,6 +106,8 @@ pub struct ChunkWriter {
     pending_gap_ns: u64,
     /// Arrival time of the previous buffer, for gap detection.
     last_arrival_ns: Option<u64>,
+    /// Loudest absolute sample observed across the whole track.
+    peak: i16,
 }
 
 impl ChunkWriter {
@@ -122,6 +124,7 @@ impl ChunkWriter {
             pending_discontinuity: false,
             pending_gap_ns: 0,
             last_arrival_ns: None,
+            peak: 0,
         }
     }
 
@@ -133,6 +136,42 @@ impl ChunkWriter {
     #[allow(dead_code)]
     pub fn pending_frames(&self) -> usize {
         self.pending.len() / self.config.channels.max(1) as usize
+    }
+
+    /// Loudest sample seen so far, as a fraction of full scale.
+    ///
+    /// Distinguishes "recorded silence" from "recorded nothing", which are
+    /// otherwise indistinguishable: a silent track and a correctly captured one
+    /// both produce chunks, and FLAC compresses silence to almost nothing.
+    pub fn peak_level(&self) -> f32 {
+        self.peak as f32 / i16::MAX as f32
+    }
+
+    /// Adopts a new format mid-stream, sealing whatever is buffered.
+    ///
+    /// A Bluetooth headset switching between its playback and headset profiles
+    /// renegotiates the stream format while recording. The sequence counter must
+    /// survive that: restarting it at zero would target keys that already hold
+    /// different audio, and the storage layer refuses to overwrite them.
+    ///
+    /// The buffered remainder is sealed under the *old* format before switching,
+    /// because its samples were captured at the old rate. The next chunk is
+    /// marked discontinuous, since the two formats do not join seamlessly.
+    pub fn reconfigure(&mut self, config: ChunkConfig) -> Result<Option<SealedChunk>> {
+        let tail = self.flush()?;
+
+        self.config = config;
+        self.pending = Vec::with_capacity(self.config.samples_per_chunk());
+        self.pending_start_ns = None;
+        self.pending_end_ns = 0;
+        self.pending_pts_start_ns = None;
+        self.pending_pts_end_ns = None;
+        self.last_arrival_ns = None;
+        // `next_seq` is deliberately preserved.
+        self.pending_discontinuity = true;
+        self.pending_gap_ns = 0;
+
+        Ok(tail)
     }
 
     /// Accepts a buffer, sealing and returning chunks as they fill.
@@ -157,6 +196,10 @@ impl ChunkWriter {
         self.pending_pts_end_ns = buffer.source_pts_ns.or(self.pending_pts_end_ns);
         self.last_arrival_ns = Some(buffer.arrived_at_ns);
 
+        for sample in buffer.samples {
+            // `saturating_abs` keeps i16::MIN from wrapping to a negative peak.
+            self.peak = self.peak.max(sample.saturating_abs());
+        }
         self.pending.extend_from_slice(buffer.samples);
 
         let mut sealed = Vec::new();
@@ -472,6 +515,108 @@ mod tests {
         assert_eq!(
             sealed[0].sample_count, 48_000,
             "sample_count is frames, not interleaved samples"
+        );
+    }
+
+    #[test]
+    fn a_format_change_does_not_restart_the_sequence_counter() {
+        // A Bluetooth headset switching profile renegotiates mid-recording.
+        // Restarting seq at zero would target keys already holding different
+        // audio, and the store refuses to overwrite them — breaking the
+        // recording outright.
+        let mut w = ChunkWriter::new(config());
+        let full = tone(48_000);
+
+        w.push(buffer(&full, 1_000_000_000)).unwrap();
+        w.push(buffer(&full, 2_000_000_000)).unwrap();
+
+        // Headset drops to 16 kHz mono.
+        let tail = w
+            .reconfigure(ChunkConfig {
+                sample_rate_hz: 16_000,
+                channels: 1,
+                chunk_duration_s: 1,
+            })
+            .unwrap();
+        assert!(tail.is_none(), "nothing was buffered, so nothing to seal");
+
+        let after = w.push(buffer(&tone(16_000), 3_000_000_000)).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after[0].seq, 2,
+            "sequence must continue across a format change, not restart"
+        );
+    }
+
+    #[test]
+    fn a_format_change_seals_buffered_audio_under_the_old_format() {
+        let mut w = ChunkWriter::new(config());
+        // Half a second buffered at 48 kHz.
+        w.push(buffer(&tone(24_000), 500_000_000)).unwrap();
+
+        let tail = w
+            .reconfigure(ChunkConfig {
+                sample_rate_hz: 16_000,
+                channels: 1,
+                chunk_duration_s: 1,
+            })
+            .unwrap()
+            .expect("buffered audio must be sealed, not discarded");
+
+        assert_eq!(tail.seq, 0);
+        assert_eq!(
+            tail.sample_count, 24_000,
+            "samples captured at the old rate must be sealed at the old rate"
+        );
+    }
+
+    #[test]
+    fn the_chunk_after_a_format_change_is_marked_discontinuous() {
+        let mut w = ChunkWriter::new(config());
+        w.push(buffer(&tone(48_000), 1_000_000_000)).unwrap();
+
+        w.reconfigure(ChunkConfig {
+            sample_rate_hz: 16_000,
+            channels: 1,
+            chunk_duration_s: 1,
+        })
+        .unwrap();
+
+        let after = w.push(buffer(&tone(16_000), 2_000_000_000)).unwrap();
+        assert!(
+            after[0].discontinuity,
+            "two formats do not join seamlessly; the seam must be recorded"
+        );
+    }
+
+    #[test]
+    fn peak_level_separates_silence_from_signal() {
+        let mut w = ChunkWriter::new(config());
+        assert_eq!(w.peak_level(), 0.0);
+
+        w.push(buffer(&vec![0i16; 24_000], 500_000_000)).unwrap();
+        assert_eq!(
+            w.peak_level(),
+            0.0,
+            "digital silence must report no signal"
+        );
+
+        w.push(buffer(&tone(24_000), 1_000_000_000)).unwrap();
+        assert!(
+            w.peak_level() > 0.2,
+            "an audible tone must register, got {}",
+            w.peak_level()
+        );
+    }
+
+    #[test]
+    fn peak_level_does_not_wrap_on_the_most_negative_sample() {
+        let mut w = ChunkWriter::new(config());
+        w.push(buffer(&[i16::MIN, 0], 100_000_000)).unwrap();
+        assert!(
+            w.peak_level() > 0.99,
+            "i16::MIN must saturate to full scale, got {}",
+            w.peak_level()
         );
     }
 

@@ -81,6 +81,25 @@ pub struct RecordingSession {
 /// What the collector thread produces once every stream has ended.
 type CollectedTracks = BTreeMap<usize, TrackAccumulator>;
 
+/// The result of a finished session.
+#[derive(Debug)]
+pub struct SessionOutcome {
+    pub manifest: RecordingManifest,
+    /// Per-track capture health, keyed by track id. Reported separately from
+    /// the manifest because it describes the capture run rather than the audio.
+    pub tracks: Vec<TrackOutcome>,
+}
+
+#[derive(Debug)]
+pub struct TrackOutcome {
+    pub track_id: TrackId,
+    /// Loudest sample as a fraction of full scale. A track that captured
+    /// correctly but heard nothing is indistinguishable from a broken one
+    /// without this.
+    pub peak_level: f32,
+    pub discontinuities: u64,
+}
+
 impl RecordingSession {
     /// Opens every track and begins capturing.
     pub fn start(
@@ -132,7 +151,7 @@ impl RecordingSession {
     }
 
     /// Stops every track, flushes trailing audio, and returns the manifest.
-    pub fn stop(mut self) -> Result<RecordingManifest> {
+    pub fn stop(mut self) -> Result<SessionOutcome> {
         self.stop_flag.store(true, Ordering::SeqCst);
 
         // Stopping each stream joins its thread, so once this returns no further
@@ -149,7 +168,23 @@ impl RecordingSession {
             .map_err(|_| anyhow::anyhow!("collector thread panicked"))??;
 
         let ended_at = time::OffsetDateTime::now_utc();
-        self.build_manifest(collected, ended_at)
+
+        let tracks = self
+            .specs
+            .iter()
+            .enumerate()
+            .map(|(index, spec)| {
+                let acc = collected.get(&index);
+                TrackOutcome {
+                    track_id: spec.track_id.clone(),
+                    peak_level: acc.map(|a| a.peak_level).unwrap_or(0.0),
+                    discontinuities: acc.map(|a| a.stats.discontinuities).unwrap_or(0),
+                }
+            })
+            .collect();
+
+        let manifest = self.build_manifest(collected, ended_at)?;
+        Ok(SessionOutcome { manifest, tracks })
     }
 
     fn build_manifest(
@@ -253,6 +288,8 @@ struct TrackAccumulator {
     sample_rate_hz: Option<u32>,
     channels: Option<u16>,
     stats: SessionStats,
+    /// Loudest sample seen, carried out of the writer before it is dropped.
+    peak_level: f32,
 }
 
 fn spawn_collector(
@@ -284,11 +321,26 @@ fn spawn_collector(
                         );
                         acc.sample_rate_hz = Some(sample_rate_hz);
                         acc.channels = Some(channels);
-                        acc.writer = Some(ChunkWriter::new(ChunkConfig {
+
+                        let config = ChunkConfig {
                             sample_rate_hz,
                             channels,
                             ..ChunkConfig::default()
-                        }));
+                        };
+
+                        match acc.writer.as_mut() {
+                            // A renegotiation mid-recording, e.g. a Bluetooth
+                            // headset switching profile. The writer is adapted
+                            // rather than replaced so the sequence counter
+                            // survives; a fresh one would restart at zero and
+                            // collide with chunks already stored.
+                            Some(writer) => {
+                                if let Some(tail) = writer.reconfigure(config)? {
+                                    persist_chunk(&*store, &prefix, &spec.track_id, tail, acc)?;
+                                }
+                            }
+                            None => acc.writer = Some(ChunkWriter::new(config)),
+                        }
                     }
                     CaptureEvent::Buffer {
                         samples,
@@ -316,7 +368,9 @@ fn spawn_collector(
                     CaptureEvent::Ended { reason } => {
                         tracing::info!(track = %spec.track_id, %reason, "capture stream ended");
                         if let Some(writer) = acc.writer.as_mut() {
-                            if let Some(chunk) = writer.flush()? {
+                            let tail = writer.flush()?;
+                            acc.peak_level = writer.peak_level();
+                            if let Some(chunk) = tail {
                                 persist_chunk(&*store, &prefix, &spec.track_id, chunk, acc)?;
                             }
                         }

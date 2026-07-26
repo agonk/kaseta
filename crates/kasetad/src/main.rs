@@ -194,7 +194,8 @@ fn cmd_record(seconds: u64) -> Result<()> {
 
     std::thread::sleep(std::time::Duration::from_secs(seconds));
 
-    let manifest = session.stop()?;
+    let outcome = session.stop()?;
+    let manifest = &outcome.manifest;
 
     // The manifest is what every later stage reads; without it the chunks on
     // disk are unattributed audio.
@@ -230,6 +231,18 @@ fn cmd_record(seconds: u64) -> Result<()> {
                 );
             }
             None => println!("    drift  not measurable (no audio captured)"),
+        }
+
+        // Peak level is what separates "captured silence" from "captured
+        // nothing" — both produce chunks, and FLAC shrinks silence to almost
+        // nothing, so byte counts cannot tell them apart.
+        if let Some(o) = outcome.tracks.iter().find(|o| o.track_id == track.track_id) {
+            if o.peak_level <= 0.0 {
+                println!("    peak  SILENT — no signal reached this track");
+            } else {
+                let dbfs = 20.0 * o.peak_level.log10();
+                println!("    peak  {:.1} dBFS", dbfs);
+            }
         }
 
         if gaps > 0 {
