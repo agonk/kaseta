@@ -85,12 +85,34 @@ pub struct RecordingSession {
     /// into nothing and only discover the failure at `stop`, by which point the
     /// rest of the meeting is gone.
     failure: Arc<Mutex<Option<String>>>,
+    health: Arc<Mutex<SessionHealth>>,
     master_track_id: TrackId,
+    notes: RecordingNotes,
     specs: Vec<TrackSpec>,
 }
 
 /// What the collector thread produces once every stream has ended.
 type CollectedTracks = BTreeMap<usize, TrackAccumulator>;
+
+/// Live health of a running session.
+///
+/// A recording can be materially broken while still appearing to run: one track
+/// can die while the other keeps capturing. Reporting only "recording" in that
+/// state would let a meeting finish with half of it missing and no warning.
+#[derive(Clone, Debug, Default)]
+pub struct SessionHealth {
+    /// Set when persistence failed; nothing further is being written.
+    pub failure: Option<String>,
+    /// Tracks whose capture stream ended before a stop was requested, with the
+    /// reason reported by the stream.
+    pub degraded_tracks: Vec<(TrackId, String)>,
+}
+
+impl SessionHealth {
+    pub fn is_degraded(&self) -> bool {
+        !self.degraded_tracks.is_empty()
+    }
+}
 
 /// The result of a finished session.
 #[derive(Debug)]
@@ -117,6 +139,7 @@ impl RecordingSession {
         specs: Vec<TrackSpec>,
         store: Arc<dyn BlobStore>,
         started_at: time::OffsetDateTime,
+        notes: RecordingNotes,
     ) -> Result<Self> {
         anyhow::ensure!(!specs.is_empty(), "a recording needs at least one track");
 
@@ -146,7 +169,7 @@ impl RecordingSession {
                 started_at_ns: clock_started_ns,
             },
             master_track_id: master_track_id.clone(),
-            notes: RecordingNotes::default(),
+            notes: notes.clone(),
         };
         store
             .put_idempotent(
@@ -170,12 +193,15 @@ impl RecordingSession {
         drop(tx);
 
         let failure = Arc::new(Mutex::new(None));
+        let health = Arc::new(Mutex::new(SessionHealth::default()));
         let collector = spawn_collector(
             rx,
             specs.clone(),
             prefix.clone(),
             store,
             Arc::clone(&failure),
+            Arc::clone(&health),
+            Arc::clone(&stop_flag),
         );
 
         Ok(Self {
@@ -187,7 +213,9 @@ impl RecordingSession {
             collector: Some(collector),
             stop_flag,
             failure,
+            health,
             master_track_id,
+            notes,
             specs,
         })
     }
@@ -207,6 +235,17 @@ impl RecordingSession {
     /// should be stopped; continuing only discards audio.
     pub fn failure(&self) -> Option<String> {
         self.failure.lock().ok().and_then(|f| f.clone())
+    }
+
+    /// Live health, for status display.
+    pub fn health(&self) -> SessionHealth {
+        let mut health = self
+            .health
+            .lock()
+            .map(|h| h.clone())
+            .unwrap_or_default();
+        health.failure = self.failure();
+        health
     }
 
     /// Stops every track, flushes trailing audio, and returns the manifest.
@@ -297,7 +336,7 @@ impl RecordingSession {
                 nominal_sample_rate_hz: nominal_rate,
             },
             tracks,
-            notes: RecordingNotes::default(),
+            notes: self.notes.clone(),
         })
     }
 }
@@ -349,6 +388,8 @@ fn spawn_collector(
     prefix: RecordingPrefix,
     store: Arc<dyn BlobStore>,
     failure: Arc<Mutex<Option<String>>>,
+    health: Arc<Mutex<SessionHealth>>,
+    stop_flag: Arc<AtomicBool>,
 ) -> JoinHandle<Result<CollectedTracks>> {
     std::thread::Builder::new()
         .name("kaseta-collector".into())
@@ -489,7 +530,23 @@ fn spawn_collector(
                         }
                     }
                     CaptureEvent::Ended { reason } => {
-                        tracing::info!(track = %spec.track_id, %reason, "capture stream ended");
+                        // A stream ending before a stop was requested means the
+                        // device went away or the server dropped it. The rest of
+                        // the meeting is missing from this track, which must be
+                        // visible rather than logged and forgotten.
+                        if !stop_flag.load(Ordering::SeqCst) {
+                            tracing::warn!(
+                                track = %spec.track_id,
+                                %reason,
+                                "capture stream ended unexpectedly; this track is incomplete"
+                            );
+                            if let Ok(mut h) = health.lock() {
+                                h.degraded_tracks
+                                    .push((spec.track_id.clone(), reason.clone()));
+                            }
+                        } else {
+                            tracing::info!(track = %spec.track_id, %reason, "capture stream ended");
+                        }
                         if let Some(writer) = acc.writer.as_mut() {
                             let tail = writer.flush().map_err(&publish)?;
                             acc.peak_level = writer.peak_level();

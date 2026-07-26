@@ -222,7 +222,11 @@ fn cmd_record(seconds: u64) -> Result<()> {
 
     let specs = TrackSpec::meeting(mic, playback)?;
     let started_at = time::OffsetDateTime::now_utc();
-    let session = RecordingSession::start(specs, store.clone(), started_at)?;
+    // Headphones are the supported configuration: on speakers the far end
+    // bleeds into the microphone track and local-versus-remote attribution
+    // degrades. The CLI cannot know, so it records that it does not.
+    let notes = kaseta_contracts::manifest::RecordingNotes::default();
+    let session = RecordingSession::start(specs, store.clone(), started_at, notes)?;
     let prefix = session.prefix().clone();
 
     // Poll rather than sleep straight through: if persistence fails, the
@@ -230,10 +234,17 @@ fn cmd_record(seconds: u64) -> Result<()> {
     // end of the requested duration would record nothing while appearing to work.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
     let mut aborted = None;
+    let mut reported_degraded = std::collections::HashSet::new();
     while std::time::Instant::now() < deadline {
-        if let Some(error) = session.failure() {
+        let health = session.health();
+        if let Some(error) = health.failure {
             aborted = Some(error);
             break;
+        }
+        for (track, reason) in &health.degraded_tracks {
+            if reported_degraded.insert(track.clone()) {
+                eprintln!("  {track} stopped capturing: {reason}");
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
