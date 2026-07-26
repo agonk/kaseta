@@ -18,6 +18,7 @@
 #![allow(dead_code)]
 
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -31,6 +32,18 @@ use ulid::Ulid;
 use crate::blobstore::BlobStore;
 use crate::capture::devices::{self, DeviceKind};
 use crate::capture::session::{RecordingSession, SessionOutcome, TrackSpec};
+
+/// Conditions the caller can correct, as opposed to faults.
+///
+/// Distinguished so the API can answer "you asked for something that does not
+/// apply right now" differently from "something broke".
+#[derive(Debug, thiserror::Error)]
+pub enum SupervisorError {
+    #[error("a recording is already running")]
+    AlreadyRecording,
+    #[error("no recording is running")]
+    NotRecording,
+}
 
 /// How often the supervisor re-reads session health while idle at its channel.
 ///
@@ -78,7 +91,12 @@ impl Default for DaemonStatus {
     }
 }
 
-/// What a finished recording produced.
+/// A recording whose capture has stopped and whose manifest is durable.
+///
+/// Returned before exports are produced. Once the manifest is written the
+/// recording is safe and complete; merging and mixing decode and re-encode the
+/// whole thing and can take minutes on a long meeting, which no caller should
+/// wait on.
 #[derive(Debug)]
 pub struct StoppedRecording {
     pub manifest: RecordingManifest,
@@ -102,6 +120,12 @@ pub struct Supervisor {
     status: watch::Receiver<DaemonStatus>,
     thread: Option<JoinHandle<()>>,
 }
+
+/// Recordings whose exports are still being produced.
+///
+/// Reported so the interface can say a recording is still being prepared rather
+/// than appearing finished while its audio is not yet playable.
+type ExportsInFlight = Arc<AtomicUsize>;
 
 impl Supervisor {
     pub fn spawn(store: Arc<dyn BlobStore>) -> Result<Self> {
@@ -164,6 +188,7 @@ fn run(
     store: Arc<dyn BlobStore>,
 ) {
     let mut active: Option<Active> = None;
+    let exporting: ExportsInFlight = Arc::new(AtomicUsize::new(0));
 
     loop {
         // Waiting with a timeout rather than blocking indefinitely is what lets
@@ -171,13 +196,13 @@ fn run(
         match commands.recv_timeout(HEALTH_POLL) {
             Ok(Command::Start { notes, reply }) => {
                 let result = start_recording(&mut active, &store, notes);
-                publish(&status, &active);
+                publish(&status, &active, &exporting);
                 let _ = reply.send(result);
             }
             Ok(Command::Stop { reply }) => {
                 let Some(session) = active.take() else {
-                    let _ = reply.send(Err(anyhow!("no recording is running")));
-                    publish(&status, &active);
+                    let _ = reply.send(Err(SupervisorError::NotRecording.into()));
+                    publish(&status, &active, &exporting);
                     continue;
                 };
 
@@ -193,23 +218,56 @@ fn run(
                     failure: session.session.failure(),
                 });
 
-                let _ = reply.send(finalize(session, &*store));
-                publish(&status, &active);
+                match seal(session, &*store) {
+                    Ok(stopped) => {
+                        // The manifest is durable, so the recording is safe.
+                        // Exports are derived and slow; producing them on a
+                        // separate thread keeps the supervisor able to accept
+                        // another recording immediately.
+                        spawn_exports(
+                            Arc::clone(&store),
+                            stopped.manifest.clone(),
+                            stopped.prefix.clone(),
+                            Arc::clone(&exporting),
+                        );
+                        let _ = reply.send(Ok(stopped));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
+                publish(&status, &active, &exporting);
             }
             Ok(Command::Shutdown) => {
                 if let Some(session) = active.take() {
                     tracing::warn!("shutting down while recording; sealing what was captured");
-                    if let Err(e) = finalize(session, &*store) {
-                        tracing::error!(error = %format!("{e:#}"), "failed to seal recording");
+                    match seal(session, &*store) {
+                        Ok(stopped) => {
+                            // Exports run inline here: the process is exiting,
+                            // so there is nowhere to defer them to.
+                            let _ = crate::export::merge_recording(
+                                &*store,
+                                &stopped.manifest,
+                                &stopped.prefix,
+                            );
+                            let _ = crate::export::mix_recording(
+                                &*store,
+                                &stopped.manifest,
+                                &stopped.prefix,
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %format!("{e:#}"), "failed to seal recording")
+                        }
                     }
                 }
                 return;
             }
-            Err(RecvTimeoutError::Timeout) => publish(&status, &active),
+            Err(RecvTimeoutError::Timeout) => publish(&status, &active, &exporting),
             // Every command sender is gone, so nothing can ask for a stop.
             Err(RecvTimeoutError::Disconnected) => {
                 if let Some(session) = active.take() {
-                    let _ = finalize(session, &*store);
+                    let _ = seal(session, &*store);
                 }
                 return;
             }
@@ -240,8 +298,16 @@ impl Active {
     }
 }
 
-fn publish(status: &watch::Sender<DaemonStatus>, active: &Option<Active>) {
+fn publish(
+    status: &watch::Sender<DaemonStatus>,
+    active: &Option<Active>,
+    exporting: &ExportsInFlight,
+) {
     let next = match active {
+        None if exporting.load(Ordering::SeqCst) > 0 => DaemonStatus {
+            state: RecordingState::Finalizing,
+            ..DaemonStatus::default()
+        },
         None => DaemonStatus::default(),
         Some(a) => {
             let health = a.session.health();
@@ -269,7 +335,7 @@ fn start_recording(
     notes: RecordingNotes,
 ) -> Result<Ulid> {
     if active.is_some() {
-        return Err(anyhow!("a recording is already running"));
+        return Err(SupervisorError::AlreadyRecording.into());
     }
 
     let specs = default_meeting_tracks()?;
@@ -289,8 +355,37 @@ fn start_recording(
     Ok(id)
 }
 
-/// Seals a recording and writes its manifest and exports.
-fn finalize(active: Active, store: &dyn BlobStore) -> Result<StoppedRecording> {
+/// Produces a recording's exports off the supervisor thread.
+fn spawn_exports(
+    store: Arc<dyn BlobStore>,
+    manifest: RecordingManifest,
+    prefix: RecordingPrefix,
+    exporting: ExportsInFlight,
+) {
+    exporting.fetch_add(1, Ordering::SeqCst);
+    let counter = Arc::clone(&exporting);
+    let spawned = std::thread::Builder::new()
+        .name("kaseta-export".into())
+        .spawn(move || {
+            // Exports are convenience artifacts; failing to produce them must
+            // not lose a recording whose chunks and manifest are durable.
+            if let Err(e) = crate::export::merge_recording(&*store, &manifest, &prefix) {
+                tracing::error!(error = %format!("{e:#}"), "merging tracks failed");
+            }
+            if let Err(e) = crate::export::mix_recording(&*store, &manifest, &prefix) {
+                tracing::error!(error = %format!("{e:#}"), "mixing recording failed");
+            }
+            counter.fetch_sub(1, Ordering::SeqCst);
+        });
+
+    if spawned.is_err() {
+        exporting.fetch_sub(1, Ordering::SeqCst);
+        tracing::error!("could not spawn the export thread; audio will need `kasetad export`");
+    }
+}
+
+/// Stops capture and writes the manifest, making the recording durable.
+fn seal(active: Active, store: &dyn BlobStore) -> Result<StoppedRecording> {
     let prefix = active.session.prefix().clone();
     let outcome = active.session.stop().context("stopping capture")?;
 
@@ -299,15 +394,6 @@ fn finalize(active: Active, store: &dyn BlobStore) -> Result<StoppedRecording> {
     store
         .put(&prefix.manifest(), &manifest_json)
         .context("writing manifest")?;
-
-    // Exports are convenience artifacts; failing to produce them must not lose
-    // a recording whose chunks and manifest are already durable.
-    if let Err(e) = crate::export::merge_recording(store, &outcome.manifest, &prefix) {
-        tracing::error!(error = %format!("{e:#}"), "merging tracks failed");
-    }
-    if let Err(e) = crate::export::mix_recording(store, &outcome.manifest, &prefix) {
-        tracing::error!(error = %format!("{e:#}"), "mixing recording failed");
-    }
 
     Ok(StoppedRecording {
         manifest: outcome.manifest.clone(),

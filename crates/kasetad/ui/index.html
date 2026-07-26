@@ -119,6 +119,11 @@
 </main>
 
 <script>
+// Minted per daemon run and substituted into this page when it is served. A
+// page on another origin cannot read it, which is what stops a hostile site
+// from driving the recorder.
+const TOKEN = "__KASETA_TOKEN__";
+
 const $ = (id) => document.getElementById(id);
 let state = { state: "idle" };
 let busy = false;
@@ -134,9 +139,14 @@ const fmtDate = (iso) => new Date(iso).toLocaleString(undefined, {
   weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit",
 });
 
-async function api(path, options) {
+async function api(path, options = {}) {
   const res = await fetch(path, {
-    headers: { "content-type": "application/json" }, ...options,
+    ...options,
+    headers: {
+      "content-type": "application/json",
+      "x-kaseta-token": TOKEN,
+      ...(options.headers || {}),
+    },
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));

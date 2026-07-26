@@ -487,6 +487,14 @@ fn cmd_serve(port: u16) -> Result<()> {
         Err(e) => tracing::error!(error = %format!("{e:#}"), "could not index existing recordings"),
     }
 
+    // A purge interrupted by a crash left objects behind and a tombstone hiding
+    // them; finish the job before anything indexes them again.
+    match library::purge_pending(&*store, &db) {
+        Ok(n) if n > 0 => tracing::info!(recordings = n, "completed interrupted deletions"),
+        Ok(_) => {}
+        Err(e) => tracing::error!(error = %format!("{e:#}"), "retrying deletions failed"),
+    }
+
     // Jobs left running by a previous process have no live worker; requeue them
     // before anything new is scheduled.
     match db.recover_orphaned_jobs() {
@@ -498,8 +506,10 @@ fn cmd_serve(port: u16) -> Result<()> {
     let supervisor = Arc::new(supervisor::Supervisor::spawn(Arc::clone(&store))?);
     let db = Arc::new(Mutex::new(db));
 
-    // Capture runs on its own threads; the runtime here only serves HTTP.
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    // A multi-thread runtime, so one slow request cannot stall the others.
+    // Blocking work is additionally moved off the runtime with `spawn_blocking`;
+    // this is defence in depth rather than the primary mechanism.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("starting the async runtime")?;

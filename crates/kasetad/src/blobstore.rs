@@ -43,6 +43,13 @@ pub trait BlobStore: Send + Sync {
     /// observe absence and the later one would silently replace the earlier.
     fn put_if_absent(&self, key: &BlobKey, bytes: &[u8]) -> Result<bool>;
 
+    /// Reads a byte range, without loading the whole object.
+    ///
+    /// Media playback seeks, and a long recording's export is hundreds of
+    /// megabytes; serving a seek by reading the entire object would put that
+    /// much in memory per request.
+    fn get_range(&self, key: &BlobKey, offset: u64, len: u64) -> Result<Vec<u8>>;
+
     /// Every key beneath `prefix`, in lexicographic order.
     ///
     /// Ordering matters: the key layout is designed so that sorting yields
@@ -230,6 +237,31 @@ impl BlobStore for LocalFsStore {
         Ok(std::fs::metadata(&path)
             .with_context(|| format!("stat blob {key}"))?
             .len())
+    }
+
+    fn get_range(&self, key: &BlobKey, offset: u64, len: u64) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let path = self.resolve(key)?;
+        let mut file =
+            std::fs::File::open(&path).with_context(|| format!("opening blob {key}"))?;
+        file.seek(SeekFrom::Start(offset))
+            .with_context(|| format!("seeking blob {key}"))?;
+
+        let mut buf = vec![0u8; len as usize];
+        let mut filled = 0usize;
+        // A short read is normal at end of file; the caller asked for at most
+        // `len`, not exactly `len`.
+        while filled < buf.len() {
+            match file.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e).with_context(|| format!("reading blob {key}")),
+            }
+        }
+        buf.truncate(filled);
+        Ok(buf)
     }
 
     fn list_prefix(&self, prefix: &str) -> Result<Vec<BlobKey>> {

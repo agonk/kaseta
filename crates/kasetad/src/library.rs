@@ -82,8 +82,23 @@ pub fn reconcile(store: &dyn BlobStore, db: &Db) -> Result<usize> {
             }
         };
 
+        // A tombstoned recording whose objects have not finished being purged
+        // must stay deleted rather than being rebuilt from the survivors.
+        let tombstoned: bool = db
+            .conn()
+            .query_row(
+                "SELECT deleted_at IS NOT NULL FROM recordings WHERE id = ?1",
+                params![manifest.recording_id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if tombstoned {
+            continue;
+        }
+
         seen.insert(manifest.recording_id.to_string());
-        upsert(db, &manifest)?;
+        index_recording(store, db, &manifest)?;
         indexed += 1;
     }
 
@@ -92,19 +107,50 @@ pub fn reconcile(store: &dyn BlobStore, db: &Db) -> Result<usize> {
 }
 
 /// Inserts or refreshes one recording, preserving anything the user set.
-fn upsert(db: &Db, manifest: &RecordingManifest) -> Result<()> {
-    let duration_ms = duration_ms(manifest);
+///
+/// Which exports exist is resolved here, once, rather than by scanning storage
+/// on every list request.
+pub fn index_recording(
+    store: &dyn BlobStore,
+    db: &Db,
+    manifest: &RecordingManifest,
+) -> Result<()> {
+    let prefix = prefix_for(manifest.recording_id, manifest.started_at);
+    let exported: Vec<BlobKey> = store
+        .list_prefix(prefix.root().as_str())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|k| k.as_str().contains("/exports/"))
+        .collect();
+
+    let has_mixed = exported
+        .iter()
+        .any(|k| k.as_str().ends_with("/mixed.flac"));
+
+    let tracks: Vec<IndexedTrack> = exported
+        .iter()
+        .filter_map(|k| {
+            let name = k.as_str().rsplit_once('/')?.1;
+            let stem = name.strip_suffix(".flac")?;
+            (stem != "mixed").then(|| IndexedTrack {
+                track_id: stem.to_string(),
+                role: describe_track(stem).0.to_string(),
+            })
+        })
+        .collect();
 
     db.conn().execute(
         "INSERT INTO recordings
              (id, owner_id, status, title, started_at, ended_at, manifest_version,
-              clock_started_ns, duration_ms)
-         VALUES (?1, ?2, 'ready', ?3, ?4, ?5, ?6, ?7, ?8)
+              clock_started_ns, duration_ms, has_mixed, tracks_json)
+         VALUES (?1, ?2, 'ready', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(id) DO UPDATE SET
-             status           = excluded.status,
-             ended_at         = excluded.ended_at,
-             duration_ms      = excluded.duration_ms,
-             updated_at       = strftime('%s','now')",
+             status      = excluded.status,
+             ended_at    = excluded.ended_at,
+             duration_ms = excluded.duration_ms,
+             has_mixed   = excluded.has_mixed,
+             tracks_json = excluded.tracks_json,
+             updated_at  = strftime('%s','now')",
         params![
             manifest.recording_id.to_string(),
             LOCAL_OWNER_ID,
@@ -113,10 +159,18 @@ fn upsert(db: &Db, manifest: &RecordingManifest) -> Result<()> {
             manifest.ended_at.map(|t| t.unix_timestamp()),
             manifest.manifest_version,
             manifest.canonical_clock.started_at_ns as i64,
-            duration_ms,
+            duration_ms(manifest),
+            has_mixed as i64,
+            serde_json::to_string(&tracks).unwrap_or_else(|_| "[]".into()),
         ],
     )?;
     Ok(())
+}
+
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+struct IndexedTrack {
+    track_id: String,
+    role: String,
 }
 
 /// Longest track duration, in milliseconds.
@@ -138,52 +192,125 @@ fn duration_ms(manifest: &RecordingManifest) -> i64 {
         .unwrap_or(0)
 }
 
-/// Every recording that has not been deleted, newest first.
-pub fn list(store: &dyn BlobStore, db: &Db) -> Result<Vec<LibraryItem>> {
-    let rows: Vec<(String, Option<String>, Option<String>, String, i64, Option<i64>, i64)> = {
+/// Retries purging recordings whose objects were not fully removed.
+///
+/// Called at startup: a purge interrupted by a crash or a transient I/O error
+/// leaves objects behind, and the tombstone that hides them must not be dropped
+/// until they are gone.
+pub fn purge_pending(store: &dyn BlobStore, db: &Db) -> Result<usize> {
+    let pending: Vec<(String, i64)> = {
         let mut stmt = db.conn().prepare(
-            "SELECT id, title, title_override, status, started_at, ended_at, duration_ms
-             FROM recordings
-             WHERE owner_id = ?1 AND deleted_at IS NULL
-             ORDER BY started_at DESC",
+            "SELECT id, started_at FROM recordings WHERE purge_pending = 1",
         )?;
-        let rows = stmt.query_map(params![LOCAL_OWNER_ID], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get::<_, Option<i64>>(6)?.unwrap_or(0),
-            ))
-        })?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect::<Result<_, _>>()?
     };
 
-    let mut items = Vec::with_capacity(rows.len());
-    for (id, title, title_override, status, started_at, ended_at, duration_ms) in rows {
-        let id = Ulid::from_string(&id).context("recording id is not a valid ULID")?;
-        let started_at = time::OffsetDateTime::from_unix_timestamp(started_at)
-            .context("recording has an invalid start time")?;
+    let mut completed = 0usize;
+    for (id, started_at) in pending {
+        let Ok(ulid) = Ulid::from_string(&id) else { continue };
+        let Ok(started_at) = time::OffsetDateTime::from_unix_timestamp(started_at) else {
+            continue;
+        };
+        let prefix = prefix_for(ulid, started_at);
 
-        items.push(LibraryItem {
-            id,
-            title: effective_title(&title_override, &title, started_at),
-            renamed: title_override.is_some(),
-            status,
-            started_at,
-            ended_at: ended_at.and_then(|t| time::OffsetDateTime::from_unix_timestamp(t).ok()),
-            duration_ms,
-            tracks: tracks_for(store, id, started_at),
-            mixed_audio_url: mixed_url(store, id, started_at),
-        });
+        let mut cleared = true;
+        for key in store.list_prefix(prefix.root().as_str())? {
+            if store.delete(&key).is_err() {
+                cleared = false;
+            }
+        }
+        if cleared {
+            db.conn()
+                .execute("DELETE FROM recordings WHERE id = ?1", params![id])?;
+            completed += 1;
+        }
     }
-    Ok(items)
+    Ok(completed)
 }
 
-pub fn get(store: &dyn BlobStore, db: &Db, id: Ulid) -> Result<Option<LibraryItem>> {
-    Ok(list(store, db)?.into_iter().find(|i| i.id == id))
+/// Every recording that has not been deleted, newest first.
+///
+/// Reads only the index. Listing must not touch storage: it runs on every page
+/// load, and probing the filesystem once per recording put its cost on the
+/// request path and grew it with the library.
+pub fn list(db: &Db) -> Result<Vec<LibraryItem>> {
+    let mut stmt = db.conn().prepare(
+        "SELECT id, title, title_override, status, started_at, ended_at,
+                duration_ms, has_mixed, tracks_json
+         FROM recordings
+         WHERE owner_id = ?1 AND deleted_at IS NULL
+         ORDER BY started_at DESC",
+    )?;
+
+    let rows = stmt.query_map(params![LOCAL_OWNER_ID], |r| {
+        Ok(Row {
+            id: r.get(0)?,
+            title: r.get(1)?,
+            title_override: r.get(2)?,
+            status: r.get(3)?,
+            started_at: r.get(4)?,
+            ended_at: r.get(5)?,
+            duration_ms: r.get::<_, Option<i64>>(6)?.unwrap_or(0),
+            has_mixed: r.get::<_, i64>(7)? != 0,
+            tracks_json: r.get(8)?,
+        })
+    })?;
+
+    rows.map(|row| row.map_err(Into::into).and_then(into_item))
+        .collect()
+}
+
+struct Row {
+    id: String,
+    title: Option<String>,
+    title_override: Option<String>,
+    status: String,
+    started_at: i64,
+    ended_at: Option<i64>,
+    duration_ms: i64,
+    has_mixed: bool,
+    tracks_json: Option<String>,
+}
+
+fn into_item(row: Row) -> Result<LibraryItem> {
+    let id = Ulid::from_string(&row.id).context("recording id is not a valid ULID")?;
+    let started_at = time::OffsetDateTime::from_unix_timestamp(row.started_at)
+        .context("recording has an invalid start time")?;
+
+    let indexed: Vec<IndexedTrack> = row
+        .tracks_json
+        .as_deref()
+        .and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default();
+
+    Ok(LibraryItem {
+        title: effective_title(&row.title_override, &row.title, started_at),
+        renamed: row.title_override.is_some(),
+        status: row.status,
+        started_at,
+        ended_at: row
+            .ended_at
+            .and_then(|t| time::OffsetDateTime::from_unix_timestamp(t).ok()),
+        duration_ms: row.duration_ms,
+        tracks: indexed
+            .into_iter()
+            .map(|t| LibraryTrack {
+                label: describe_track(&t.track_id).1.to_string(),
+                audio_url: format!("/api/v1/recordings/{id}/audio/{}.flac", t.track_id),
+                track_id: t.track_id,
+                role: t.role,
+            })
+            .collect(),
+        mixed_audio_url: row
+            .has_mixed
+            .then(|| format!("/api/v1/recordings/{id}/audio/mixed.flac")),
+        id,
+    })
+}
+
+pub fn get(db: &Db, id: Ulid) -> Result<Option<LibraryItem>> {
+    Ok(list(db)?.into_iter().find(|i| i.id == id))
 }
 
 /// A recording always has a name, even if nobody gave it one.
@@ -212,43 +339,7 @@ fn prefix_for(id: Ulid, started_at: time::OffsetDateTime) -> kaseta_contracts::R
     kaseta_contracts::RecordingPrefix::new(id, started_at)
 }
 
-/// Exported per-track files, discovered from storage rather than assumed.
-fn tracks_for(store: &dyn BlobStore, id: Ulid, started_at: time::OffsetDateTime) -> Vec<LibraryTrack> {
-    let prefix = prefix_for(id, started_at);
-    let Ok(keys) = store.list_prefix(prefix.root().as_str()) else {
-        return Vec::new();
-    };
 
-    let mut tracks: Vec<LibraryTrack> = keys
-        .iter()
-        .filter_map(|k| {
-            let name = k.as_str().rsplit_once('/')?.1;
-            let stem = name.strip_suffix(".flac")?;
-            if !k.as_str().contains("/exports/") || stem == "mixed" {
-                return None;
-            }
-            let (role, label) = describe_track(stem);
-            Some(LibraryTrack {
-                track_id: stem.to_string(),
-                role: role.to_string(),
-                label: label.to_string(),
-                audio_url: format!("/api/v1/recordings/{id}/audio/{stem}.flac"),
-            })
-        })
-        .collect();
-
-    tracks.sort_by(|a, b| a.track_id.cmp(&b.track_id));
-    tracks
-}
-
-fn mixed_url(store: &dyn BlobStore, id: Ulid, started_at: time::OffsetDateTime) -> Option<String> {
-    let prefix = prefix_for(id, started_at);
-    let key = prefix.export("mixed.flac").ok()?;
-    store
-        .exists(&key)
-        .ok()?
-        .then(|| format!("/api/v1/recordings/{id}/audio/mixed.flac"))
-}
 
 /// Maps a track id to something a person can read.
 fn describe_track(track_id: &str) -> (&'static str, &'static str) {
@@ -293,8 +384,11 @@ pub fn delete(store: &dyn BlobStore, db: &Db, id: Ulid) -> Result<bool> {
         return Ok(false);
     };
 
+    // The tombstone and the purge marker go down together, before any object is
+    // touched.
     db.conn().execute(
-        "UPDATE recordings SET deleted_at = strftime('%s','now') WHERE id = ?1",
+        "UPDATE recordings SET deleted_at = strftime('%s','now'), purge_pending = 1
+         WHERE id = ?1",
         params![id.to_string()],
     )?;
 
@@ -302,16 +396,24 @@ pub fn delete(store: &dyn BlobStore, db: &Db, id: Ulid) -> Result<bool> {
         .context("recording has an invalid start time")?;
     let prefix = prefix_for(id, started_at);
 
+    let mut purged_everything = true;
     for key in store.list_prefix(prefix.root().as_str())? {
         if let Err(e) = store.delete(&key) {
-            // The tombstone stands regardless; leftover objects are retried by
-            // the next purge rather than blocking the deletion.
             tracing::warn!(%key, error = %format!("{e:#}"), "could not remove object");
+            purged_everything = false;
         }
     }
 
-    db.conn()
-        .execute("DELETE FROM recordings WHERE id = ?1", params![id.to_string()])?;
+    if purged_everything {
+        // Nothing survives for the reconciler to find, so the row can go.
+        db.conn()
+            .execute("DELETE FROM recordings WHERE id = ?1", params![id.to_string()])?;
+    } else {
+        // An object survived. Dropping the row now would let the next reconcile
+        // rebuild the recording from whatever is left and resurrect something
+        // the user deleted. The tombstone stays until a retry finishes the job.
+        tracing::warn!(%id, "purge incomplete; the recording stays tombstoned");
+    }
     Ok(true)
 }
 
