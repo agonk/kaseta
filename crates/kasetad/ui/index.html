@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kaseta</title>
+<style>
+  /* One file, no build step, no framework. The page is compiled into the
+     daemon binary, so there is nothing to install or serve alongside it. */
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbfa;
+    --panel: #ffffff;
+    --line: #e4e4e1;
+    --text: #1a1a18;
+    --muted: #6b6b66;
+    --accent: #b4341f;
+    --accent-soft: #fdf0ee;
+    --radius: 10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16161a;
+      --panel: #1e1e23;
+      --line: #2e2e35;
+      --text: #ececf0;
+      --muted: #9a9aa4;
+      --accent: #e8624a;
+      --accent-soft: #2a1d1b;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 720px; margin: 0 auto; padding: 32px 20px 80px; }
+  h1 { font-size: 19px; margin: 0; letter-spacing: -0.01em; }
+  header { display: flex; align-items: baseline; gap: 10px; margin-bottom: 24px; }
+  header span { color: var(--muted); font-size: 13px; }
+
+  .recorder {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 20px; margin-bottom: 28px;
+    display: flex; align-items: center; gap: 16px;
+  }
+  .recorder.live { border-color: var(--accent); background: var(--accent-soft); }
+
+  button {
+    font: inherit; font-weight: 550; cursor: pointer;
+    border-radius: 8px; border: 1px solid var(--line);
+    background: var(--panel); color: var(--text); padding: 9px 16px;
+  }
+  button:hover:not(:disabled) { border-color: var(--muted); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover:not(:disabled) { filter: brightness(1.08); }
+
+  .dot {
+    width: 9px; height: 9px; border-radius: 50%; background: var(--accent);
+    display: inline-block; animation: pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes pulse { 50% { opacity: .25; } }
+  @media (prefers-reduced-motion: reduce) { .dot { animation: none; } }
+
+  .elapsed { font-variant-numeric: tabular-nums; font-size: 22px; font-weight: 600; }
+  .state { color: var(--muted); font-size: 13px; }
+
+  ul { list-style: none; padding: 0; margin: 0; }
+  li {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 14px 16px; margin-bottom: 10px;
+  }
+  .row { display: flex; align-items: center; gap: 12px; }
+  .title { font-weight: 550; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  audio { width: 100%; margin-top: 12px; height: 34px; }
+
+  .icon {
+    padding: 5px 9px; font-size: 13px; color: var(--muted);
+    background: none; border: none;
+  }
+  .icon:hover { color: var(--text); background: var(--bg); }
+
+  .tracks { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
+  .tracks button { font-size: 12px; padding: 4px 10px; color: var(--muted); }
+
+  .empty, .error {
+    color: var(--muted); text-align: center; padding: 36px 20px;
+    border: 1px dashed var(--line); border-radius: var(--radius);
+  }
+  .error { color: var(--accent); border-color: var(--accent); text-align: left; padding: 14px 16px; }
+  .warn { color: var(--accent); font-size: 13px; margin-top: 6px; }
+  input[type=text] {
+    font: inherit; flex: 1; padding: 7px 10px; border-radius: 8px;
+    border: 1px solid var(--accent); background: var(--bg); color: var(--text);
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Kaseta</h1>
+    <span id="sub">meeting recorder</span>
+  </header>
+
+  <div class="recorder" id="recorder">
+    <div style="flex:1">
+      <div class="elapsed" id="elapsed">Ready</div>
+      <div class="state" id="state">Records your microphone and everything you hear, as separate tracks.</div>
+      <div class="warn" id="warn" hidden></div>
+    </div>
+    <button class="primary" id="toggle">Start recording</button>
+  </div>
+
+  <div id="error" class="error" hidden></div>
+  <ul id="list"></ul>
+  <div id="empty" class="empty" hidden>No recordings yet.</div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let state = { state: "idle" };
+let busy = false;
+
+const fmtDuration = (ms) => {
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  return h ? `${h}:${String(m).padStart(2,"0")}:${String(sec).padStart(2,"0")}`
+           : `${m}:${String(sec).padStart(2,"0")}`;
+};
+
+const fmtDate = (iso) => new Date(iso).toLocaleString(undefined, {
+  weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit",
+});
+
+async function api(path, options) {
+  const res = await fetch(path, {
+    headers: { "content-type": "application/json" }, ...options,
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `${res.status} ${res.statusText}`);
+  }
+  return res.status === 204 ? null : res.json();
+}
+
+function showError(e) {
+  $("error").textContent = e.message;
+  $("error").hidden = false;
+}
+
+function renderStatus(s) {
+  state = s;
+  const live = s.state === "recording";
+  const finalizing = s.state === "finalizing";
+
+  $("recorder").classList.toggle("live", live);
+  $("toggle").textContent = live ? "Stop recording" : "Start recording";
+  $("toggle").disabled = finalizing || busy;
+
+  if (live) {
+    $("elapsed").innerHTML = `<span class="dot"></span> ${fmtDuration(s.elapsed_s * 1000)}`;
+    $("state").textContent = "Recording you and everyone else.";
+  } else if (finalizing) {
+    $("elapsed").textContent = "Saving…";
+    $("state").textContent = "Sealing the recording and preparing audio.";
+  } else {
+    $("elapsed").textContent = "Ready";
+    $("state").textContent = "Records your microphone and everything you hear, as separate tracks.";
+  }
+
+  // A recording can be materially broken while still appearing to run, so a
+  // track that stopped early is surfaced rather than discovered afterwards.
+  const problems = [];
+  if (s.failure) problems.push(s.failure);
+  for (const t of s.degraded_tracks || []) problems.push(`${t} stopped capturing`);
+  $("warn").hidden = problems.length === 0;
+  $("warn").textContent = problems.join(" · ");
+}
+
+function renderList(items) {
+  $("empty").hidden = items.length > 0;
+  $("list").replaceChildren(...items.map(render));
+}
+
+function render(item) {
+  const li = document.createElement("li");
+  li.dataset.id = item.id;
+
+  const row = document.createElement("div");
+  row.className = "row";
+
+  const info = document.createElement("div");
+  info.style.flex = "1";
+  info.style.minWidth = "0";
+
+  const title = document.createElement("div");
+  title.className = "title";
+  title.textContent = item.title;
+
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  meta.textContent = `${fmtDate(item.started_at)} · ${fmtDuration(item.duration_ms)}`;
+
+  info.append(title, meta);
+
+  const rename = document.createElement("button");
+  rename.className = "icon";
+  rename.textContent = "Rename";
+  rename.onclick = () => startRename(li, item);
+
+  const remove = document.createElement("button");
+  remove.className = "icon";
+  remove.textContent = "Delete";
+  remove.onclick = () => destroy(item);
+
+  row.append(info, rename, remove);
+  li.append(row);
+
+  if (item.mixed_audio_url) {
+    const audio = document.createElement("audio");
+    audio.controls = true;
+    audio.preload = "none";
+    audio.src = item.mixed_audio_url;
+    li.append(audio);
+  }
+
+  // Both sides are kept separately; the mix is what you usually want, but each
+  // side alone is what makes attribution possible.
+  if (item.tracks?.length) {
+    const tracks = document.createElement("div");
+    tracks.className = "tracks";
+    for (const t of item.tracks) {
+      const b = document.createElement("button");
+      b.textContent = `▸ ${t.label} only`;
+      b.onclick = () => {
+        const a = li.querySelector("audio");
+        if (a) { a.src = t.audio_url; a.play(); }
+      };
+      tracks.append(b);
+    }
+    li.append(tracks);
+  }
+
+  return li;
+}
+
+function startRename(li, item) {
+  const row = li.querySelector(".row");
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = item.title;
+
+  const save = async () => {
+    const title = input.value.trim();
+    try {
+      await api(`/api/v1/recordings/${item.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ title: title || null }),
+      });
+      await refreshList();
+    } catch (e) { showError(e); }
+  };
+
+  input.onkeydown = (e) => {
+    if (e.key === "Enter") save();
+    if (e.key === "Escape") refreshList();
+  };
+  input.onblur = save;
+
+  row.replaceChildren(input);
+  input.focus();
+  input.select();
+}
+
+async function destroy(item) {
+  if (!confirm(`Delete "${item.title}"? The audio is removed permanently.`)) return;
+  try {
+    await api(`/api/v1/recordings/${item.id}`, { method: "DELETE" });
+    await refreshList();
+  } catch (e) { showError(e); }
+}
+
+$("toggle").onclick = async () => {
+  busy = true;
+  $("toggle").disabled = true;
+  $("error").hidden = true;
+  try {
+    if (state.state === "recording") {
+      await api("/api/v1/recordings/active/stop", { method: "POST" });
+      await refreshList();
+    } else {
+      await api("/api/v1/recordings", { method: "POST", body: JSON.stringify({}) });
+    }
+  } catch (e) {
+    showError(e);
+  } finally {
+    busy = false;
+    await refreshStatus();
+  }
+};
+
+async function refreshStatus() {
+  try { renderStatus(await api("/api/v1/status")); }
+  catch (e) { showError(e); }
+}
+
+async function refreshList() {
+  try { renderList((await api("/api/v1/recordings")).items); }
+  catch (e) { showError(e); }
+}
+
+refreshStatus();
+refreshList();
+// Polling rather than a socket: the page is open occasionally and briefly, and
+// a second of latency on an elapsed counter costs nothing.
+setInterval(refreshStatus, 1000);
+</script>
+</body>
+</html>

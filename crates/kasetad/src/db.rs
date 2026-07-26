@@ -18,7 +18,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use ulid::Ulid;
 
 /// Bumped whenever the schema changes. Migrations run in order at startup.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// The single local user. Present so every query is already scoped by owner and
 /// adding real accounts does not mean rewriting them.
@@ -76,6 +76,11 @@ impl Db {
             self.conn
                 .execute_batch(include_str!("migrations/001_initial.sql"))
                 .context("applying migration 001_initial")?;
+        }
+        if current < 2 {
+            self.conn
+                .execute_batch(include_str!("migrations/002_library.sql"))
+                .context("applying migration 002_library")?;
         }
 
         self.conn

@@ -7,6 +7,8 @@ mod capture;
 mod clock;
 mod db;
 mod export;
+mod http;
+mod library;
 mod supervisor;
 
 const USAGE: &str = "\
@@ -19,6 +21,7 @@ COMMANDS:
     devices              List recordable audio devices and exit
     doctor               Check that this machine can capture audio
     record [SECONDS]     Record both sides of a meeting (default 30s)
+    serve [PORT]         Run the daemon and its interface (default 7777)
     export [ID]          Merge a recording's chunks into one file per track
                          (defaults to the most recent recording)
     help                 Show this message
@@ -26,6 +29,7 @@ COMMANDS:
 ENVIRONMENT:
     KASETA_LOG   Log filter, e.g. `kasetad=debug`
     KASETA_DATA  Where recordings are written (default ./data)
+    KASETA_PORT  Port for `serve` (default 7777)
 ";
 
 fn main() -> Result<()> {
@@ -41,6 +45,16 @@ fn main() -> Result<()> {
         Some("devices") => cmd_devices(),
         Some("doctor") => cmd_doctor(),
         Some("export") => cmd_export(std::env::args().nth(2)),
+        Some("serve") => {
+            let port = std::env::args()
+                .nth(2)
+                .or_else(|| std::env::var("KASETA_PORT").ok())
+                .map(|p| p.parse::<u16>())
+                .transpose()
+                .context("PORT must be a number between 1 and 65535")?
+                .unwrap_or(7777);
+            cmd_serve(port)
+        }
         Some("record") => {
             let seconds = std::env::args()
                 .nth(2)
@@ -451,4 +465,44 @@ fn find_manifest_matching(
         .filter(|k| k.as_str().ends_with("/manifest.json"))
         .find(|k| k.as_str().contains(id))
         .with_context(|| format!("no recording matching {id:?}"))
+}
+
+/// Runs the daemon: capture supervisor, HTTP API, and the interface.
+///
+/// The interface is served as a static page rather than shipped as a desktop
+/// shell, so closing the browser tab leaves only this process resident.
+fn cmd_serve(port: u16) -> Result<()> {
+    use std::sync::Mutex;
+
+    let root = std::env::var("KASETA_DATA").unwrap_or_else(|_| "./data".into());
+    let store: Arc<dyn blobstore::BlobStore> = Arc::new(blobstore::LocalFsStore::new(&root)?);
+
+    let db = db::Db::open(&std::path::Path::new(&root).join("kaseta.db"))?;
+
+    // Storage is the source of truth; the index is derived. Rebuilding it at
+    // startup means a database that was deleted, or that missed a recording
+    // because the daemon died mid-write, converges on what storage holds.
+    match library::reconcile(&*store, &db) {
+        Ok(count) => tracing::info!(recordings = count, "library ready"),
+        Err(e) => tracing::error!(error = %format!("{e:#}"), "could not index existing recordings"),
+    }
+
+    // Jobs left running by a previous process have no live worker; requeue them
+    // before anything new is scheduled.
+    match db.recover_orphaned_jobs() {
+        Ok(ids) if !ids.is_empty() => tracing::warn!(count = ids.len(), "requeued interrupted jobs"),
+        Ok(_) => {}
+        Err(e) => tracing::error!(error = %format!("{e:#}"), "job recovery failed"),
+    }
+
+    let supervisor = Arc::new(supervisor::Supervisor::spawn(Arc::clone(&store))?);
+    let db = Arc::new(Mutex::new(db));
+
+    // Capture runs on its own threads; the runtime here only serves HTTP.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("starting the async runtime")?;
+
+    runtime.block_on(http::serve(supervisor, store, db, port))
 }
