@@ -54,9 +54,18 @@ pub fn list_devices() -> Result<Vec<AudioDevice>> {
     let core = context
         .connect_rc(None)
         .context("connecting to PipeWire (is a session available?)")?;
-    let registry = core.get_registry().context("obtaining PipeWire registry")?;
+    let registry = core
+        .get_registry_rc()
+        .context("obtaining PipeWire registry")?;
 
     let found: Rc<RefCell<Vec<AudioDevice>>> = Rc::new(RefCell::new(Vec::new()));
+    // Which nodes the session considers default. Recording anything else means
+    // recording a device the user is not actually speaking into or listening to.
+    let defaults: Rc<RefCell<Defaults>> = Rc::new(RefCell::new(Defaults::default()));
+    // Bound proxies and their listeners must outlive the loop, or the server
+    // stops delivering their events.
+    let bound: Rc<RefCell<Vec<(pipewire::metadata::Metadata, pipewire::metadata::MetadataListener)>>> =
+        Rc::new(RefCell::new(Vec::new()));
 
     // The server replays every existing object on connect, then answers our
     // sync. Waiting for that answer is what makes enumeration complete rather
@@ -77,12 +86,59 @@ pub fn list_devices() -> Result<Vec<AudioDevice>> {
         .register();
 
     let collector = found.clone();
+    let default_sink_source = defaults.clone();
+    let keep_alive = bound.clone();
+    let registry_for_bind = registry.clone();
     let _registry_listener = registry
         .add_listener_local()
         .global(move |global| {
             if let Some(device) = device_from_global(global) {
                 collector.borrow_mut().push(device);
+                return;
             }
+
+            // WirePlumber publishes the session's default sink and source in a
+            // metadata object named `default`. There is no other authoritative
+            // source for it: the node list carries no such flag.
+            if global.type_ != pipewire::types::ObjectType::Metadata {
+                return;
+            }
+            let is_default_metadata = global
+                .props
+                .and_then(|p| p.get("metadata.name"))
+                .is_some_and(|name| name == "default");
+            if !is_default_metadata {
+                return;
+            }
+
+            let Ok(metadata) = registry_for_bind.bind::<pipewire::metadata::Metadata, _>(global)
+            else {
+                tracing::debug!("could not bind default metadata; falling back to first device");
+                return;
+            };
+
+            let sink_source = default_sink_source.clone();
+            let listener = metadata
+                .add_listener_local()
+                .property(move |_subject, key, _type, value| {
+                    let (Some(key), Some(value)) = (key, value) else {
+                        return 0;
+                    };
+                    // Values are JSON of the form {"name":"<node.name>"}.
+                    let Some(name) = parse_default_node_name(value) else {
+                        return 0;
+                    };
+                    let mut slot = sink_source.borrow_mut();
+                    match key {
+                        "default.audio.sink" => slot.sink = Some(name),
+                        "default.audio.source" => slot.source = Some(name),
+                        _ => {}
+                    }
+                    0
+                })
+                .register();
+
+            keep_alive.borrow_mut().push((metadata, listener));
         })
         .register();
 
@@ -90,21 +146,56 @@ pub fn list_devices() -> Result<Vec<AudioDevice>> {
         mainloop.run();
     }
 
-    // Both listeners are dropped here, releasing the collector's second handle.
+    // Listeners are dropped here, releasing the collectors' second handles.
     drop(_registry_listener);
+    bound.borrow_mut().clear();
 
+    let defaults = defaults.borrow().clone();
     let mut devices = Rc::try_unwrap(found)
         .map_err(|_| anyhow::anyhow!("device collector outlived enumeration"))?
         .into_inner();
 
-    // Stable, human-meaningful ordering: microphones first, then monitors, each
-    // alphabetically. Interfaces should not reshuffle between refreshes.
+    for device in &mut devices {
+        let default_name = match device.kind {
+            DeviceKind::Microphone => defaults.source.as_deref(),
+            DeviceKind::SinkMonitor => defaults.sink.as_deref(),
+        };
+        device.is_default = default_name == Some(device.node_name.as_str());
+    }
+
+    // Microphones before monitors, the session default first within each, then
+    // alphabetically. The default is what the user is actually speaking into
+    // and listening to, so it must sort ahead of an unused internal input.
+    // Ordering depends on `is_default`, so it is resolved above first.
     devices.sort_by(|a, b| {
-        (a.kind as u8, &a.display_name).cmp(&(b.kind as u8, &b.display_name))
+        (a.kind as u8, !a.is_default, &a.display_name)
+            .cmp(&(b.kind as u8, !b.is_default, &b.display_name))
     });
     devices.dedup_by(|a, b| a.node_name == b.node_name);
 
     Ok(devices)
+}
+
+/// The session's default sink and source, by node name.
+#[derive(Clone, Debug, Default)]
+struct Defaults {
+    sink: Option<String>,
+    source: Option<String>,
+}
+
+/// Extracts the node name from a default-device metadata value.
+///
+/// The value is JSON of the form `{"name":"alsa_output..."}`. A malformed or
+/// unexpected value yields `None`, which falls back to no default rather than
+/// to a wrong one.
+fn parse_default_node_name(value: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(value).ok()?;
+    let name = parsed.get("name")?.as_str()?;
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }
 
 /// Classifies a registry object, returning `None` for anything not recordable.
@@ -201,6 +292,43 @@ mod tests {
         let mic = device("alsa_input.usb-mic", "USB Mic", DeviceKind::Microphone);
         let target = capture_target(&mic);
         assert!(!target.capture_sink);
+    }
+
+    #[test]
+    fn parses_the_default_node_name_from_metadata() {
+        assert_eq!(
+            parse_default_node_name(r#"{"name":"alsa_output.usb-Jabra_EVOLVE_20_MS.analog-stereo"}"#),
+            Some("alsa_output.usb-Jabra_EVOLVE_20_MS.analog-stereo".into())
+        );
+    }
+
+    #[test]
+    fn a_malformed_default_yields_no_default_rather_than_a_wrong_one() {
+        assert_eq!(parse_default_node_name("not json"), None);
+        assert_eq!(parse_default_node_name(r#"{"other":"x"}"#), None);
+        assert_eq!(parse_default_node_name(r#"{"name":""}"#), None);
+        assert_eq!(parse_default_node_name(r#"{"name":123}"#), None);
+    }
+
+    #[test]
+    fn the_session_default_sorts_ahead_of_other_devices_of_its_kind() {
+        // A laptop's unused internal input enumerates before a plugged-in
+        // headset; recording the first-found device would capture silence.
+        let mut internal = device("alsa_input.internal", "Internal Mic", DeviceKind::Microphone);
+        let mut headset = device("alsa_input.jabra", "Jabra EVOLVE 20 MS", DeviceKind::Microphone);
+        headset.is_default = true;
+        internal.is_default = false;
+
+        let mut devices = vec![internal, headset];
+        devices.sort_by(|a, b| {
+            (a.kind as u8, !a.is_default, &a.display_name)
+                .cmp(&(b.kind as u8, !b.is_default, &b.display_name))
+        });
+
+        assert_eq!(
+            devices[0].node_name, "alsa_input.jabra",
+            "the default device must be chosen over an alphabetically earlier one"
+        );
     }
 
     #[test]

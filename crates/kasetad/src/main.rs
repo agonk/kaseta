@@ -81,17 +81,21 @@ fn cmd_devices() -> Result<()> {
         .unwrap_or(20)
         .max(12);
 
-    println!("{:<width$}  {:<12}  {}", "DEVICE", "KIND", "NODE NAME");
+    println!("  {:<width$}  {:<12}  {}", "DEVICE", "KIND", "NODE NAME");
     for d in &devices {
         let kind = match d.kind {
             capture::DeviceKind::Microphone => "microphone",
             capture::DeviceKind::SinkMonitor => "playback",
         };
+        // The session default is what the user is actually speaking into and
+        // listening to, and is what a recording will open.
+        let marker = if d.is_default { "*" } else { " " };
         println!(
-            "{:<width$}  {:<12}  {}",
+            "{marker} {:<width$}  {:<12}  {}",
             d.display_name, kind, d.node_name
         );
     }
+    println!("\n* = session default, used when recording");
 
     let mics = devices
         .iter()
@@ -182,9 +186,19 @@ fn cmd_record(seconds: u64) -> Result<()> {
     let root = std::env::var("KASETA_DATA").unwrap_or_else(|_| "./data".into());
     let store = Arc::new(blobstore::LocalFsStore::new(&root)?);
 
+    // Devices are ordered defaults-first, so taking the first of each kind
+    // selects what the user is actually using.
     println!("Recording {seconds}s");
-    println!("  microphone  {}", mic.display_name);
-    println!("  playback    {}", playback.display_name);
+    println!(
+        "  microphone  {}{}",
+        mic.display_name,
+        if mic.is_default { "" } else { "  (NOT the session default)" }
+    );
+    println!(
+        "  playback    {}{}",
+        playback.display_name,
+        if playback.is_default { "" } else { "  (NOT the session default)" }
+    );
     println!("  writing to  {}\n", store.root().display());
 
     let specs = TrackSpec::meeting(mic, playback)?;
