@@ -135,6 +135,21 @@ fn cmd_doctor() -> Result<()> {
             println!("  microphones       {mics}");
             println!("  playback monitors {monitors}");
 
+            let default_mic = devices
+                .iter()
+                .find(|d| d.is_default && d.kind == capture::DeviceKind::Microphone);
+            let default_playback = devices
+                .iter()
+                .find(|d| d.is_default && d.kind == capture::DeviceKind::SinkMonitor);
+            println!(
+                "  default mic       {}",
+                default_mic.map_or("(none detected)", |d| d.display_name.as_str())
+            );
+            println!(
+                "  default playback  {}",
+                default_playback.map_or("(none detected)", |d| d.display_name.as_str())
+            );
+
             println!();
             if mics == 0 {
                 println!("No microphone found — the operator's own audio cannot be recorded.");

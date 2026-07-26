@@ -67,20 +67,45 @@ pub fn list_devices() -> Result<Vec<AudioDevice>> {
     let bound: Rc<RefCell<Vec<(pipewire::metadata::Metadata, pipewire::metadata::MetadataListener)>>> =
         Rc::new(RefCell::new(Vec::new()));
 
-    // The server replays every existing object on connect, then answers our
-    // sync. Waiting for that answer is what makes enumeration complete rather
-    // than merely "whatever arrived before a timeout".
-    let pending = core.sync(0).map_err(|e| anyhow::anyhow!("sync failed: {e}"))?;
+    // Two round-trips, not one.
+    //
+    // The first drains the registry, which is when the default-metadata object
+    // is discovered and bound. Binding is itself asynchronous, so that object's
+    // properties have not arrived yet. A second sync, issued once the first
+    // completes, waits for them. Quitting after one round-trip finds every
+    // device but never learns which are default.
+    let pending = Rc::new(Cell::new(
+        core.sync(0).map_err(|e| anyhow::anyhow!("sync failed: {e}"))?,
+    ));
+    let drained_registry = Rc::new(Cell::new(false));
     let done = Rc::new(Cell::new(false));
 
     let finished = done.clone();
+    let drained = drained_registry.clone();
+    let expected = pending.clone();
     let quit_loop = mainloop.clone();
+    let core_for_sync = core.clone();
     let _core_listener = core
         .add_listener_local()
         .done(move |id, seq| {
-            if id == pipewire::core::PW_ID_CORE && seq == pending {
+            if id != pipewire::core::PW_ID_CORE || seq != expected.get() {
+                return;
+            }
+            if drained.get() {
                 finished.set(true);
                 quit_loop.quit();
+                return;
+            }
+            drained.set(true);
+            match core_for_sync.sync(0) {
+                Ok(seq) => expected.set(seq),
+                Err(e) => {
+                    // Without the second round-trip no default is known, which
+                    // degrades selection rather than breaking enumeration.
+                    tracing::warn!(%e, "could not await default-device metadata");
+                    finished.set(true);
+                    quit_loop.quit();
+                }
             }
         })
         .register();
@@ -113,9 +138,10 @@ pub fn list_devices() -> Result<Vec<AudioDevice>> {
 
             let Ok(metadata) = registry_for_bind.bind::<pipewire::metadata::Metadata, _>(global)
             else {
-                tracing::debug!("could not bind default metadata; falling back to first device");
+                tracing::warn!("could not bind default-device metadata");
                 return;
             };
+            tracing::debug!("bound default-device metadata");
 
             let sink_source = default_sink_source.clone();
             let listener = metadata
@@ -151,6 +177,11 @@ pub fn list_devices() -> Result<Vec<AudioDevice>> {
     bound.borrow_mut().clear();
 
     let defaults = defaults.borrow().clone();
+    tracing::debug!(
+        sink = defaults.sink.as_deref().unwrap_or("(none)"),
+        source = defaults.source.as_deref().unwrap_or("(none)"),
+        "session default devices"
+    );
     let mut devices = Rc::try_unwrap(found)
         .map_err(|_| anyhow::anyhow!("device collector outlived enumeration"))?
         .into_inner();
