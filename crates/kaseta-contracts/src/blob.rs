@@ -162,6 +162,23 @@ impl RecordingPrefix {
             .expect("literal segment is safe")
     }
 
+    /// Recording-level metadata, written when capture starts rather than when
+    /// it ends, so a crash does not take the recording's identity with it.
+    pub fn header(&self) -> BlobKey {
+        self.root()
+            .join("recording.json")
+            .expect("literal segment is safe")
+    }
+
+    /// Track-level metadata, written once the stream format is negotiated.
+    pub fn track_header(&self, track_id: &TrackId) -> BlobKey {
+        self.root()
+            .join("tracks")
+            .and_then(|k| k.join(track_id.as_str()))
+            .and_then(|k| k.join("track.json"))
+            .expect("track id is validated on construction")
+    }
+
     /// Key for one chunk of one track. `seq` is zero-padded so chunks sort
     /// lexicographically, which is what makes stitching a plain listing.
     pub fn chunk(&self, track_id: &TrackId, seq: u32, extension: &str) -> BlobKey {

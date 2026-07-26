@@ -19,8 +19,9 @@ use std::thread::JoinHandle;
 
 use anyhow::{Context, Result};
 use kaseta_contracts::manifest::{
-    CanonicalClock, Chunk, ClockDomain, ClockKind, MediaType, RecordingManifest, RecordingNotes,
-    Timeline, Track, TrackFormat, TrackRole, TrackSource, MANIFEST_VERSION,
+    CanonicalClock, Chunk, ClockDomain, ClockKind, MediaType, RecordingHeader, RecordingManifest,
+    RecordingNotes, Timeline, Track, TrackFormat, TrackHeader, TrackRole, TrackSource,
+    MANIFEST_VERSION,
 };
 use kaseta_contracts::{BlobKey, RecordingPrefix, TrackId};
 use ulid::Ulid;
@@ -122,6 +123,25 @@ impl RecordingSession {
         let recording_id = Ulid::new();
         let prefix = RecordingPrefix::new(recording_id, started_at);
         let clock_started_ns = boottime_ns();
+
+        // Written before capture begins: a recording that dies in its first
+        // seconds must still be identifiable, and the clock origin is not
+        // derivable from the chunks.
+        let header = RecordingHeader {
+            manifest_version: MANIFEST_VERSION.into(),
+            recording_id,
+            started_at,
+            canonical_clock: CanonicalClock {
+                kind: ClockKind::BoottimeNs,
+                started_at_ns: clock_started_ns,
+            },
+        };
+        store
+            .put_idempotent(
+                &prefix.header(),
+                &serde_json::to_vec(&header).context("serialising recording header")?,
+            )
+            .context("writing recording header")?;
 
         let (tx, rx) = mpsc::channel::<(usize, CaptureEvent)>();
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -367,6 +387,35 @@ fn spawn_collector(
                             channels,
                             ..ChunkConfig::default()
                         };
+
+                        // The format is only known now, and nothing about the
+                        // device or its clock domain is derivable from the
+                        // chunks, so this is the point at which a track becomes
+                        // reconstructable.
+                        let track_header = TrackHeader {
+                            track_id: spec.track_id.clone(),
+                            media_type: MediaType::Audio,
+                            role: spec.role,
+                            source: track_source(&spec.device),
+                            clock_domain: ClockDomain {
+                                source_clock: "pipewire".into(),
+                                device_clock_id: Some(spec.device.node_name.clone()),
+                            },
+                            format: TrackFormat {
+                                container: "flac".into(),
+                                codec: "flac".into(),
+                                sample_rate_hz: Some(sample_rate_hz),
+                                channels: Some(channels),
+                                sample_format: Some("s16".into()),
+                            },
+                        };
+                        let encoded = serde_json::to_vec(&track_header)
+                            .context("serialising track header")
+                            .map_err(&publish)?;
+                        store
+                            .put(&prefix.track_header(&spec.track_id), &encoded)
+                            .context("writing track header")
+                            .map_err(&publish)?;
 
                         match acc.writer.as_mut() {
                             // A renegotiation mid-recording, e.g. a Bluetooth

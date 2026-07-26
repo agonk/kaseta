@@ -110,14 +110,23 @@ impl LocalFsStore {
 
     /// Writes `bytes` to a temporary sibling of `path` and returns its location.
     ///
-    /// The temporary is named after the content digest, so two writers staging
-    /// identical bytes cannot corrupt each other and two writers staging
-    /// different bytes cannot collide.
+    /// The name is unique per call, not per content. Naming it by digest alone
+    /// would let two writers staging *identical* bytes share one temp file, so
+    /// whichever finished first would delete the file the other was about to
+    /// commit.
     fn staged(&self, path: &Path, bytes: &[u8]) -> Result<PathBuf> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+
         let parent = path
             .parent()
             .context("blob path unexpectedly has no parent")?;
-        let tmp = parent.join(format!(".{}.tmp", sha256_hex(bytes)));
+        let tmp = parent.join(format!(
+            ".{}.{}.{}.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+            &sha256_hex(bytes)[..16]
+        ));
         std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
         Ok(tmp)
     }
@@ -342,19 +351,21 @@ mod tests {
     }
 
     #[test]
-    fn staging_different_content_for_one_key_does_not_collide() {
-        // Temp files are named by content digest, so a second writer staging
-        // different bytes cannot clobber the first writer's staged data.
+    fn every_staged_temporary_is_unique_even_for_identical_bytes() {
+        // Two writers staging the same bytes must not share a temp file: one
+        // would delete the file the other was about to commit.
         let (_dir, store) = store();
         let path = store.resolve(&key("a/b.flac")).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
 
-        let one = store.staged(&path, b"one").unwrap();
-        let two = store.staged(&path, b"two").unwrap();
+        let one = store.staged(&path, b"same").unwrap();
+        let two = store.staged(&path, b"same").unwrap();
+        let other = store.staged(&path, b"different").unwrap();
 
-        assert_ne!(one, two);
-        assert_eq!(std::fs::read(&one).unwrap(), b"one");
-        assert_eq!(std::fs::read(&two).unwrap(), b"two");
+        assert_ne!(one, two, "identical content must still stage separately");
+        assert_ne!(one, other);
+        assert_eq!(std::fs::read(&one).unwrap(), b"same");
+        assert_eq!(std::fs::read(&two).unwrap(), b"same");
     }
 
     #[test]

@@ -1,10 +1,14 @@
 //! The recording manifest — the durable description of what was captured.
 //!
-//! The manifest is written incrementally during capture and finalised when
-//! recording stops, so a crash leaves a manifest describing every chunk that
-//! reached disk. It models `N` tracks of arbitrary source from the outset;
-//! adding per-application audio or video introduces new [`TrackSource`]
-//! variants, not a schema migration.
+//! The manifest is assembled when a session ends. Durability across a crash
+//! does not depend on it: [`RecordingHeader`] is written when capture starts,
+//! [`TrackHeader`] once each format is negotiated, and a [`Chunk`] sidecar
+//! beside every audio blob. Those three together reconstruct a manifest for a
+//! recording that was interrupted.
+//!
+//! It models `N` tracks of arbitrary source from the outset; adding
+//! per-application audio or video introduces new [`TrackSource`] variants, not
+//! a schema migration.
 //!
 //! # Timing
 //!
@@ -92,6 +96,36 @@ pub enum EchoRisk {
     #[default]
     Unknown,
     High,
+}
+
+/// Recording-level metadata, written when capture starts.
+///
+/// The manifest is only assembled when a session ends, so without this a crash
+/// would lose the recording's identity and clock origin even though every chunk
+/// survived. Together with the per-track headers and chunk sidecars it is
+/// enough to rebuild a [`RecordingManifest`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecordingHeader {
+    pub manifest_version: String,
+    pub recording_id: Ulid,
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: time::OffsetDateTime,
+    pub canonical_clock: CanonicalClock,
+}
+
+/// Track-level metadata, written once the stream format is known.
+///
+/// Carries everything about a track that is not derivable from its chunks:
+/// which device it came from, what it represents, and which hardware clock it
+/// runs on.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TrackHeader {
+    pub track_id: TrackId,
+    pub media_type: MediaType,
+    pub role: TrackRole,
+    pub source: TrackSource,
+    pub clock_domain: ClockDomain,
+    pub format: TrackFormat,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

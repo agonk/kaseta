@@ -267,7 +267,14 @@ impl ChunkWriter {
         let start_ns = self.pending_start_ns.unwrap_or(self.pending_end_ns);
         let boundary_ns = start_ns + samples_to_ns(sealed_frames, self.config.sample_rate_hz);
 
-        let chunk = self.finish(samples, start_ns, boundary_ns)?;
+        // Both clocks are interpolated to the same boundary. Reading the last
+        // buffer's PTS instead would be wrong for every chunk except the one
+        // the buffer actually ended in.
+        let pts_start = self.pending_pts_start_ns;
+        let pts_boundary =
+            pts_start.map(|pts| pts + samples_to_ns(sealed_frames, self.config.sample_rate_hz));
+
+        let chunk = self.finish(samples, start_ns, boundary_ns, pts_start, pts_boundary)?;
 
         // The retained remainder begins exactly where the sealed chunk ended,
         // on both clocks. The stream's own timestamp advances with the samples,
@@ -275,9 +282,7 @@ impl ChunkWriter {
         // buffer's value — which would be wrong whenever a boundary falls
         // inside a buffer.
         self.pending_start_ns = Some(boundary_ns);
-        self.pending_pts_start_ns = self
-            .pending_pts_start_ns
-            .map(|pts| pts + samples_to_ns(sealed_frames, self.config.sample_rate_hz));
+        self.pending_pts_start_ns = pts_boundary;
         self.pending_discontinuity = false;
         self.pending_gap_ns = 0;
 
@@ -295,14 +300,26 @@ impl ChunkWriter {
         let samples = std::mem::take(&mut self.pending);
         let start_ns = self.pending_start_ns.unwrap_or(self.pending_end_ns);
         let end_ns = self.pending_end_ns.max(start_ns);
-        let chunk = self.finish(samples, start_ns, end_ns)?;
+        let frames = (samples.len() / self.config.channels.max(1) as usize) as u64;
+        let pts_start = self.pending_pts_start_ns;
+        let pts_end =
+            pts_start.map(|pts| pts + samples_to_ns(frames, self.config.sample_rate_hz));
+
+        let chunk = self.finish(samples, start_ns, end_ns, pts_start, pts_end)?;
         self.pending_start_ns = None;
         self.pending_discontinuity = false;
         self.pending_gap_ns = 0;
         Ok(Some(chunk))
     }
 
-    fn finish(&mut self, samples: Vec<i16>, start_ns: u64, end_ns: u64) -> Result<SealedChunk> {
+    fn finish(
+        &mut self,
+        samples: Vec<i16>,
+        start_ns: u64,
+        end_ns: u64,
+        pts_start: Option<u64>,
+        pts_end: Option<u64>,
+    ) -> Result<SealedChunk> {
         let frames = (samples.len() / self.config.channels.max(1) as usize) as u64;
         let encoded = encode_flac(&samples, &self.config)?;
         let sha256 = sha256_hex(&encoded);
@@ -314,8 +331,8 @@ impl ChunkWriter {
             sample_count: frames,
             boottime_start_ns: start_ns,
             boottime_end_ns: end_ns,
-            source_pts_start_ns: self.pending_pts_start_ns,
-            source_pts_end_ns: self.pending_pts_end_ns,
+            source_pts_start_ns: pts_start,
+            source_pts_end_ns: pts_end,
             discontinuity: self.pending_discontinuity,
             gap_before_ns: self.pending_gap_ns,
             drops_before_chunk: self.pending_drops,
@@ -551,8 +568,17 @@ mod tests {
             assert_eq!(
                 c.source_pts_start_ns,
                 Some(i as u64 * 1_000_000_000),
-                "chunk {i} source PTS must advance with the samples"
+                "chunk {i} start PTS must advance with the samples"
             );
+            assert_eq!(
+                c.source_pts_end_ns,
+                Some((i as u64 + 1) * 1_000_000_000),
+                "chunk {i} end PTS must be interpolated, not the last buffer's value"
+            );
+        }
+        // Adjacent chunks must meet exactly, or merged audio would gap or overlap.
+        for pair in sealed.windows(2) {
+            assert_eq!(pair[0].source_pts_end_ns, pair[1].source_pts_start_ns);
         }
     }
 

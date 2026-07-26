@@ -17,8 +17,8 @@ pub mod worker;
 pub use blob::{BlobKey, BlobKeyError, RecordingPrefix, TrackId};
 pub use jobs::{IllegalTransition, Job, JobState, JobType};
 pub use manifest::{
-    CanonicalClock, Chunk, ClockKind, Drift, MediaType, RecordingManifest, Track, TrackFormat,
-    TrackRole, TrackSource, MANIFEST_VERSION,
+    CanonicalClock, Chunk, ClockKind, Drift, MediaType, RecordingHeader, RecordingManifest, Track,
+    TrackFormat, TrackHeader, TrackRole, TrackSource, MANIFEST_VERSION,
 };
 pub use worker::{
     Segment, SpeakerHint, TranscribeParams, TranscribeSpec, WorkerResult, WorkerStatus,
