@@ -170,12 +170,24 @@ impl RecordingPrefix {
             .expect("literal segment is safe")
     }
 
-    /// Track-level metadata, written once the stream format is negotiated.
+    /// Immutable track identity, written once.
     pub fn track_header(&self, track_id: &TrackId) -> BlobKey {
         self.root()
             .join("tracks")
             .and_then(|k| k.join(track_id.as_str()))
             .and_then(|k| k.join("track.json"))
+            .expect("track id is validated on construction")
+    }
+
+    /// The format governing chunks from `from_seq` onwards.
+    ///
+    /// Zero-padded so epochs sort in capture order alongside the chunks they
+    /// describe, and named distinctly enough not to collide with chunk keys.
+    pub fn format_epoch(&self, track_id: &TrackId, from_seq: u32) -> BlobKey {
+        self.root()
+            .join("tracks")
+            .and_then(|k| k.join(track_id.as_str()))
+            .and_then(|k| k.join(&format!("format-{from_seq:06}.json")))
             .expect("track id is validated on construction")
     }
 

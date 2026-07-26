@@ -2,9 +2,14 @@
 //!
 //! The manifest is assembled when a session ends. Durability across a crash
 //! does not depend on it: [`RecordingHeader`] is written when capture starts,
-//! [`TrackHeader`] once each format is negotiated, and a [`Chunk`] sidecar
-//! beside every audio blob. Those three together reconstruct a manifest for a
-//! recording that was interrupted.
+//! [`TrackHeader`] and a [`FormatEpoch`] when a track's format is negotiated,
+//! and a [`Chunk`] sidecar beside every audio blob.
+//!
+//! Recovery from those artifacts is faithful but not byte-identical. `ended_at`
+//! is a wall-clock value and the durable timing is boottime-based, so a
+//! recovered recording's end is inferred from its last chunk rather than known.
+//! A root holding a header but no chunks was interrupted before capture
+//! produced anything, and carries no audio to recover.
 //!
 //! It models `N` tracks of arbitrary source from the outset; adding
 //! per-application audio or video introduces new [`TrackSource`] variants, not
@@ -111,13 +116,24 @@ pub struct RecordingHeader {
     #[serde(with = "time::serde::rfc3339")]
     pub started_at: time::OffsetDateTime,
     pub canonical_clock: CanonicalClock,
+    /// The reference track, chosen when the session was configured. Not
+    /// re-derivable afterwards: the choice falls back to the first track when no
+    /// microphone is present, and track ordering is not preserved by storage.
+    pub master_track_id: TrackId,
+    /// Operator-supplied context. Lost entirely if not persisted here, since
+    /// nothing about it is derivable from the audio.
+    #[serde(default)]
+    pub notes: RecordingNotes,
 }
 
-/// Track-level metadata, written once the stream format is known.
+/// Immutable track identity, written once.
 ///
-/// Carries everything about a track that is not derivable from its chunks:
-/// which device it came from, what it represents, and which hardware clock it
-/// runs on.
+/// Carries what a track *is* — which device it came from, what it represents,
+/// which hardware clock it runs on. Deliberately excludes the sample format,
+/// which is not immutable: a Bluetooth headset switching profile renegotiates
+/// mid-recording. Formats live in [`FormatEpoch`] instead, so a header can
+/// never describe a format that some of the track's chunks were not captured
+/// at.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrackHeader {
     pub track_id: TrackId,
@@ -125,6 +141,17 @@ pub struct TrackHeader {
     pub role: TrackRole,
     pub source: TrackSource,
     pub clock_domain: ClockDomain,
+}
+
+/// The format a run of chunks was captured at.
+///
+/// One is written when capture starts and another after every renegotiation,
+/// keyed by the first chunk sequence it governs. Sorting epochs by `from_seq`
+/// partitions a track's chunks by the format each was actually recorded at.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FormatEpoch {
+    /// First chunk sequence captured under this format.
+    pub from_seq: u32,
     pub format: TrackFormat,
 }
 

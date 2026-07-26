@@ -19,9 +19,9 @@ use std::thread::JoinHandle;
 
 use anyhow::{Context, Result};
 use kaseta_contracts::manifest::{
-    CanonicalClock, Chunk, ClockDomain, ClockKind, MediaType, RecordingHeader, RecordingManifest,
-    RecordingNotes, Timeline, Track, TrackFormat, TrackHeader, TrackRole, TrackSource,
-    MANIFEST_VERSION,
+    CanonicalClock, Chunk, ClockDomain, ClockKind, FormatEpoch, MediaType, RecordingHeader,
+    RecordingManifest, RecordingNotes, Timeline, Track, TrackFormat, TrackHeader, TrackRole,
+    TrackSource, MANIFEST_VERSION,
 };
 use kaseta_contracts::{BlobKey, RecordingPrefix, TrackId};
 use ulid::Ulid;
@@ -85,6 +85,7 @@ pub struct RecordingSession {
     /// into nothing and only discover the failure at `stop`, by which point the
     /// rest of the meeting is gone.
     failure: Arc<Mutex<Option<String>>>,
+    master_track_id: TrackId,
     specs: Vec<TrackSpec>,
 }
 
@@ -108,7 +109,6 @@ pub struct TrackOutcome {
     /// correctly but heard nothing is indistinguishable from a broken one
     /// without this.
     pub peak_level: f32,
-    pub discontinuities: u64,
 }
 
 impl RecordingSession {
@@ -124,6 +124,16 @@ impl RecordingSession {
         let prefix = RecordingPrefix::new(recording_id, started_at);
         let clock_started_ns = boottime_ns();
 
+        // Chosen here rather than at assembly time so the header can record it.
+        // The fallback depends on track ordering, which storage does not
+        // preserve, so it is not re-derivable after a crash.
+        let master_track_id = specs
+            .iter()
+            .find(|s| s.role == TrackRole::LocalMic)
+            .or_else(|| specs.first())
+            .map(|s| s.track_id.clone())
+            .context("no tracks in session")?;
+
         // Written before capture begins: a recording that dies in its first
         // seconds must still be identifiable, and the clock origin is not
         // derivable from the chunks.
@@ -135,6 +145,8 @@ impl RecordingSession {
                 kind: ClockKind::BoottimeNs,
                 started_at_ns: clock_started_ns,
             },
+            master_track_id: master_track_id.clone(),
+            notes: RecordingNotes::default(),
         };
         store
             .put_idempotent(
@@ -175,6 +187,7 @@ impl RecordingSession {
             collector: Some(collector),
             stop_flag,
             failure,
+            master_track_id,
             specs,
         })
     }
@@ -225,7 +238,6 @@ impl RecordingSession {
                     track_id: spec.track_id.clone(),
                     peak_level: acc.map(|a| a.peak_level).unwrap_or(0.0),
                     drops: acc.map(|a| a.stats.drops).unwrap_or(0),
-                    discontinuities: acc.map(|a| a.stats.discontinuities).unwrap_or(0),
                 }
             })
             .collect();
@@ -263,15 +275,7 @@ impl RecordingSession {
             });
         }
 
-        // The master timeline is the microphone when present: it is the track
-        // whose timing the operator experiences directly.
-        let master = self
-            .specs
-            .iter()
-            .find(|s| s.role == TrackRole::LocalMic)
-            .or_else(|| self.specs.first())
-            .map(|s| s.track_id.clone())
-            .context("no tracks in session")?;
+        let master = self.master_track_id.clone();
 
         let nominal_rate = tracks
             .iter()
@@ -388,34 +392,13 @@ fn spawn_collector(
                             ..ChunkConfig::default()
                         };
 
-                        // The format is only known now, and nothing about the
-                        // device or its clock domain is derivable from the
-                        // chunks, so this is the point at which a track becomes
-                        // reconstructable.
-                        let track_header = TrackHeader {
-                            track_id: spec.track_id.clone(),
-                            media_type: MediaType::Audio,
-                            role: spec.role,
-                            source: track_source(&spec.device),
-                            clock_domain: ClockDomain {
-                                source_clock: "pipewire".into(),
-                                device_clock_id: Some(spec.device.node_name.clone()),
-                            },
-                            format: TrackFormat {
-                                container: "flac".into(),
-                                codec: "flac".into(),
-                                sample_rate_hz: Some(sample_rate_hz),
-                                channels: Some(channels),
-                                sample_format: Some("s16".into()),
-                            },
+                        let format = TrackFormat {
+                            container: "flac".into(),
+                            codec: "flac".into(),
+                            sample_rate_hz: Some(sample_rate_hz),
+                            channels: Some(channels),
+                            sample_format: Some("s16".into()),
                         };
-                        let encoded = serde_json::to_vec(&track_header)
-                            .context("serialising track header")
-                            .map_err(&publish)?;
-                        store
-                            .put(&prefix.track_header(&spec.track_id), &encoded)
-                            .context("writing track header")
-                            .map_err(&publish)?;
 
                         match acc.writer.as_mut() {
                             // A renegotiation mid-recording, e.g. a Bluetooth
@@ -430,8 +413,48 @@ fn spawn_collector(
                                         .map_err(&publish)?;
                                 }
                             }
-                            None => acc.writer = Some(ChunkWriter::new(config)),
+                            None => {
+                                // Identity is immutable and written once.
+                                let header = TrackHeader {
+                                    track_id: spec.track_id.clone(),
+                                    media_type: MediaType::Audio,
+                                    role: spec.role,
+                                    source: track_source(&spec.device),
+                                    clock_domain: ClockDomain {
+                                        source_clock: "pipewire".into(),
+                                        device_clock_id: Some(spec.device.node_name.clone()),
+                                    },
+                                };
+                                let encoded = serde_json::to_vec(&header)
+                                    .context("serialising track header")
+                                    .map_err(&publish)?;
+                                store
+                                    .put_idempotent(&prefix.track_header(&spec.track_id), &encoded)
+                                    .context("writing track header")
+                                    .map_err(&publish)?;
+                                acc.writer = Some(ChunkWriter::new(config));
+                            }
                         }
+
+                        // Written after any flush, so the epoch is keyed to the
+                        // first chunk actually captured under this format —
+                        // never to one still holding the previous format's audio.
+                        let from_seq = acc
+                            .writer
+                            .as_ref()
+                            .map(|w| w.next_seq())
+                            .unwrap_or(0);
+                        let epoch = FormatEpoch { from_seq, format };
+                        let encoded = serde_json::to_vec(&epoch)
+                            .context("serialising format epoch")
+                            .map_err(&publish)?;
+                        store
+                            .put_idempotent(
+                                &prefix.format_epoch(&spec.track_id, from_seq),
+                                &encoded,
+                            )
+                            .context("writing format epoch")
+                            .map_err(&publish)?;
                     }
                     CaptureEvent::Buffer {
                         samples,

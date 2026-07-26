@@ -137,6 +137,12 @@ impl ChunkWriter {
         &self.config
     }
 
+    /// Sequence the next sealed chunk will carry. Used to key a format epoch to
+    /// the first chunk it governs.
+    pub fn next_seq(&self) -> u32 {
+        self.next_seq
+    }
+
     /// Frames currently buffered and not yet sealed. Drives the level meter.
     #[allow(dead_code)]
     pub fn pending_frames(&self) -> usize {
