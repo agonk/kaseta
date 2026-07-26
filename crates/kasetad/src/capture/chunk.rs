@@ -41,9 +41,6 @@ pub struct ChunkConfig {
     pub sample_rate_hz: u32,
     pub channels: u16,
     pub chunk_duration_s: u32,
-    /// FLAC compression level. Level 5 is the usual quality/speed balance;
-    /// speech compresses well and this stays comfortably real-time on one core.
-    pub compression_level: u8,
 }
 
 impl Default for ChunkConfig {
@@ -52,7 +49,6 @@ impl Default for ChunkConfig {
             sample_rate_hz: 48_000,
             channels: 1,
             chunk_duration_s: DEFAULT_CHUNK_DURATION_S,
-            compression_level: 5,
         }
     }
 }
@@ -133,7 +129,8 @@ impl ChunkWriter {
         &self.config
     }
 
-    /// Frames currently buffered and not yet sealed.
+    /// Frames currently buffered and not yet sealed. Drives the level meter.
+    #[allow(dead_code)]
     pub fn pending_frames(&self) -> usize {
         self.pending.len() / self.config.channels.max(1) as usize
     }
@@ -298,7 +295,6 @@ mod tests {
             sample_rate_hz: 48_000,
             channels: 1,
             chunk_duration_s: 1,
-            compression_level: 0,
         }
     }
 

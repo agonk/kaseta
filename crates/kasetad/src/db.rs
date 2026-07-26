@@ -8,6 +8,10 @@
 //!
 //! Connections use WAL so the HTTP handlers can read while capture writes.
 
+// The job queue is complete and test-covered ahead of the scheduler that
+// drives it. Suppressed here rather than per-item so the surface stays visible.
+#![allow(dead_code)]
+
 use anyhow::{Context, Result};
 use kaseta_contracts::{Job, JobState, JobType};
 use rusqlite::{params, Connection, OptionalExtension};

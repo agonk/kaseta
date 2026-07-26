@@ -122,6 +122,7 @@ impl RecordingSession {
         })
     }
 
+    #[allow(dead_code)]
     pub fn recording_id(&self) -> Ulid {
         self.recording_id
     }

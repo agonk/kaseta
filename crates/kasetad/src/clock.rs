@@ -9,8 +9,6 @@
 //! `CLOCK_BOOTTIME` is monotonic *and* counts suspended time, which is exactly
 //! the property track alignment needs.
 
-use std::time::Duration;
-
 /// Reads the canonical clock, in nanoseconds since boot.
 #[cfg(target_os = "linux")]
 pub fn boottime_ns() -> u64 {
@@ -47,13 +45,10 @@ pub fn samples_to_ns(samples: u64, sample_rate_hz: u32) -> u64 {
     ((samples as u128 * 1_000_000_000u128) / sample_rate_hz as u128) as u64
 }
 
-pub fn ns_to_duration(ns: u64) -> Duration {
-    Duration::from_nanos(ns)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn the_clock_advances_and_never_goes_backwards() {

@@ -10,6 +10,10 @@
 //! recording interrupted by a crash therefore never leaves a torn chunk that
 //! would later be read as valid audio.
 
+// `delete`, `size` and `get_verified` are the retention and upload paths,
+// exercised by tests ahead of the jobs that call them.
+#![allow(dead_code)]
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
