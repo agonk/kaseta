@@ -315,22 +315,11 @@ fn cmd_record(seconds: u64) -> Result<()> {
 
     // Chunks are the durable format but not a listenable one, so a merged file
     // per track is produced immediately rather than left as a separate step.
-    match export::merge_recording(&*store, manifest, &prefix) {
-        Ok(merged) if !merged.is_empty() => {
-            println!("Merged:");
-            for m in &merged {
-                println!(
-                    "  {}  ({:.1} MiB)",
-                    m.key,
-                    m.bytes as f64 / (1024.0 * 1024.0)
-                );
-            }
-            println!();
-        }
-        Ok(_) => {}
-        // A failed merge must not discard a good recording; the chunks are
-        // intact and `export` can retry.
-        Err(e) => eprintln!("Could not merge tracks: {e:#}\nThe chunks are intact; run `kasetad export` to retry.\n"),
+    // A failed export must not discard a good recording; the chunks are intact
+    // and `export` can retry.
+    if let Err(e) = write_exports(&*store, manifest, &prefix) {
+        eprintln!("Could not export: {e:#}");
+        eprintln!("The chunks are intact; run `kasetad export` to retry.\n");
     }
 
     println!("Manifest: {}", prefix.manifest());
@@ -363,38 +352,65 @@ fn cmd_export(id: Option<String>) -> Result<()> {
     let prefix = kaseta_contracts::RecordingPrefix::new(manifest.recording_id, manifest.started_at);
     println!("Merging {}\n", manifest.recording_id);
 
-    let merged = export::merge_recording(&store, &manifest, &prefix)?;
+    write_exports(&store, &manifest, &prefix)
+}
+
+/// Produces the listenable artifacts for a recording: one file per track, and
+/// one combined stereo mix.
+///
+/// Both are kept. The per-track files carry the separation that lets a
+/// transcript attribute every line without a speaker model; the mix is what a
+/// person actually wants to play back.
+fn write_exports(
+    store: &dyn blobstore::BlobStore,
+    manifest: &kaseta_contracts::RecordingManifest,
+    prefix: &kaseta_contracts::RecordingPrefix,
+) -> Result<()> {
+    let merged = export::merge_recording(store, manifest, prefix)?;
     if merged.is_empty() {
-        println!("Nothing to merge: this recording captured no audio.");
+        println!("Nothing to export: this recording captured no audio.");
         return Ok(());
     }
 
+    println!("Exported:");
     for m in &merged {
         let rate = manifest
             .tracks
             .iter()
-            .find_map(|t| {
-                m.key
-                    .as_str()
-                    .contains(t.track_id.as_str())
-                    .then(|| t.format.sample_rate_hz)
-                    .flatten()
-            })
+            .find(|t| m.key.as_str().contains(t.track_id.as_str()))
+            .and_then(|t| t.format.sample_rate_hz)
             .unwrap_or(48_000);
 
-        println!("  {}", m.key);
         println!(
-            "    {:.1}s, {:.1} MiB",
+            "  {}  ({:.1}s, {:.1} MiB)",
+            m.key,
             export::frames_to_seconds(m.frames, rate),
             m.bytes as f64 / (1024.0 * 1024.0)
         );
         if m.padded_frames > 0 {
             println!(
-                "    {:.1}s of silence inserted where audio was dropped",
+                "      {:.1}s of silence inserted where audio was dropped",
                 export::frames_to_seconds(m.padded_frames, rate)
             );
         }
     }
+
+    if let Some(mix) = export::mix_recording(store, manifest, prefix)? {
+        println!(
+            "\n  {}  ({:.1}s, {:.1} MiB)  <- both sides together",
+            mix.key,
+            export::frames_to_seconds(mix.frames, mix.sample_rate_hz),
+            mix.bytes as f64 / (1024.0 * 1024.0)
+        );
+        if mix.gain < 1.0 {
+            println!(
+                "      attenuated {:.1} dB so the combined signal does not clip",
+                20.0 * mix.gain.log10()
+            );
+        }
+    }
+    println!();
+
     Ok(())
 }
 

@@ -51,15 +51,15 @@ pub fn merge_recording(
     Ok(merged)
 }
 
-fn merge_track(
-    store: &dyn BlobStore,
-    track: &Track,
-    prefix: &kaseta_contracts::RecordingPrefix,
-) -> Result<MergedTrack> {
+/// Decodes every chunk of a track into one continuous buffer.
+///
+/// Returns the interleaved samples and how many frames of silence were inserted
+/// to stand in for dropped audio.
+fn decode_track(store: &dyn BlobStore, track: &Track) -> Result<(Vec<i16>, u64)> {
     let sample_rate = track
         .format
         .sample_rate_hz
-        .context("track has no sample rate; cannot merge")?;
+        .context("track has no sample rate")?;
     let channels = track.format.channels.unwrap_or(1);
 
     let mut samples: Vec<i16> = Vec::new();
@@ -88,6 +88,22 @@ fn merge_track(
         samples.extend(decoded);
     }
 
+    Ok((samples, padded_frames))
+}
+
+fn merge_track(
+    store: &dyn BlobStore,
+    track: &Track,
+    prefix: &kaseta_contracts::RecordingPrefix,
+) -> Result<MergedTrack> {
+    let sample_rate = track
+        .format
+        .sample_rate_hz
+        .context("track has no sample rate; cannot merge")?;
+    let channels = track.format.channels.unwrap_or(1);
+
+    let (samples, padded_frames) = decode_track(store, track)?;
+
     let frames = (samples.len() / channels.max(1) as usize) as u64;
     let encoded = crate::capture::chunk::encode_flac_samples(&samples, sample_rate, channels)
         .context("encoding merged track")?;
@@ -105,6 +121,132 @@ fn merge_track(
         frames,
         padded_frames,
     })
+}
+
+/// A single stereo file combining every track in a recording.
+#[derive(Debug)]
+pub struct MixedRecording {
+    pub key: BlobKey,
+    pub bytes: u64,
+    pub frames: u64,
+    pub sample_rate_hz: u32,
+    /// Attenuation applied to avoid clipping, as a fraction. `1.0` means none.
+    pub gain: f32,
+}
+
+/// Mixes every track into one stereo file, aligned on the canonical clock.
+///
+/// # Why alignment matters
+///
+/// Tracks do not start together. Each stream negotiates its format and begins
+/// delivering independently, typically tens to hundreds of milliseconds apart.
+/// Summing both from sample zero would offset one speaker against the other by
+/// that amount for the entire recording. Each track is therefore placed at its
+/// true offset from the earliest track's first sample, measured on the
+/// canonical clock.
+///
+/// Output is stereo: a mono microphone is placed in both channels rather than
+/// left only.
+pub fn mix_recording(
+    store: &dyn BlobStore,
+    manifest: &RecordingManifest,
+    prefix: &kaseta_contracts::RecordingPrefix,
+) -> Result<Option<MixedRecording>> {
+    let tracks: Vec<&Track> = manifest
+        .tracks
+        .iter()
+        .filter(|t| !t.chunks.is_empty() && t.media_type == kaseta_contracts::MediaType::Audio)
+        .collect();
+    if tracks.is_empty() {
+        return Ok(None);
+    }
+
+    // Resampling is not attempted, so a rate mismatch is reported rather than
+    // producing audio that slowly slides out of sync.
+    let sample_rate = tracks[0]
+        .format
+        .sample_rate_hz
+        .context("track has no sample rate; cannot mix")?;
+    if let Some(odd) = tracks
+        .iter()
+        .find(|t| t.format.sample_rate_hz != Some(sample_rate))
+    {
+        bail!(
+            "cannot mix tracks at different sample rates: {} is {:?}, expected {sample_rate}",
+            odd.track_id,
+            odd.format.sample_rate_hz
+        );
+    }
+
+    let earliest = tracks
+        .iter()
+        .filter_map(|t| t.chunks.first().map(|c| c.boottime_start_ns))
+        .min()
+        .context("no chunk carries a start time")?;
+
+    // Accumulate in i32: two tracks at full scale would overflow i16, and the
+    // needed attenuation is not known until every track is placed.
+    let mut mixed: Vec<i32> = Vec::new();
+
+    for track in &tracks {
+        let channels = track.format.channels.unwrap_or(1).max(1);
+        let (samples, _) = decode_track(store, track)?;
+
+        let offset_ns = track
+            .chunks
+            .first()
+            .map(|c| c.boottime_start_ns.saturating_sub(earliest))
+            .unwrap_or(0);
+        let offset_frames = ns_to_frames(offset_ns, sample_rate) as usize;
+
+        let frames = samples.len() / channels as usize;
+        let needed = (offset_frames + frames) * 2;
+        if mixed.len() < needed {
+            mixed.resize(needed, 0);
+        }
+
+        for frame in 0..frames {
+            let base = frame * channels as usize;
+            let (left, right) = if channels == 1 {
+                // A mono source belongs in the middle, not hard left.
+                (samples[base], samples[base])
+            } else {
+                (samples[base], samples[base + 1])
+            };
+            let out = (offset_frames + frame) * 2;
+            mixed[out] += left as i32;
+            mixed[out + 1] += right as i32;
+        }
+    }
+
+    // Attenuate only if the sum actually clips, so a quiet recording is not
+    // needlessly made quieter.
+    let peak = mixed.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+    let gain = if peak > i16::MAX as u32 {
+        i16::MAX as f32 / peak as f32
+    } else {
+        1.0
+    };
+
+    let samples: Vec<i16> = mixed
+        .iter()
+        .map(|s| (*s as f32 * gain).clamp(i16::MIN as f32, i16::MAX as f32) as i16)
+        .collect();
+
+    let frames = (samples.len() / 2) as u64;
+    let encoded = crate::capture::chunk::encode_flac_samples(&samples, sample_rate, 2)
+        .context("encoding mixed recording")?;
+
+    let key = prefix.export("mixed.flac").context("building export key")?;
+    store.put(&key, &encoded).context("writing mixed recording")?;
+
+    Ok(Some(MixedRecording {
+        key,
+        bytes: encoded.len() as u64,
+        frames,
+        sample_rate_hz: sample_rate,
+        gain,
+    }))
 }
 
 /// Converts a duration to whole frames, rounding to nearest.
@@ -324,6 +466,190 @@ mod tests {
         assert!(
             format!("{err:#}").contains("integrity check"),
             "expected an integrity failure, got: {err:#}"
+        );
+    }
+
+    /// Builds a manifest with two tracks whose chunks are already stored.
+    fn two_track_manifest(
+        store: &LocalFsStore,
+        prefix: &RecordingPrefix,
+        mic: (Vec<i16>, u16, u64),
+        remote: (Vec<i16>, u16, u64),
+    ) -> RecordingManifest {
+        use kaseta_contracts::manifest::{CanonicalClock, ClockKind, RecordingNotes, Timeline};
+
+        let build = |id: &str, role: TrackRole, (samples, channels, start_ns): (Vec<i16>, u16, u64)| {
+            let track_id = TrackId::new(id).unwrap();
+            let encoded = encode_flac_samples(&samples, 48_000, channels).unwrap();
+            let key = prefix.chunk(&track_id, 0, "flac");
+            store.put(&key, &encoded).unwrap();
+            Track {
+                track_id: track_id.clone(),
+                media_type: MediaType::Audio,
+                role,
+                source: TrackSource::Microphone {
+                    node_name: "test".into(),
+                    display_name: "Test".into(),
+                },
+                clock_domain: ClockDomain {
+                    source_clock: "pipewire".into(),
+                    device_clock_id: None,
+                },
+                format: TrackFormat {
+                    container: "flac".into(),
+                    codec: "flac".into(),
+                    sample_rate_hz: Some(48_000),
+                    channels: Some(channels),
+                    sample_format: Some("s16".into()),
+                },
+                chunks: vec![Chunk {
+                    seq: 0,
+                    blob: key,
+                    sha256: crate::blobstore::sha256_hex(&encoded),
+                    bytes: encoded.len() as u64,
+                    sample_count: Some((samples.len() / channels as usize) as u64),
+                    boottime_start_ns: start_ns,
+                    boottime_end_ns: start_ns + 1_000_000_000,
+                    source_pts_start_ns: None,
+                    source_pts_end_ns: None,
+                    discontinuity: false,
+                    gap_before_ns: 0,
+                    drops_before_chunk: 0,
+                }],
+            }
+        };
+
+        RecordingManifest {
+            manifest_version: kaseta_contracts::MANIFEST_VERSION.into(),
+            recording_id: Ulid::nil(),
+            started_at: datetime!(2026-07-26 19:00:00 UTC),
+            ended_at: None,
+            canonical_clock: CanonicalClock {
+                kind: ClockKind::BoottimeNs,
+                started_at_ns: 0,
+            },
+            timeline: Timeline {
+                master_track_id: TrackId::new("a_local-mic_01").unwrap(),
+                nominal_sample_rate_hz: 48_000,
+            },
+            tracks: vec![
+                build("a_local-mic_01", TrackRole::LocalMic, mic),
+                build("a_remote-mix_01", TrackRole::RemoteMix, remote),
+            ],
+            notes: RecordingNotes::default(),
+        }
+    }
+
+    #[test]
+    fn mixes_both_sides_into_one_stereo_file() {
+        let (_dir, store, prefix) = setup();
+        let manifest = two_track_manifest(
+            &store,
+            &prefix,
+            (tone(48_000, 1), 1, 0),
+            (tone(48_000, 2), 2, 0),
+        );
+
+        let mixed = mix_recording(&store, &manifest, &prefix).unwrap().unwrap();
+
+        assert_eq!(mixed.frames, 48_000);
+        assert_eq!(mixed.sample_rate_hz, 48_000);
+        let decoded = decode_flac(&store.get(&mixed.key).unwrap(), 2).unwrap();
+        assert_eq!(decoded.len(), 96_000, "output must be stereo");
+    }
+
+    #[test]
+    fn tracks_are_aligned_on_the_canonical_clock_not_sample_zero() {
+        let (_dir, store, prefix) = setup();
+        // The remote track starts half a second after the mic. Summing from
+        // sample zero would offset the two speakers for the whole recording.
+        let manifest = two_track_manifest(
+            &store,
+            &prefix,
+            (vec![1_000i16; 48_000], 1, 0),
+            (vec![2_000i16; 96_000], 2, 500_000_000),
+        );
+
+        let mixed = mix_recording(&store, &manifest, &prefix).unwrap().unwrap();
+        let decoded = decode_flac(&store.get(&mixed.key).unwrap(), 2).unwrap();
+
+        // First half second: microphone only.
+        assert_eq!(decoded[0], 1_000);
+        // After the offset: both tracks summed.
+        let at_offset = 24_000 * 2;
+        assert_eq!(
+            decoded[at_offset], 3_000,
+            "the later track must begin at its true offset"
+        );
+        assert_eq!(
+            mixed.frames, 72_000,
+            "output spans from the earliest start to the latest end"
+        );
+    }
+
+    #[test]
+    fn a_mono_microphone_is_centred_rather_than_hard_left() {
+        let (_dir, store, prefix) = setup();
+        let manifest = two_track_manifest(
+            &store,
+            &prefix,
+            (vec![900i16; 1_000], 1, 0),
+            (vec![0i16; 2_000], 2, 0),
+        );
+
+        let mixed = mix_recording(&store, &manifest, &prefix).unwrap().unwrap();
+        let decoded = decode_flac(&store.get(&mixed.key).unwrap(), 2).unwrap();
+
+        assert_eq!(decoded[0], 900, "left");
+        assert_eq!(decoded[1], 900, "right");
+    }
+
+    #[test]
+    fn attenuates_only_when_the_sum_would_clip() {
+        let (_dir, store, prefix) = setup();
+
+        // Quiet enough to sum without clipping: no attenuation.
+        let quiet = two_track_manifest(
+            &store,
+            &prefix,
+            (vec![1_000i16; 1_000], 1, 0),
+            (vec![1_000i16; 2_000], 2, 0),
+        );
+        assert_eq!(mix_recording(&store, &quiet, &prefix).unwrap().unwrap().gain, 1.0);
+
+        // Two near-full-scale tracks would overflow i16.
+        let (_dir2, store2, prefix2) = setup();
+        let loud = two_track_manifest(
+            &store2,
+            &prefix2,
+            (vec![30_000i16; 1_000], 1, 0),
+            (vec![30_000i16; 2_000], 2, 0),
+        );
+        let mixed = mix_recording(&store2, &loud, &prefix2).unwrap().unwrap();
+        assert!(mixed.gain < 1.0, "a clipping sum must be attenuated");
+
+        let decoded = decode_flac(&store2.get(&mixed.key).unwrap(), 2).unwrap();
+        assert!(
+            decoded.iter().all(|s| *s > 0),
+            "attenuation must not wrap samples to negative"
+        );
+    }
+
+    #[test]
+    fn refuses_to_mix_mismatched_sample_rates() {
+        let (_dir, store, prefix) = setup();
+        let mut manifest = two_track_manifest(
+            &store,
+            &prefix,
+            (tone(1_000, 1), 1, 0),
+            (tone(2_000, 2), 2, 0),
+        );
+        manifest.tracks[1].format.sample_rate_hz = Some(16_000);
+
+        let err = mix_recording(&store, &manifest, &prefix).unwrap_err();
+        assert!(
+            err.to_string().contains("different sample rates"),
+            "expected a rate mismatch error, got: {err}"
         );
     }
 
