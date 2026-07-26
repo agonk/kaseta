@@ -18,7 +18,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use ulid::Ulid;
 
 /// Bumped whenever the schema changes. Migrations run in order at startup.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// The single local user. Present so every query is already scoped by owner and
 /// adding real accounts does not mean rewriting them.
@@ -81,6 +81,11 @@ impl Db {
             self.conn
                 .execute_batch(include_str!("migrations/002_library.sql"))
                 .context("applying migration 002_library")?;
+        }
+        if current < 3 {
+            self.conn
+                .execute_batch(include_str!("migrations/003_exports.sql"))
+                .context("applying migration 003_exports")?;
         }
 
         self.conn
@@ -565,6 +570,86 @@ mod tests {
             err.to_string().contains("not a valid ULID"),
             "expected a parse error, got: {err}"
         );
+    }
+
+    #[test]
+    fn every_migration_file_is_wired_into_migrate() {
+        // Adding a migration file without registering it leaves the schema
+        // silently behind, surfacing much later as a missing column.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/migrations");
+        let count = std::fs::read_dir(&dir)
+            .expect("migrations directory")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "sql"))
+            .count() as i64;
+
+        assert_eq!(
+            count, SCHEMA_VERSION,
+            "{count} migration files exist but SCHEMA_VERSION is {SCHEMA_VERSION}"
+        );
+    }
+
+    #[test]
+    fn the_schema_has_every_column_the_library_queries() {
+        let db = Db::open_in_memory().unwrap();
+        let mut stmt = db.conn.prepare("SELECT * FROM recordings LIMIT 0").unwrap();
+        let columns: Vec<String> = stmt
+            .column_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        for required in [
+            "id", "title", "title_override", "status", "started_at", "ended_at",
+            "duration_ms", "has_mixed", "tracks_json", "deleted_at", "purge_pending",
+        ] {
+            assert!(
+                columns.contains(&required.to_string()),
+                "recordings is missing {required}; have {columns:?}"
+            );
+        }
+        drop(stmt);
+    }
+
+    #[test]
+    fn an_existing_database_upgrades_rather_than_failing() {
+        // The realistic case: a database created by an earlier version, opened
+        // by a newer one. Only the missing migrations must run.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("kaseta.db");
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            Db::configure(&conn).unwrap();
+            conn.execute_batch(include_str!("migrations/001_initial.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("migrations/002_library.sql"))
+                .unwrap();
+            conn.pragma_update(None, "user_version", 2i64).unwrap();
+        }
+
+        let db = Db::open(&path).expect("opening an older database must upgrade it");
+
+        let version: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // The query that failed in the field must now succeed.
+        db.conn
+            .query_row(
+                "SELECT id, title, title_override, status, started_at, ended_at,
+                        duration_ms, has_mixed, tracks_json
+                 FROM recordings LIMIT 1",
+                [],
+                |_| Ok(()),
+            )
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(()),
+                other => Err(other),
+            })
+            .expect("the library query must run against an upgraded database");
     }
 
     #[test]
