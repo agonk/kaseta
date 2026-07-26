@@ -1,0 +1,13 @@
+/target
+**/node_modules
+/data
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.venv/
+/ui/dist

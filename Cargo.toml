@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["crates/kaseta-contracts", "crates/kasetad"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "AGPL-3.0-only"
+repository = "https://github.com/agonk/kaseta"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ulid = { version = "1", features = ["serde"] }
+time = { version = "0.3", features = ["formatting", "parsing", "serde", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "process", "signal", "time"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
