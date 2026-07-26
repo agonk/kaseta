@@ -1,0 +1,411 @@
+//! Owns the one live recording, on behalf of everything else.
+//!
+//! A recording session owns OS threads, is consumed by `stop()`, and is
+//! deliberately not `Sync`. Sharing it behind a mutex would mean holding a lock
+//! across a blocking thread join, which would stall every status request for as
+//! long as finalisation takes.
+//!
+//! Instead a single supervisor thread owns the session exclusively. Callers send
+//! commands and receive replies; readers see a cheap [`DaemonStatus`] snapshot
+//! that the supervisor republishes as things change. Nothing outside this module
+//! touches a [`RecordingSession`].
+//!
+//! Only one recording exists at a time. Starting while one runs is refused
+//! rather than silently queued or ignored.
+
+// The daemon that drives this is the next piece; the supervisor is complete and
+// test-covered ahead of it.
+#![allow(dead_code)]
+
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+
+use anyhow::{anyhow, Context, Result};
+use kaseta_contracts::manifest::{RecordingNotes, TrackRole};
+use kaseta_contracts::{RecordingManifest, RecordingPrefix, TrackId};
+use serde::Serialize;
+use tokio::sync::{oneshot, watch};
+use ulid::Ulid;
+
+use crate::blobstore::BlobStore;
+use crate::capture::devices::{self, DeviceKind};
+use crate::capture::session::{RecordingSession, SessionOutcome, TrackSpec};
+
+/// How often the supervisor re-reads session health while idle at its channel.
+///
+/// Bounds how long a track failing mid-recording can go unreported.
+const HEALTH_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingState {
+    Idle,
+    Recording,
+    /// Capture has stopped and the recording is being sealed and exported. This
+    /// is reported separately from `Idle` because it can take a noticeable time
+    /// on a long meeting, and the interface should not claim to be finished.
+    Finalizing,
+}
+
+/// A cheap, cloneable view of what the daemon is doing.
+#[derive(Clone, Debug, Serialize)]
+pub struct DaemonStatus {
+    pub state: RecordingState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recording_id: Option<Ulid>,
+    #[serde(with = "time::serde::rfc3339::option", default)]
+    pub started_at: Option<time::OffsetDateTime>,
+    /// Seconds elapsed since capture began.
+    pub elapsed_s: u64,
+    /// Tracks that stopped capturing before a stop was requested.
+    pub degraded_tracks: Vec<String>,
+    /// Set when persistence failed; nothing further is being written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+}
+
+impl Default for DaemonStatus {
+    fn default() -> Self {
+        Self {
+            state: RecordingState::Idle,
+            recording_id: None,
+            started_at: None,
+            elapsed_s: 0,
+            degraded_tracks: Vec::new(),
+            failure: None,
+        }
+    }
+}
+
+/// What a finished recording produced.
+#[derive(Debug)]
+pub struct StoppedRecording {
+    pub manifest: RecordingManifest,
+    pub prefix: RecordingPrefix,
+    pub outcome: SessionOutcome,
+}
+
+enum Command {
+    Start {
+        notes: RecordingNotes,
+        reply: oneshot::Sender<Result<Ulid>>,
+    },
+    Stop {
+        reply: oneshot::Sender<Result<StoppedRecording>>,
+    },
+    Shutdown,
+}
+
+pub struct Supervisor {
+    commands: Sender<Command>,
+    status: watch::Receiver<DaemonStatus>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Supervisor {
+    pub fn spawn(store: Arc<dyn BlobStore>) -> Result<Self> {
+        let (commands, rx) = mpsc::channel::<Command>();
+        let (status_tx, status) = watch::channel(DaemonStatus::default());
+
+        let thread = std::thread::Builder::new()
+            .name("kaseta-supervisor".into())
+            .spawn(move || run(rx, status_tx, store))
+            .context("spawning supervisor thread")?;
+
+        Ok(Self {
+            commands,
+            status,
+            thread: Some(thread),
+        })
+    }
+
+    pub fn status(&self) -> DaemonStatus {
+        self.status.borrow().clone()
+    }
+
+    /// Begins a recording, returning its id.
+    ///
+    /// Fails if one is already running: a second concurrent recording would
+    /// contend for the same devices and produce two half-recordings.
+    pub async fn start(&self, notes: RecordingNotes) -> Result<Ulid> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::Start { notes, reply })
+            .map_err(|_| anyhow!("supervisor is not running"))?;
+        response.await.map_err(|_| anyhow!("supervisor dropped the request"))?
+    }
+
+    /// Stops the active recording and waits for it to be sealed.
+    pub async fn stop(&self) -> Result<StoppedRecording> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::Stop { reply })
+            .map_err(|_| anyhow!("supervisor is not running"))?;
+        response.await.map_err(|_| anyhow!("supervisor dropped the request"))?
+    }
+}
+
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        // A daemon shutting down mid-recording must seal what it has rather than
+        // abandoning the capture threads.
+        let _ = self.commands.send(Command::Shutdown);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The supervisor loop. Owns the session exclusively for its whole lifetime.
+fn run(
+    commands: mpsc::Receiver<Command>,
+    status: watch::Sender<DaemonStatus>,
+    store: Arc<dyn BlobStore>,
+) {
+    let mut active: Option<Active> = None;
+
+    loop {
+        // Waiting with a timeout rather than blocking indefinitely is what lets
+        // health be republished while no commands arrive.
+        match commands.recv_timeout(HEALTH_POLL) {
+            Ok(Command::Start { notes, reply }) => {
+                let result = start_recording(&mut active, &store, notes);
+                publish(&status, &active);
+                let _ = reply.send(result);
+            }
+            Ok(Command::Stop { reply }) => {
+                let Some(session) = active.take() else {
+                    let _ = reply.send(Err(anyhow!("no recording is running")));
+                    publish(&status, &active);
+                    continue;
+                };
+
+                // Publish before finalising: sealing and exporting a long
+                // recording is not instant, and the interface should say so
+                // rather than appear hung or already idle.
+                let _ = status.send(DaemonStatus {
+                    state: RecordingState::Finalizing,
+                    recording_id: Some(session.id),
+                    started_at: Some(session.started_at),
+                    elapsed_s: session.elapsed_s(),
+                    degraded_tracks: session.degraded_track_names(),
+                    failure: session.session.failure(),
+                });
+
+                let _ = reply.send(finalize(session, &*store));
+                publish(&status, &active);
+            }
+            Ok(Command::Shutdown) => {
+                if let Some(session) = active.take() {
+                    tracing::warn!("shutting down while recording; sealing what was captured");
+                    if let Err(e) = finalize(session, &*store) {
+                        tracing::error!(error = %format!("{e:#}"), "failed to seal recording");
+                    }
+                }
+                return;
+            }
+            Err(RecvTimeoutError::Timeout) => publish(&status, &active),
+            // Every command sender is gone, so nothing can ask for a stop.
+            Err(RecvTimeoutError::Disconnected) => {
+                if let Some(session) = active.take() {
+                    let _ = finalize(session, &*store);
+                }
+                return;
+            }
+        }
+    }
+}
+
+/// A running recording plus what the status snapshot needs.
+struct Active {
+    id: Ulid,
+    started_at: time::OffsetDateTime,
+    started_boottime_ns: u64,
+    session: RecordingSession,
+}
+
+impl Active {
+    fn elapsed_s(&self) -> u64 {
+        crate::clock::boottime_ns().saturating_sub(self.started_boottime_ns) / 1_000_000_000
+    }
+
+    fn degraded_track_names(&self) -> Vec<String> {
+        self.session
+            .health()
+            .degraded_tracks
+            .iter()
+            .map(|(id, _)| id.to_string())
+            .collect()
+    }
+}
+
+fn publish(status: &watch::Sender<DaemonStatus>, active: &Option<Active>) {
+    let next = match active {
+        None => DaemonStatus::default(),
+        Some(a) => {
+            let health = a.session.health();
+            DaemonStatus {
+                state: RecordingState::Recording,
+                recording_id: Some(a.id),
+                started_at: Some(a.started_at),
+                elapsed_s: a.elapsed_s(),
+                degraded_tracks: health
+                    .degraded_tracks
+                    .iter()
+                    .map(|(id, _)| id.to_string())
+                    .collect(),
+                failure: health.failure,
+            }
+        }
+    };
+    // A send failure only means nobody is watching.
+    let _ = status.send(next);
+}
+
+fn start_recording(
+    active: &mut Option<Active>,
+    store: &Arc<dyn BlobStore>,
+    notes: RecordingNotes,
+) -> Result<Ulid> {
+    if active.is_some() {
+        return Err(anyhow!("a recording is already running"));
+    }
+
+    let specs = default_meeting_tracks()?;
+    let started_at = time::OffsetDateTime::now_utc();
+    let started_boottime_ns = crate::clock::boottime_ns();
+
+    let session = RecordingSession::start(specs, Arc::clone(store), started_at, notes)
+        .context("starting capture")?;
+    let id = session.recording_id();
+
+    *active = Some(Active {
+        id,
+        started_at,
+        started_boottime_ns,
+        session,
+    });
+    Ok(id)
+}
+
+/// Seals a recording and writes its manifest and exports.
+fn finalize(active: Active, store: &dyn BlobStore) -> Result<StoppedRecording> {
+    let prefix = active.session.prefix().clone();
+    let outcome = active.session.stop().context("stopping capture")?;
+
+    let manifest_json =
+        serde_json::to_vec_pretty(&outcome.manifest).context("serialising manifest")?;
+    store
+        .put(&prefix.manifest(), &manifest_json)
+        .context("writing manifest")?;
+
+    // Exports are convenience artifacts; failing to produce them must not lose
+    // a recording whose chunks and manifest are already durable.
+    if let Err(e) = crate::export::merge_recording(store, &outcome.manifest, &prefix) {
+        tracing::error!(error = %format!("{e:#}"), "merging tracks failed");
+    }
+    if let Err(e) = crate::export::mix_recording(store, &outcome.manifest, &prefix) {
+        tracing::error!(error = %format!("{e:#}"), "mixing recording failed");
+    }
+
+    Ok(StoppedRecording {
+        manifest: outcome.manifest.clone(),
+        prefix,
+        outcome,
+    })
+}
+
+/// Builds the two tracks a meeting needs from the session's default devices.
+fn default_meeting_tracks() -> Result<Vec<TrackSpec>> {
+    let devices = devices::list_devices()
+        .context("could not reach PipeWire — run `kasetad doctor` to diagnose")?;
+
+    // Discovery orders defaults first, so the first of each kind is what the
+    // user is actually speaking into and listening to.
+    let mic = devices
+        .iter()
+        .find(|d| d.kind == DeviceKind::Microphone)
+        .context("no microphone found — cannot record your own audio")?
+        .clone();
+    let playback = devices
+        .iter()
+        .find(|d| d.kind == DeviceKind::SinkMonitor)
+        .context("no playback monitor found — cannot record the far end")?
+        .clone();
+
+    TrackSpec::meeting(mic, playback)
+}
+
+/// The role a track carries, for display.
+pub fn role_label(role: TrackRole) -> &'static str {
+    match role {
+        TrackRole::LocalMic => "you",
+        TrackRole::RemoteMix => "others",
+        TrackRole::Application => "application",
+        TrackRole::Visual => "video",
+    }
+}
+
+/// Whether a track id names the combined mix rather than a captured track.
+pub fn is_mix(track_id: &TrackId) -> bool {
+    track_id.as_str() == "mixed"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_idle_daemon_reports_no_recording() {
+        let status = DaemonStatus::default();
+        assert_eq!(status.state, RecordingState::Idle);
+        assert!(status.recording_id.is_none());
+        assert_eq!(status.elapsed_s, 0);
+    }
+
+    #[test]
+    fn status_serialises_without_absent_fields() {
+        let json = serde_json::to_string(&DaemonStatus::default()).unwrap();
+        assert!(json.contains("\"state\":\"idle\""));
+        assert!(
+            !json.contains("recording_id"),
+            "absent fields must not appear as nulls: {json}"
+        );
+    }
+
+    #[test]
+    fn recording_status_carries_what_the_interface_needs() {
+        let status = DaemonStatus {
+            state: RecordingState::Recording,
+            recording_id: Some(Ulid::nil()),
+            started_at: Some(time::OffsetDateTime::UNIX_EPOCH),
+            elapsed_s: 42,
+            degraded_tracks: vec!["a_local-mic_01".into()],
+            failure: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+
+        assert!(json.contains("\"state\":\"recording\""));
+        assert!(json.contains("\"elapsed_s\":42"));
+        assert!(json.contains("a_local-mic_01"));
+    }
+
+    #[test]
+    fn finalizing_is_distinct_from_idle() {
+        // A long recording takes real time to seal and export. Reporting idle
+        // during that would make the interface look finished when it is not.
+        let json = serde_json::to_string(&DaemonStatus {
+            state: RecordingState::Finalizing,
+            ..DaemonStatus::default()
+        })
+        .unwrap();
+        assert!(json.contains("\"state\":\"finalizing\""));
+    }
+
+    #[test]
+    fn roles_read_as_people_not_internals() {
+        assert_eq!(role_label(TrackRole::LocalMic), "you");
+        assert_eq!(role_label(TrackRole::RemoteMix), "others");
+    }
+}

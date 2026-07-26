@@ -109,6 +109,7 @@ pub struct SessionHealth {
 }
 
 impl SessionHealth {
+    #[allow(dead_code)]
     pub fn is_degraded(&self) -> bool {
         !self.degraded_tracks.is_empty()
     }

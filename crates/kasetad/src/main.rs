@@ -7,6 +7,7 @@ mod capture;
 mod clock;
 mod db;
 mod export;
+mod supervisor;
 
 const USAGE: &str = "\
 kasetad — Kaseta recording daemon
