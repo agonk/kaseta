@@ -35,6 +35,14 @@ pub trait BlobStore: Send + Sync {
     /// Byte size without reading the object.
     fn size(&self, key: &BlobKey) -> Result<u64>;
 
+    /// Writes only if the key is currently absent, atomically.
+    ///
+    /// Returns whether this call created the object. Implementations must make
+    /// the absence check and the write a single indivisible step; a
+    /// check-then-write is not sufficient, because two writers would both
+    /// observe absence and the later one would silently replace the earlier.
+    fn put_if_absent(&self, key: &BlobKey, bytes: &[u8]) -> Result<bool>;
+
     /// Writes only if absent, or verifies the existing object matches.
     ///
     /// Chunk writes are retried after crashes and re-uploaded on resume, so this
@@ -42,21 +50,23 @@ pub trait BlobStore: Send + Sync {
     /// is a bug — two recordings colliding, or a corrupted store — and is
     /// reported rather than silently overwritten.
     fn put_idempotent(&self, key: &BlobKey, bytes: &[u8]) -> Result<PutOutcome> {
-        if self.exists(key)? {
-            let existing = self.get(key)?;
-            return if existing == bytes {
-                Ok(PutOutcome::AlreadyPresent)
-            } else {
-                bail!(
-                    "blob {key} already exists with different content \
-                     (existing sha256 {}, incoming {})",
-                    sha256_hex(&existing),
-                    sha256_hex(bytes)
-                )
-            };
+        if self.put_if_absent(key, bytes)? {
+            return Ok(PutOutcome::Written);
         }
-        self.put(key, bytes)?;
-        Ok(PutOutcome::Written)
+        // The key was taken. Comparing only now, rather than before writing,
+        // keeps the decision atomic: nothing between the check and the write
+        // can change the outcome.
+        let existing = self.get(key)?;
+        if existing == bytes {
+            Ok(PutOutcome::AlreadyPresent)
+        } else {
+            bail!(
+                "blob {key} already exists with different content \
+                 (existing sha256 {}, incoming {})",
+                sha256_hex(&existing),
+                sha256_hex(bytes)
+            )
+        }
     }
 
     /// Reads and verifies against an expected digest.
@@ -98,6 +108,20 @@ impl LocalFsStore {
         &self.root
     }
 
+    /// Writes `bytes` to a temporary sibling of `path` and returns its location.
+    ///
+    /// The temporary is named after the content digest, so two writers staging
+    /// identical bytes cannot corrupt each other and two writers staging
+    /// different bytes cannot collide.
+    fn staged(&self, path: &Path, bytes: &[u8]) -> Result<PathBuf> {
+        let parent = path
+            .parent()
+            .context("blob path unexpectedly has no parent")?;
+        let tmp = parent.join(format!(".{}.tmp", sha256_hex(bytes)));
+        std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+        Ok(tmp)
+    }
+
     /// Maps a key to an absolute path, refusing anything that would escape the
     /// root.
     ///
@@ -132,16 +156,38 @@ impl BlobStore for LocalFsStore {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
 
-        // Write to a sibling temporary file, then rename. `rename` within a
-        // directory is atomic, so a reader sees either no blob or a whole one.
-        let tmp = path.with_extension(format!(
-            "{}.tmp",
-            path.extension().and_then(|e| e.to_str()).unwrap_or("blob")
-        ));
-        std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+        let tmp = self.staged(&path, bytes)?;
+        // `rename` within a directory is atomic, so a reader sees either no blob
+        // or a whole one. This variant deliberately replaces an existing blob.
         std::fs::rename(&tmp, &path)
             .with_context(|| format!("committing {}", path.display()))?;
         Ok(())
+    }
+
+    fn put_if_absent(&self, key: &BlobKey, bytes: &[u8]) -> Result<bool> {
+        let path = self.resolve(key)?;
+        let parent = path
+            .parent()
+            .context("blob path unexpectedly has no parent")?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+
+        let tmp = self.staged(&path, bytes)?;
+
+        // `hard_link` fails with AlreadyExists rather than replacing, which is
+        // the atomic create-only commit `rename` cannot express. The link and
+        // the temp file share an inode, so the temp is then just an extra name
+        // to drop.
+        let created = match std::fs::hard_link(&tmp, &path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e).with_context(|| format!("committing {}", path.display()));
+            }
+        };
+        let _ = std::fs::remove_file(&tmp);
+        Ok(created)
     }
 
     fn get(&self, key: &BlobKey) -> Result<Vec<u8>> {
@@ -258,6 +304,57 @@ mod tests {
         store.put(&k, b"bad!").unwrap();
         let err = store.get_verified(&k, &digest).unwrap_err();
         assert!(err.to_string().contains("integrity check"));
+    }
+
+    #[test]
+    fn put_if_absent_reports_whether_it_created_the_object() {
+        let (_dir, store) = store();
+        let k = key("a/b.flac");
+
+        assert!(store.put_if_absent(&k, b"first").unwrap());
+        assert!(
+            !store.put_if_absent(&k, b"second").unwrap(),
+            "a taken key must not be reported as created"
+        );
+        assert_eq!(
+            store.get(&k).unwrap(),
+            b"first",
+            "create-only must never replace existing bytes"
+        );
+    }
+
+    #[test]
+    fn a_failed_create_leaves_no_temporary_behind() {
+        let (dir, store) = store();
+        let k = key("a/b.flac");
+        store.put_if_absent(&k, b"first").unwrap();
+        store.put_if_absent(&k, b"second").unwrap();
+
+        let leftovers: Vec<_> = walk(dir.path())
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".tmp"))
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "found temp files: {leftovers:?}");
+    }
+
+    #[test]
+    fn staging_different_content_for_one_key_does_not_collide() {
+        // Temp files are named by content digest, so a second writer staging
+        // different bytes cannot clobber the first writer's staged data.
+        let (_dir, store) = store();
+        let path = store.resolve(&key("a/b.flac")).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let one = store.staged(&path, b"one").unwrap();
+        let two = store.staged(&path, b"two").unwrap();
+
+        assert_ne!(one, two);
+        assert_eq!(std::fs::read(&one).unwrap(), b"one");
+        assert_eq!(std::fs::read(&two).unwrap(), b"two");
     }
 
     #[test]

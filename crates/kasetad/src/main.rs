@@ -192,7 +192,21 @@ fn cmd_record(seconds: u64) -> Result<()> {
     let session = RecordingSession::start(specs, store.clone(), started_at)?;
     let prefix = session.prefix().clone();
 
-    std::thread::sleep(std::time::Duration::from_secs(seconds));
+    // Poll rather than sleep straight through: if persistence fails, the
+    // collector stops and every later buffer is discarded, so continuing to the
+    // end of the requested duration would record nothing while appearing to work.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    let mut aborted = None;
+    while std::time::Instant::now() < deadline {
+        if let Some(error) = session.failure() {
+            aborted = Some(error);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    if let Some(error) = &aborted {
+        eprintln!("\nRecording stopped early: {error}\n");
+    }
 
     let outcome = session.stop()?;
     let manifest = &outcome.manifest;
@@ -245,8 +259,13 @@ fn cmd_record(seconds: u64) -> Result<()> {
             }
         }
 
+        if let Some(o) = outcome.tracks.iter().find(|o| o.track_id == track.track_id) {
+            if o.drops > 0 {
+                println!("    {} buffer(s) dropped by the audio server", o.drops);
+            }
+        }
         if gaps > 0 {
-            println!("    {gaps} discontinuit(ies) — audio was dropped");
+            println!("    {gaps} discontinuit(ies) — audio went missing");
         }
         if track.chunks.is_empty() {
             println!("    NO AUDIO CAPTURED");
@@ -255,5 +274,9 @@ fn cmd_record(seconds: u64) -> Result<()> {
     }
 
     println!("Manifest: {}", prefix.manifest());
+
+    if let Some(error) = aborted {
+        anyhow::bail!("recording did not complete: {error}");
+    }
     Ok(())
 }

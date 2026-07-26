@@ -262,45 +262,68 @@ impl Db {
              FROM jobs WHERE id = ?1",
             params![id],
             |r| {
-                Ok(Job {
-                    id: Ulid::from_string(&r.get::<_, String>(0)?).unwrap_or_default(),
-                    recording_id: Ulid::from_string(&r.get::<_, String>(1)?).unwrap_or_default(),
-                    job_type: parse_job_type(&r.get::<_, String>(2)?),
-                    revision: r.get(3)?,
-                    state: parse_job_state(&r.get::<_, String>(4)?),
-                    attempt: r.get(5)?,
-                    max_attempts: r.get(6)?,
-                    worker_pid: r.get(7)?,
-                    error_code: r.get(8)?,
-                    error_message: r.get(9)?,
-                })
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, u32>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, u32>(5)?,
+                    r.get::<_, u32>(6)?,
+                    r.get::<_, Option<u32>>(7)?,
+                    r.get::<_, Option<String>>(8)?,
+                    r.get::<_, Option<String>>(9)?,
+                ))
             },
         )
         .optional()
-        .context("loading job")
+        .context("loading job")?
+        .map(|row| -> Result<Job> {
+            Ok(Job {
+                id: Ulid::from_string(&row.0).context("job id is not a valid ULID")?,
+                recording_id: Ulid::from_string(&row.1)
+                    .context("job recording_id is not a valid ULID")?,
+                job_type: parse_job_type(&row.2)?,
+                revision: row.3,
+                state: parse_job_state(&row.4)?,
+                attempt: row.5,
+                max_attempts: row.6,
+                worker_pid: row.7,
+                error_code: row.8,
+                error_message: row.9,
+            })
+        })
+        .transpose()
     }
 }
 
-fn parse_job_type(s: &str) -> JobType {
-    match s {
+/// Parsers reject unknown values rather than substituting a default.
+///
+/// A silent fallback would turn database corruption, or a row written by a newer
+/// schema, into a job quietly misclassified as a different type or state — which
+/// could resurrect finished work or discard live work.
+fn parse_job_type(s: &str) -> Result<JobType> {
+    Ok(match s {
         "finalize_recording" => JobType::FinalizeRecording,
         "transcribe" => JobType::Transcribe,
         "merge_transcript" => JobType::MergeTranscript,
         "summarize" => JobType::Summarize,
-        _ => JobType::UploadRemote,
-    }
+        "upload_remote" => JobType::UploadRemote,
+        other => anyhow::bail!("unknown job_type in database: {other:?}"),
+    })
 }
 
-fn parse_job_state(s: &str) -> JobState {
-    match s {
+fn parse_job_state(s: &str) -> Result<JobState> {
+    Ok(match s {
         "queued" => JobState::Queued,
         "running" => JobState::Running,
         "succeeded" => JobState::Succeeded,
         "failed_retryable" => JobState::FailedRetryable,
+        "failed_terminal" => JobState::FailedTerminal,
         "canceled" => JobState::Canceled,
         "superseded" => JobState::Superseded,
-        _ => JobState::FailedTerminal,
-    }
+        other => anyhow::bail!("unknown job state in database: {other:?}"),
+    })
 }
 
 #[cfg(test)]
@@ -493,6 +516,50 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining, 0, "foreign keys must cascade");
+    }
+
+    #[test]
+    fn an_unknown_state_in_the_database_is_an_error_not_a_guess() {
+        let (db, rec) = db_with_recording();
+        let id = db.enqueue(rec, JobType::Transcribe, 1).unwrap();
+
+        // Simulate a row written by a newer schema. The CHECK constraint is
+        // bypassed deliberately to reach the parser.
+        db.conn
+            .execute("PRAGMA ignore_check_constraints = ON", [])
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE jobs SET state = 'quarantined' WHERE id = ?1",
+                params![id.to_string()],
+            )
+            .unwrap();
+
+        let err = Db::load_job(&db.conn, &id.to_string()).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown job state"),
+            "expected a hard error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_job_id_is_an_error_not_a_nil_ulid() {
+        // `recording_id` cannot be corrupted while the foreign key holds, so
+        // the primary key is the reachable case.
+        let (db, rec) = db_with_recording();
+        let id = db.enqueue(rec, JobType::Transcribe, 1).unwrap();
+        db.conn
+            .execute(
+                "UPDATE jobs SET id = 'not-a-ulid' WHERE id = ?1",
+                params![id.to_string()],
+            )
+            .unwrap();
+
+        let err = Db::load_job(&db.conn, "not-a-ulid").unwrap_err();
+        assert!(
+            err.to_string().contains("not a valid ULID"),
+            "expected a parse error, got: {err}"
+        );
     }
 
     #[test]

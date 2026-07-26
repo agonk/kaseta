@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use anyhow::{Context, Result};
@@ -65,6 +65,8 @@ pub struct SessionStats {
     pub bytes_written: u64,
     pub frames_captured: u64,
     pub discontinuities: u64,
+    /// Buffers the server had ready that were never collected.
+    pub drops: u64,
 }
 
 pub struct RecordingSession {
@@ -75,6 +77,13 @@ pub struct RecordingSession {
     streams: Vec<CaptureStream>,
     collector: Option<JoinHandle<Result<CollectedTracks>>>,
     stop_flag: Arc<AtomicBool>,
+    /// First collector error, published as soon as it happens.
+    ///
+    /// Once the collector exits, its channel closes and every capture callback
+    /// silently discards buffers. Without this the caller would keep recording
+    /// into nothing and only discover the failure at `stop`, by which point the
+    /// rest of the meeting is gone.
+    failure: Arc<Mutex<Option<String>>>,
     specs: Vec<TrackSpec>,
 }
 
@@ -93,6 +102,7 @@ pub struct SessionOutcome {
 #[derive(Debug)]
 pub struct TrackOutcome {
     pub track_id: TrackId,
+    pub drops: u64,
     /// Loudest sample as a fraction of full scale. A track that captured
     /// correctly but heard nothing is indistinguishable from a broken one
     /// without this.
@@ -127,7 +137,14 @@ impl RecordingSession {
         // once every stream thread has exited.
         drop(tx);
 
-        let collector = spawn_collector(rx, specs.clone(), prefix.clone(), store);
+        let failure = Arc::new(Mutex::new(None));
+        let collector = spawn_collector(
+            rx,
+            specs.clone(),
+            prefix.clone(),
+            store,
+            Arc::clone(&failure),
+        );
 
         Ok(Self {
             recording_id,
@@ -137,6 +154,7 @@ impl RecordingSession {
             streams,
             collector: Some(collector),
             stop_flag,
+            failure,
             specs,
         })
     }
@@ -148,6 +166,14 @@ impl RecordingSession {
 
     pub fn prefix(&self) -> &RecordingPrefix {
         &self.prefix
+    }
+
+    /// The first collector failure, if the session has stopped persisting.
+    ///
+    /// A session that reports a failure is no longer recording anything and
+    /// should be stopped; continuing only discards audio.
+    pub fn failure(&self) -> Option<String> {
+        self.failure.lock().ok().and_then(|f| f.clone())
     }
 
     /// Stops every track, flushes trailing audio, and returns the manifest.
@@ -178,6 +204,7 @@ impl RecordingSession {
                 TrackOutcome {
                     track_id: spec.track_id.clone(),
                     peak_level: acc.map(|a| a.peak_level).unwrap_or(0.0),
+                    drops: acc.map(|a| a.stats.drops).unwrap_or(0),
                     discontinuities: acc.map(|a| a.stats.discontinuities).unwrap_or(0),
                 }
             })
@@ -297,10 +324,23 @@ fn spawn_collector(
     specs: Vec<TrackSpec>,
     prefix: RecordingPrefix,
     store: Arc<dyn BlobStore>,
+    failure: Arc<Mutex<Option<String>>>,
 ) -> JoinHandle<Result<CollectedTracks>> {
     std::thread::Builder::new()
         .name("kaseta-collector".into())
         .spawn(move || -> Result<CollectedTracks> {
+            // Publishes the first error before unwinding. Once this thread
+            // exits, the channel closes and every capture callback silently
+            // discards its buffers, so the owner must be able to see the
+            // failure while it is happening rather than at `stop`.
+            let publish = |e: anyhow::Error| -> anyhow::Error {
+                if let Ok(mut slot) = failure.lock() {
+                    slot.get_or_insert_with(|| format!("{e:#}"));
+                }
+                tracing::error!(error = %format!("{e:#}"), "capture collector failed");
+                e
+            };
+
             let mut tracks: CollectedTracks = BTreeMap::new();
 
             for (index, event) in rx {
@@ -335,8 +375,10 @@ fn spawn_collector(
                             // survives; a fresh one would restart at zero and
                             // collide with chunks already stored.
                             Some(writer) => {
-                                if let Some(tail) = writer.reconfigure(config)? {
-                                    persist_chunk(&*store, &prefix, &spec.track_id, tail, acc)?;
+                                let tail = writer.reconfigure(config).map_err(&publish)?;
+                                if let Some(tail) = tail {
+                                    persist_chunk(&*store, &prefix, &spec.track_id, tail, acc)
+                                        .map_err(&publish)?;
                                 }
                             }
                             None => acc.writer = Some(ChunkWriter::new(config)),
@@ -356,22 +398,32 @@ fn spawn_collector(
                         acc.stats.frames_captured +=
                             (samples.len() / writer.config().channels.max(1) as usize) as u64;
 
-                        let sealed = writer.push(CapturedBuffer {
-                            samples: &samples,
-                            arrived_at_ns,
-                            source_pts_ns,
-                        })?;
+                        let sealed = writer
+                            .push(CapturedBuffer {
+                                samples: &samples,
+                                arrived_at_ns,
+                                source_pts_ns,
+                            })
+                            .map_err(&publish)?;
                         for chunk in sealed {
-                            persist_chunk(&*store, &prefix, &spec.track_id, chunk, acc)?;
+                            persist_chunk(&*store, &prefix, &spec.track_id, chunk, acc)
+                                .map_err(&publish)?;
+                        }
+                    }
+                    CaptureEvent::Dropped => {
+                        acc.stats.drops += 1;
+                        if let Some(writer) = acc.writer.as_mut() {
+                            writer.note_drop();
                         }
                     }
                     CaptureEvent::Ended { reason } => {
                         tracing::info!(track = %spec.track_id, %reason, "capture stream ended");
                         if let Some(writer) = acc.writer.as_mut() {
-                            let tail = writer.flush()?;
+                            let tail = writer.flush().map_err(&publish)?;
                             acc.peak_level = writer.peak_level();
                             if let Some(chunk) = tail {
-                                persist_chunk(&*store, &prefix, &spec.track_id, chunk, acc)?;
+                                persist_chunk(&*store, &prefix, &spec.track_id, chunk, acc)
+                                    .map_err(&publish)?;
                             }
                         }
                     }
@@ -385,8 +437,14 @@ fn spawn_collector(
 
 /// Writes a sealed chunk to storage and records it in the manifest.
 ///
-/// Persisting here rather than at the end of the recording is what bounds crash
-/// loss to a single chunk.
+/// Two objects are written per chunk: the audio, then a sidecar holding its
+/// timing metadata. The manifest is only assembled when the session ends, so
+/// without the sidecar a crash would leave audio on disk whose timestamps,
+/// discontinuity flags and digests died with the in-memory accumulator —
+/// unusable for alignment or transcription.
+///
+/// Audio is written first. A sidecar therefore implies its audio is present,
+/// and recovery can treat any chunk lacking one as incomplete.
 fn persist_chunk(
     store: &dyn BlobStore,
     prefix: &RecordingPrefix,
@@ -405,7 +463,7 @@ fn persist_chunk(
         acc.stats.discontinuities += 1;
     }
 
-    acc.chunks.push(Chunk {
+    let record = Chunk {
         seq: chunk.seq,
         blob: key,
         sha256: chunk.sha256,
@@ -417,9 +475,16 @@ fn persist_chunk(
         source_pts_end_ns: chunk.source_pts_end_ns,
         discontinuity: chunk.discontinuity,
         gap_before_ns: chunk.gap_before_ns,
-        drops_before_chunk: 0,
-    });
+        drops_before_chunk: chunk.drops_before_chunk,
+    };
 
+    let sidecar = prefix.chunk(track_id, record.seq, "json");
+    let encoded = serde_json::to_vec(&record).context("serialising chunk metadata")?;
+    store
+        .put_idempotent(&sidecar, &encoded)
+        .with_context(|| format!("persisting metadata for chunk {} of {track_id}", record.seq))?;
+
+    acc.chunks.push(record);
     Ok(())
 }
 

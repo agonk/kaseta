@@ -35,6 +35,10 @@ pub enum CaptureEvent {
         /// The stream's own position, for cross-checking the canonical clock.
         source_pts_ns: Option<u64>,
     },
+    /// The server had audio ready that could not be collected. Reported rather
+    /// than logged because elapsed-time gap detection cannot see this loss: the
+    /// next buffer still arrives on schedule.
+    Dropped,
     /// The stream stopped on its own — the device disappeared, or the server
     /// went away. The owner decides whether to reconnect.
     Ended { reason: String },
@@ -176,10 +180,11 @@ fn run_capture_loop(
                 return;
             }
             let Some(mut buffer) = stream.dequeue_buffer() else {
-                // The server reclaimed buffers faster than they were consumed.
-                // Nothing is lost: the gap is detected downstream from the
-                // canonical clock and recorded as a discontinuity.
-                tracing::warn!("no capture buffer available");
+                // Audio is lost here, and the canonical clock cannot reveal it:
+                // the next buffer still arrives on schedule, so no gap appears.
+                // It is reported so the chunk can carry an explicit drop count.
+                tracing::warn!("no capture buffer available; audio dropped");
+                let _ = events_for_process.send(CaptureEvent::Dropped);
                 return;
             };
 

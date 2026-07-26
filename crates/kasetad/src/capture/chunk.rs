@@ -76,6 +76,8 @@ pub struct SealedChunk {
     /// seamlessly from the previous one.
     pub discontinuity: bool,
     pub gap_before_ns: u64,
+    /// Buffers the audio server had ready but that were never collected.
+    pub drops_before_chunk: u64,
 }
 
 /// One captured buffer as delivered by the audio server.
@@ -108,6 +110,8 @@ pub struct ChunkWriter {
     last_arrival_ns: Option<u64>,
     /// Loudest absolute sample observed across the whole track.
     peak: i16,
+    /// Buffers lost before the pending chunk was sealed.
+    pending_drops: u64,
 }
 
 impl ChunkWriter {
@@ -125,6 +129,7 @@ impl ChunkWriter {
             pending_gap_ns: 0,
             last_arrival_ns: None,
             peak: 0,
+            pending_drops: 0,
         }
     }
 
@@ -136,6 +141,15 @@ impl ChunkWriter {
     #[allow(dead_code)]
     pub fn pending_frames(&self) -> usize {
         self.pending.len() / self.config.channels.max(1) as usize
+    }
+
+    /// Records that the audio server had a buffer ready that was never taken.
+    ///
+    /// This loss is invisible to gap detection: the following buffer can still
+    /// arrive on schedule, so elapsed time looks normal even though audio is
+    /// missing. Counting it explicitly is the only way it surfaces.
+    pub fn note_drop(&mut self) {
+        self.pending_drops = self.pending_drops.saturating_add(1);
     }
 
     /// Loudest sample seen so far, as a fraction of full scale.
@@ -182,7 +196,20 @@ impl ChunkWriter {
         let frames = buffer.samples.len() / self.config.channels.max(1) as usize;
         let buffer_duration_ns = samples_to_ns(frames as u64, self.config.sample_rate_hz);
 
-        self.note_gap(buffer.arrived_at_ns, buffer_duration_ns);
+        let mut sealed = Vec::new();
+
+        // A hole in the audio must become a chunk boundary, not a flag on a
+        // chunk that already holds pre-gap audio. Appending across a gap would
+        // let `finish` interpolate timestamps as though the missing time never
+        // elapsed, placing every later sample in the chunk too early.
+        if let Some(missing_ns) = self.detect_gap(buffer.arrived_at_ns, buffer_duration_ns) {
+            if let Some(chunk) = self.flush()? {
+                sealed.push(chunk);
+            }
+            // Applies to the chunk that starts *after* the hole.
+            self.pending_discontinuity = true;
+            self.pending_gap_ns = missing_ns;
+        }
 
         if self.pending_start_ns.is_none() {
             // A buffer arrives once its audio has been captured, so the first
@@ -202,28 +229,28 @@ impl ChunkWriter {
         }
         self.pending.extend_from_slice(buffer.samples);
 
-        let mut sealed = Vec::new();
         while self.pending.len() >= self.config.samples_per_chunk() {
             sealed.push(self.seal_full_chunk()?);
         }
         Ok(sealed)
     }
 
-    /// Detects that audio went missing between buffers.
+    /// Reports how much audio went missing before this buffer, if any.
     ///
-    /// Under-runs and device changes leave a hole. Recording the hole rather
-    /// than silently concatenating across it is what stops every timestamp after
-    /// the glitch from being wrong.
-    fn note_gap(&mut self, arrived_at_ns: u64, buffer_duration_ns: u64) {
-        let Some(last) = self.last_arrival_ns else {
-            return;
-        };
+    /// Under-runs and device changes leave a hole. Measuring it here, and
+    /// letting the caller turn it into a chunk boundary, is what stops every
+    /// timestamp after the glitch from being wrong.
+    fn detect_gap(&self, arrived_at_ns: u64, buffer_duration_ns: u64) -> Option<u64> {
+        let last = self.last_arrival_ns?;
+        if buffer_duration_ns == 0 {
+            return None;
+        }
         let elapsed = arrived_at_ns.saturating_sub(last);
         let tolerated = (buffer_duration_ns as f64 * GAP_TOLERANCE) as u64;
-        if buffer_duration_ns > 0 && elapsed > tolerated {
-            let missing = elapsed.saturating_sub(buffer_duration_ns);
-            self.pending_discontinuity = true;
-            self.pending_gap_ns = self.pending_gap_ns.saturating_add(missing);
+        if elapsed > tolerated {
+            Some(elapsed.saturating_sub(buffer_duration_ns))
+        } else {
+            None
         }
     }
 
@@ -242,9 +269,15 @@ impl ChunkWriter {
 
         let chunk = self.finish(samples, start_ns, boundary_ns)?;
 
-        // The retained remainder begins exactly where the sealed chunk ended.
+        // The retained remainder begins exactly where the sealed chunk ended,
+        // on both clocks. The stream's own timestamp advances with the samples,
+        // so it is interpolated the same way rather than snapped to the last
+        // buffer's value — which would be wrong whenever a boundary falls
+        // inside a buffer.
         self.pending_start_ns = Some(boundary_ns);
-        self.pending_pts_start_ns = self.pending_pts_end_ns;
+        self.pending_pts_start_ns = self
+            .pending_pts_start_ns
+            .map(|pts| pts + samples_to_ns(sealed_frames, self.config.sample_rate_hz));
         self.pending_discontinuity = false;
         self.pending_gap_ns = 0;
 
@@ -264,6 +297,8 @@ impl ChunkWriter {
         let end_ns = self.pending_end_ns.max(start_ns);
         let chunk = self.finish(samples, start_ns, end_ns)?;
         self.pending_start_ns = None;
+        self.pending_discontinuity = false;
+        self.pending_gap_ns = 0;
         Ok(Some(chunk))
     }
 
@@ -283,8 +318,10 @@ impl ChunkWriter {
             source_pts_end_ns: self.pending_pts_end_ns,
             discontinuity: self.pending_discontinuity,
             gap_before_ns: self.pending_gap_ns,
+            drops_before_chunk: self.pending_drops,
         };
 
+        self.pending_drops = 0;
         self.next_seq += 1;
         Ok(chunk)
     }
@@ -448,24 +485,75 @@ mod tests {
     }
 
     #[test]
-    fn a_dropout_is_recorded_rather_than_silently_concatenated() {
+    fn a_dropout_forces_a_chunk_boundary() {
         let mut w = ChunkWriter::new(config());
         let quarter = tone(12_000); // 250 ms per buffer
 
-        w.push(buffer(&quarter, 250_000_000)).unwrap();
+        assert!(w.push(buffer(&quarter, 250_000_000)).unwrap().is_empty());
+
         // The next buffer should arrive at 500 ms; it arrives at 2 s instead,
         // so 1.5 s of audio never reached us.
-        w.push(buffer(&quarter, 2_000_000_000)).unwrap();
-        w.push(buffer(&quarter, 2_250_000_000)).unwrap();
-        let sealed = w.push(buffer(&quarter, 2_500_000_000)).unwrap();
+        let sealed = w.push(buffer(&quarter, 2_000_000_000)).unwrap();
 
-        assert_eq!(sealed.len(), 1);
-        assert!(sealed[0].discontinuity, "the dropout must be flagged");
-        assert!(
-            sealed[0].gap_before_ns >= 1_400_000_000,
-            "expected ~1.5s of missing audio, recorded {}ns",
-            sealed[0].gap_before_ns
+        assert_eq!(
+            sealed.len(),
+            1,
+            "audio captured before the hole must be sealed at the hole"
         );
+        assert!(
+            !sealed[0].discontinuity,
+            "the gap follows this chunk; it does not precede it"
+        );
+        assert_eq!(sealed[0].sample_count, 12_000);
+
+        let after = w.flush().unwrap().unwrap();
+        assert!(after.discontinuity, "the chunk after the hole carries the flag");
+        assert!(
+            after.gap_before_ns >= 1_400_000_000,
+            "expected ~1.5s missing, recorded {}ns",
+            after.gap_before_ns
+        );
+    }
+
+    #[test]
+    fn audio_after_a_gap_is_not_timestamped_as_though_the_gap_never_happened() {
+        // Concatenating across a hole makes `finish` interpolate as if the
+        // missing time never elapsed, placing every later sample too early.
+        let mut w = ChunkWriter::new(config());
+        let quarter = tone(12_000);
+
+        w.push(buffer(&quarter, 250_000_000)).unwrap();
+        let before = w.push(buffer(&quarter, 2_000_000_000)).unwrap();
+        assert_eq!(before[0].boottime_end_ns, 250_000_000);
+
+        let after = w.flush().unwrap().unwrap();
+        assert_eq!(
+            after.boottime_start_ns, 1_750_000_000,
+            "post-gap audio must start after the hole, not where the pre-gap audio ended"
+        );
+    }
+
+    #[test]
+    fn a_chunk_split_inside_a_buffer_interpolates_the_source_timestamp() {
+        let mut w = ChunkWriter::new(config());
+        // Three seconds delivered at once: boundaries fall inside the buffer.
+        let three = tone(144_000);
+        let sealed = w
+            .push(CapturedBuffer {
+                samples: &three,
+                arrived_at_ns: 3_000_000_000,
+                source_pts_ns: Some(3_000_000_000),
+            })
+            .unwrap();
+
+        assert_eq!(sealed.len(), 3);
+        for (i, c) in sealed.iter().enumerate() {
+            assert_eq!(
+                c.source_pts_start_ns,
+                Some(i as u64 * 1_000_000_000),
+                "chunk {i} source PTS must advance with the samples"
+            );
+        }
     }
 
     #[test]
