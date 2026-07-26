@@ -6,6 +6,7 @@ mod blobstore;
 mod capture;
 mod clock;
 mod db;
+mod export;
 
 const USAGE: &str = "\
 kasetad — Kaseta recording daemon
@@ -17,6 +18,8 @@ COMMANDS:
     devices              List recordable audio devices and exit
     doctor               Check that this machine can capture audio
     record [SECONDS]     Record both sides of a meeting (default 30s)
+    export [ID]          Merge a recording's chunks into one file per track
+                         (defaults to the most recent recording)
     help                 Show this message
 
 ENVIRONMENT:
@@ -36,6 +39,7 @@ fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("devices") => cmd_devices(),
         Some("doctor") => cmd_doctor(),
+        Some("export") => cmd_export(std::env::args().nth(2)),
         Some("record") => {
             let seconds = std::env::args()
                 .nth(2)
@@ -309,10 +313,114 @@ fn cmd_record(seconds: u64) -> Result<()> {
         println!();
     }
 
+    // Chunks are the durable format but not a listenable one, so a merged file
+    // per track is produced immediately rather than left as a separate step.
+    match export::merge_recording(&*store, manifest, &prefix) {
+        Ok(merged) if !merged.is_empty() => {
+            println!("Merged:");
+            for m in &merged {
+                println!(
+                    "  {}  ({:.1} MiB)",
+                    m.key,
+                    m.bytes as f64 / (1024.0 * 1024.0)
+                );
+            }
+            println!();
+        }
+        Ok(_) => {}
+        // A failed merge must not discard a good recording; the chunks are
+        // intact and `export` can retry.
+        Err(e) => eprintln!("Could not merge tracks: {e:#}\nThe chunks are intact; run `kasetad export` to retry.\n"),
+    }
+
     println!("Manifest: {}", prefix.manifest());
 
     if let Some(error) = aborted {
         anyhow::bail!("recording did not complete: {error}");
     }
     Ok(())
+}
+
+/// Merges a recording's chunks into one continuous file per track.
+///
+/// Chunks stay the durable format; this produces something listenable without
+/// discarding them.
+fn cmd_export(id: Option<String>) -> Result<()> {
+    use blobstore::BlobStore;
+
+    let root = std::env::var("KASETA_DATA").unwrap_or_else(|_| "./data".into());
+    let store = blobstore::LocalFsStore::new(&root)?;
+
+    let manifest_key = match &id {
+        Some(id) => find_manifest_matching(&store, id)?,
+        None => latest_manifest(&store)?,
+    };
+
+    let manifest: kaseta_contracts::RecordingManifest =
+        serde_json::from_slice(&store.get(&manifest_key)?)
+            .with_context(|| format!("reading manifest {manifest_key}"))?;
+
+    let prefix = kaseta_contracts::RecordingPrefix::new(manifest.recording_id, manifest.started_at);
+    println!("Merging {}\n", manifest.recording_id);
+
+    let merged = export::merge_recording(&store, &manifest, &prefix)?;
+    if merged.is_empty() {
+        println!("Nothing to merge: this recording captured no audio.");
+        return Ok(());
+    }
+
+    for m in &merged {
+        let rate = manifest
+            .tracks
+            .iter()
+            .find_map(|t| {
+                m.key
+                    .as_str()
+                    .contains(t.track_id.as_str())
+                    .then(|| t.format.sample_rate_hz)
+                    .flatten()
+            })
+            .unwrap_or(48_000);
+
+        println!("  {}", m.key);
+        println!(
+            "    {:.1}s, {:.1} MiB",
+            export::frames_to_seconds(m.frames, rate),
+            m.bytes as f64 / (1024.0 * 1024.0)
+        );
+        if m.padded_frames > 0 {
+            println!(
+                "    {:.1}s of silence inserted where audio was dropped",
+                export::frames_to_seconds(m.padded_frames, rate)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The manifest of the most recent recording.
+///
+/// Keys are time-partitioned and zero-padded, so the last one lexicographically
+/// is the newest.
+fn latest_manifest(store: &blobstore::LocalFsStore) -> Result<kaseta_contracts::BlobKey> {
+    use blobstore::BlobStore;
+    store
+        .list_prefix("recordings")?
+        .into_iter()
+        .filter(|k| k.as_str().ends_with("/manifest.json"))
+        .next_back()
+        .context("no completed recordings found")
+}
+
+fn find_manifest_matching(
+    store: &blobstore::LocalFsStore,
+    id: &str,
+) -> Result<kaseta_contracts::BlobKey> {
+    use blobstore::BlobStore;
+    store
+        .list_prefix("recordings")?
+        .into_iter()
+        .filter(|k| k.as_str().ends_with("/manifest.json"))
+        .find(|k| k.as_str().contains(id))
+        .with_context(|| format!("no recording matching {id:?}"))
 }

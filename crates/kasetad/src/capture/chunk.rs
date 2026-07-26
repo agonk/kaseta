@@ -350,15 +350,20 @@ impl ChunkWriter {
     }
 }
 
+fn encode_flac(samples: &[i16], config: &ChunkConfig) -> Result<Vec<u8>> {
+    encode_flac_samples(samples, config.sample_rate_hz, config.channels)
+}
+
 /// Encodes interleaved 16-bit samples as FLAC.
 ///
 /// FLAC is lossless, so re-encoding for a different ASR model never compounds
-/// quality loss, and it halves the storage a WAV archive would need.
-fn encode_flac(samples: &[i16], config: &ChunkConfig) -> Result<Vec<u8>> {
+/// quality loss, and it halves the storage a WAV archive would need. Shared with
+/// the exporter, which decodes chunks and re-encodes them as one file.
+pub fn encode_flac_samples(samples: &[i16], sample_rate_hz: u32, channels: u16) -> Result<Vec<u8>> {
     use flacenc::component::BitRepr;
     use flacenc::error::Verify;
 
-    let channels = config.channels.max(1) as usize;
+    let channels = channels.max(1) as usize;
     // flacenc works in i32 regardless of the source bit depth.
     let widened: Vec<i32> = samples.iter().map(|s| *s as i32).collect();
 
@@ -366,12 +371,8 @@ fn encode_flac(samples: &[i16], config: &ChunkConfig) -> Result<Vec<u8>> {
         .into_verified()
         .map_err(|e| anyhow::anyhow!("invalid FLAC encoder config: {e:?}"))?;
 
-    let source = flacenc::source::MemSource::from_samples(
-        &widened,
-        channels,
-        16,
-        config.sample_rate_hz as usize,
-    );
+    let source =
+        flacenc::source::MemSource::from_samples(&widened, channels, 16, sample_rate_hz as usize);
 
     let stream = flacenc::encode_with_fixed_block_size(
         &encoder_config,

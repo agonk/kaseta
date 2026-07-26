@@ -43,6 +43,12 @@ pub trait BlobStore: Send + Sync {
     /// observe absence and the later one would silently replace the earlier.
     fn put_if_absent(&self, key: &BlobKey, bytes: &[u8]) -> Result<bool>;
 
+    /// Every key beneath `prefix`, in lexicographic order.
+    ///
+    /// Ordering matters: the key layout is designed so that sorting yields
+    /// chronological order for recordings and capture order for chunks.
+    fn list_prefix(&self, prefix: &str) -> Result<Vec<BlobKey>>;
+
     /// Writes only if absent, or verifies the existing object matches.
     ///
     /// Chunk writes are retried after crashes and re-uploaded on resume, so this
@@ -225,6 +231,46 @@ impl BlobStore for LocalFsStore {
             .with_context(|| format!("stat blob {key}"))?
             .len())
     }
+
+    fn list_prefix(&self, prefix: &str) -> Result<Vec<BlobKey>> {
+        let root = self.root.join(prefix);
+        let mut keys = Vec::new();
+        collect_keys(&root, &self.root, &mut keys)?;
+        keys.sort();
+        Ok(keys)
+    }
+}
+
+/// Walks `dir`, appending every file as a key relative to `root`.
+fn collect_keys(dir: &Path, root: &Path, out: &mut Vec<BlobKey>) -> Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // An absent prefix is an empty listing, matching object-store semantics.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("listing {}", dir.display())),
+    };
+
+    for entry in entries {
+        let path = entry.with_context(|| format!("reading {}", dir.display()))?.path();
+        if path.is_dir() {
+            collect_keys(&path, root, out)?;
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let Some(as_str) = relative.to_str() else {
+            continue;
+        };
+        // Staged temporaries are not objects; they are never visible as keys.
+        if as_str.ends_with(".tmp") {
+            continue;
+        }
+        if let Ok(key) = BlobKey::new(as_str) {
+            out.push(key);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
