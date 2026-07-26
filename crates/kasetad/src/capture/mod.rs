@@ -6,6 +6,8 @@
 
 pub mod chunk;
 pub mod devices;
+pub mod session;
+pub mod stream;
 
 // The capture surface, re-exported for callers. Not every item has a consumer
 // inside the binary yet, so the module-level allow keeps the public shape

@@ -1,4 +1,6 @@
-use anyhow::Result;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
 
 mod blobstore;
 mod capture;
@@ -12,12 +14,14 @@ USAGE:
     kasetad <COMMAND>
 
 COMMANDS:
-    devices     List recordable audio devices and exit
-    doctor      Check that this machine can capture audio
-    help        Show this message
+    devices              List recordable audio devices and exit
+    doctor               Check that this machine can capture audio
+    record [SECONDS]     Record both sides of a meeting (default 30s)
+    help                 Show this message
 
 ENVIRONMENT:
-    KASETA_LOG  Log filter, e.g. `kasetad=debug`
+    KASETA_LOG   Log filter, e.g. `kasetad=debug`
+    KASETA_DATA  Where recordings are written (default ./data)
 ";
 
 fn main() -> Result<()> {
@@ -32,6 +36,15 @@ fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("devices") => cmd_devices(),
         Some("doctor") => cmd_doctor(),
+        Some("record") => {
+            let seconds = std::env::args()
+                .nth(2)
+                .map(|s| s.parse::<u64>())
+                .transpose()
+                .context("SECONDS must be a whole number")?
+                .unwrap_or(30);
+            cmd_record(seconds)
+        }
         Some("help") | Some("--help") | Some("-h") => {
             println!("{USAGE}");
             Ok(())
@@ -137,5 +150,97 @@ fn cmd_doctor() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Records both sides of a meeting for a fixed duration.
+///
+/// This is the end-to-end check that capture works on a given machine: it opens
+/// a microphone and a playback monitor as separate tracks, seals chunks as it
+/// goes, and reports what it measured — including per-track clock drift, which
+/// is the failure that would otherwise go unnoticed until transcripts came out
+/// misaligned.
+fn cmd_record(seconds: u64) -> Result<()> {
+    use blobstore::BlobStore;
+    use capture::devices::DeviceKind;
+    use capture::session::{RecordingSession, TrackSpec};
+
+    let devices = capture::list_devices()
+        .context("could not reach PipeWire — run `kasetad doctor` to diagnose")?;
+
+    let mic = devices
+        .iter()
+        .find(|d| d.kind == DeviceKind::Microphone)
+        .context("no microphone found — cannot record your own audio")?
+        .clone();
+    let playback = devices
+        .iter()
+        .find(|d| d.kind == DeviceKind::SinkMonitor)
+        .context("no playback monitor found — cannot record the far end")?
+        .clone();
+
+    let root = std::env::var("KASETA_DATA").unwrap_or_else(|_| "./data".into());
+    let store = Arc::new(blobstore::LocalFsStore::new(&root)?);
+
+    println!("Recording {seconds}s");
+    println!("  microphone  {}", mic.display_name);
+    println!("  playback    {}", playback.display_name);
+    println!("  writing to  {}\n", store.root().display());
+
+    let specs = TrackSpec::meeting(mic, playback)?;
+    let started_at = time::OffsetDateTime::now_utc();
+    let session = RecordingSession::start(specs, store.clone(), started_at)?;
+    let prefix = session.prefix().clone();
+
+    std::thread::sleep(std::time::Duration::from_secs(seconds));
+
+    let manifest = session.stop()?;
+
+    // The manifest is what every later stage reads; without it the chunks on
+    // disk are unattributed audio.
+    let manifest_json = serde_json::to_vec_pretty(&manifest)?;
+    store.put(&prefix.manifest(), &manifest_json)?;
+
+    println!("Recorded {}\n", manifest.recording_id);
+
+    for track in &manifest.tracks {
+        let bytes: u64 = track.chunks.iter().map(|c| c.bytes).sum();
+        let gaps = track.chunks.iter().filter(|c| c.discontinuity).count();
+        let seconds_captured = track.sample_count() as f64
+            / track.format.sample_rate_hz.unwrap_or(48_000) as f64;
+
+        println!("  {}", track.track_id);
+        println!(
+            "    {} chunks, {:.1}s captured, {:.1} MiB",
+            track.chunks.len(),
+            seconds_captured,
+            bytes as f64 / (1024.0 * 1024.0)
+        );
+
+        match track.drift() {
+            Some(d) => {
+                let verdict = if d.requires_resample() {
+                    "exceeds threshold — merged audio needs resampling"
+                } else {
+                    "within tolerance"
+                };
+                println!(
+                    "    drift {:+.1} ms over {:.0}s ({verdict})",
+                    d.offset_ms, seconds_captured
+                );
+            }
+            None => println!("    drift  not measurable (no audio captured)"),
+        }
+
+        if gaps > 0 {
+            println!("    {gaps} discontinuit(ies) — audio was dropped");
+        }
+        if track.chunks.is_empty() {
+            println!("    NO AUDIO CAPTURED");
+        }
+        println!();
+    }
+
+    println!("Manifest: {}", prefix.manifest());
     Ok(())
 }
