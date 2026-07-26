@@ -1,0 +1,20 @@
+[project]
+name = "kaseta-worker"
+version = "0.1.0"
+description = "Kaseta transcription worker"
+requires-python = ">=3.10"
+
+# onnx-asr runs Parakeet through ONNX Runtime with no PyTorch, NeMo, or
+# transformers dependency. That keeps the install small and, more importantly,
+# keeps peak memory roughly half what the reference implementation needs — which
+# is what makes transcription practical on a CPU-only laptop.
+dependencies = [
+    "onnx-asr[cpu,hub]>=0.6",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["kaseta_worker*"]

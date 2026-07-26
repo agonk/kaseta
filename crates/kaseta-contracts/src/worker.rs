@@ -21,15 +21,42 @@ use crate::blob::{BlobKey, TrackId};
 pub const TRANSCRIBE_SPEC_VERSION: &str = "transcribe-tracks/v1";
 pub const WORKER_RESULT_VERSION: &str = "worker-result/v1";
 
+/// How the worker resolves [`BlobKey`]s to bytes.
+///
+/// The contract stays storage-agnostic — it names keys, never paths — but the
+/// worker is a separate process and must be told where to look. Adding a remote
+/// store is a new variant here, not a change to the protocol.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StorageRef {
+    LocalFs { root: String },
+}
+
+/// One track's audio to transcribe.
+///
+/// Points at the *merged* export rather than at chunks. Merging already
+/// concatenated the chunks and padded every dropped-audio gap with silence of
+/// exactly the missing duration, which makes the file a linear timeline: an
+/// offset within it maps to the canonical clock by simple addition. Handing the
+/// worker chunks instead would make it responsible for reassembly and for gap
+/// arithmetic it has no reason to know about.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TrackAudio {
+    pub track_id: TrackId,
+    /// Who this track carries, so the worker can label segments without
+    /// inferring anything.
+    pub speaker_hint: SpeakerHint,
+    pub audio: BlobKey,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TranscribeSpec {
     pub contract_version: String,
     pub job_id: Ulid,
     pub recording_id: Ulid,
     pub revision: u32,
-    /// Where to read the manifest describing the tracks and their chunks.
-    pub manifest: BlobKey,
-    pub tracks: Vec<TrackId>,
+    pub storage: StorageRef,
+    pub tracks: Vec<TrackAudio>,
     pub params: TranscribeParams,
 }
 
@@ -38,8 +65,8 @@ impl TranscribeSpec {
         job_id: Ulid,
         recording_id: Ulid,
         revision: u32,
-        manifest: BlobKey,
-        tracks: Vec<TrackId>,
+        storage: StorageRef,
+        tracks: Vec<TrackAudio>,
         params: TranscribeParams,
     ) -> Self {
         Self {
@@ -47,7 +74,7 @@ impl TranscribeSpec {
             job_id,
             recording_id,
             revision,
-            manifest,
+            storage,
             tracks,
             params,
         }
@@ -144,12 +171,16 @@ pub struct TrackTranscript {
     pub segments: Vec<Segment>,
 }
 
+/// A stretch of recognised speech.
+///
+/// Offsets are relative to the start of the track's audio, in nanoseconds. The
+/// worker does not know about the canonical clock and must not: keeping the
+/// mapping in the daemon means a change to how time is tracked never requires a
+/// matching change in a separate language.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Segment {
-    /// Positioned on the canonical timeline, already mapped out of chunk-local
-    /// sample offsets by the worker.
-    pub start_boottime_ns: u64,
-    pub end_boottime_ns: u64,
+    pub start_ns: u64,
+    pub end_ns: u64,
     pub text: String,
     /// Attribution derived from which track this came from, requiring no
     /// speaker model. Audio captured from the microphone was spoken by the
@@ -171,8 +202,8 @@ pub enum SpeakerHint {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Word {
-    pub start_boottime_ns: u64,
-    pub end_boottime_ns: u64,
+    pub start_ns: u64,
+    pub end_ns: u64,
     pub text: String,
 }
 
@@ -204,8 +235,8 @@ mod tests {
                 track_id: TrackId::new("a_local-mic_01").unwrap(),
                 language: Some("en".into()),
                 segments: vec![Segment {
-                    start_boottime_ns: 1_000_000_000,
-                    end_boottime_ns: 2_000_000_000,
+                    start_ns: 1_000_000_000,
+                    end_ns: 2_000_000_000,
                     text: "Can you hear me?".into(),
                     speaker_hint: Some(SpeakerHint::Local),
                     words: vec![],
@@ -255,13 +286,23 @@ mod tests {
             Ulid::nil(),
             Ulid::nil(),
             1,
-            BlobKey::new("recordings/2026/07/25/x/manifest.json").unwrap(),
-            vec![TrackId::new("a_local-mic_01").unwrap()],
+            StorageRef::LocalFs {
+                root: "/var/lib/kaseta".into(),
+            },
+            vec![TrackAudio {
+                track_id: TrackId::new("a_local-mic_01").unwrap(),
+                speaker_hint: SpeakerHint::Local,
+                audio: BlobKey::new("recordings/2026/07/25/x/exports/a_local-mic_01.flac").unwrap(),
+            }],
             TranscribeParams::default(),
         );
         let json = serde_json::to_string(&spec).unwrap();
-        assert!(!json.contains("file://"), "contracts must stay storage-agnostic");
-        assert!(!json.contains("/home"));
+        // Audio is named by key. Where those keys resolve is a separate,
+        // explicit field, so moving the worker elsewhere is a new storage
+        // variant rather than a protocol change.
+        assert!(!json.contains("file://"));
+        assert!(json.contains("\"audio\":\"recordings/"));
+        assert!(json.contains("\"kind\":\"local_fs\""));
 
         let back: TranscribeSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(back.contract_version, TRANSCRIBE_SPEC_VERSION);

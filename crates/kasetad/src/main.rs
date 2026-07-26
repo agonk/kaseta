@@ -10,6 +10,7 @@ mod export;
 mod http;
 mod library;
 mod supervisor;
+mod transcribe;
 
 const USAGE: &str = "\
 kasetad — Kaseta recording daemon
@@ -24,9 +25,11 @@ COMMANDS:
     serve [PORT]         Run the daemon and its interface (default 7777)
     export [ID]          Merge a recording's chunks into one file per track
                          (defaults to the most recent recording)
+    transcribe [ID]      Transcribe a recording (defaults to the most recent)
     help                 Show this message
 
 ENVIRONMENT:
+    KASETA_WORKER_PYTHON  Interpreter with the transcription worker installed
     KASETA_LOG   Log filter, e.g. `kasetad=debug`
     KASETA_DATA  Where recordings are written (default ./data)
     KASETA_PORT  Port for `serve` (default 7777)
@@ -45,6 +48,7 @@ fn main() -> Result<()> {
         Some("devices") => cmd_devices(),
         Some("doctor") => cmd_doctor(),
         Some("export") => cmd_export(std::env::args().nth(2)),
+        Some("transcribe") => cmd_transcribe(std::env::args().nth(2)),
         Some("serve") => {
             let port = std::env::args()
                 .nth(2)
@@ -515,4 +519,81 @@ fn cmd_serve(port: u16) -> Result<()> {
         .context("starting the async runtime")?;
 
     runtime.block_on(http::serve(supervisor, store, db, port))
+}
+
+/// Transcribes a recording and stores the result.
+///
+/// Each side is transcribed from its own track, so every line already knows who
+/// said it — no speaker model involved.
+fn cmd_transcribe(id: Option<String>) -> Result<()> {
+    use blobstore::BlobStore;
+
+    let root = std::env::var("KASETA_DATA").unwrap_or_else(|_| "./data".into());
+    let store = blobstore::LocalFsStore::new(&root)?;
+    let db = db::Db::open(&std::path::Path::new(&root).join("kaseta.db"))?;
+
+    let manifest_key = match &id {
+        Some(id) => find_manifest_matching(&store, id)?,
+        None => latest_manifest(&store)?,
+    };
+    let manifest: kaseta_contracts::RecordingManifest =
+        serde_json::from_slice(&store.get(&manifest_key)?)
+            .with_context(|| format!("reading manifest {manifest_key}"))?;
+
+    println!("Transcribing {}", manifest.recording_id);
+    println!("This runs a model on CPU; expect it to take a fraction of the recording's length.\n");
+
+    let root = store.root().display().to_string();
+    let segments = transcribe::transcribe_recording(&store, &db, &root, &manifest)?;
+
+    if segments == 0 {
+        println!("No speech was found.");
+        return Ok(());
+    }
+
+    println!("{segments} segment(s) transcribed.\n");
+    print_transcript(&db, manifest.recording_id)?;
+    Ok(())
+}
+
+/// Prints a transcript as a conversation, in the order things were said.
+fn print_transcript(db: &db::Db, recording_id: ulid::Ulid) -> Result<()> {
+    let mut stmt = db.conn().prepare(
+        "SELECT s.start_boottime_ns, s.speaker_hint, s.text
+         FROM transcript_segments s
+         JOIN transcripts t ON t.id = s.transcript_id
+         WHERE t.recording_id = ?1
+         ORDER BY s.start_boottime_ns",
+    )?;
+
+    let base: Option<i64> = db
+        .conn()
+        .query_row(
+            "SELECT clock_started_ns FROM recordings WHERE id = ?1",
+            rusqlite::params![recording_id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap_or(None);
+    let base = base.unwrap_or(0) as u64;
+
+    let rows = stmt.query_map(rusqlite::params![recording_id.to_string()], |r| {
+        Ok((
+            r.get::<_, i64>(0)? as u64,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+
+    for row in rows {
+        let (start_ns, speaker, text) = row?;
+        // Shown relative to the recording, not to system boot.
+        let offset = start_ns.saturating_sub(base) / 1_000_000_000;
+        let who = match speaker.as_str() {
+            "local" => "You",
+            "remote" => "Them",
+            _ => "?",
+        };
+        println!("[{:02}:{:02}] {who:>4}  {text}", offset / 60, offset % 60);
+    }
+    Ok(())
 }
