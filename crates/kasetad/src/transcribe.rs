@@ -62,17 +62,22 @@ pub fn transcribe_recording(
         if track.chunks.is_empty() {
             continue;
         }
-        let audio = prefix
+        let merged = prefix
             .export(&format!("{}.flac", track.track_id))
             .context("building export key")?;
         // Transcribing a track whose export never landed would silently drop a
         // side of the conversation.
-        if !store.exists(&audio)? {
+        if !store.exists(&merged)? {
             bail!(
                 "{} has no exported audio; run `kasetad export` first",
                 track.track_id
             );
         }
+
+        // The recogniser reads mono WAV only, while archives are stereo FLAC.
+        // Converting here keeps the worker free of audio-decoding dependencies.
+        let audio = crate::export::write_asr_audio(store, track, &prefix)
+            .with_context(|| format!("preparing {} for transcription", track.track_id))?;
         tracks.push(TrackAudio {
             track_id: track.track_id.clone(),
             speaker_hint: hint_for(track.role),
@@ -112,16 +117,24 @@ fn hint_for(role: TrackRole) -> SpeakerHint {
 
 /// Locates the interpreter that has the worker installed.
 fn worker_python() -> String {
-    if let Ok(explicit) = std::env::var("KASETA_WORKER_PYTHON") {
-        return explicit;
+    let candidate = std::env::var("KASETA_WORKER_PYTHON")
+        .map(std::path::PathBuf::from)
+        // The layout the worker's README sets up, so the common case needs no
+        // configuration.
+        .unwrap_or_else(|_| std::path::PathBuf::from("worker/.venv/bin/python"));
+
+    if !candidate.is_file() {
+        // Fall back to whatever `python3` resolves to and let the spawn fail
+        // with a message naming what was tried.
+        return "python3".to_string();
     }
-    // The layout the worker's README sets up, so the common case needs no
-    // configuration.
-    let beside = std::path::Path::new("worker/.venv/bin/python");
-    if beside.is_file() {
-        return beside.display().to_string();
-    }
-    "python3".to_string()
+
+    // Must be absolute: the child runs with a different working directory, and
+    // a relative program path would be resolved against *that* instead.
+    candidate
+        .canonicalize()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| candidate.display().to_string())
 }
 
 /// Spawns the worker, feeds it the spec, and reads back its result.

@@ -86,7 +86,13 @@ pub struct TranscribeParams {
     /// `auto` lets the worker choose based on what it can load. Naming a
     /// specific engine pins it, which is what reprocessing uses.
     pub engine: String,
+    /// Identifier the worker's loader accepts, not a display name.
     pub model: String,
+    /// Weight quantisation, e.g. `int8`. Halves memory and speeds inference
+    /// several-fold on a CPU, which is what makes transcription practical
+    /// without a GPU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<String>,
     /// BCP-47 tag, or `auto` for per-segment detection.
     pub language: String,
     pub word_timestamps: bool,
@@ -98,7 +104,8 @@ impl Default for TranscribeParams {
     fn default() -> Self {
         Self {
             engine: "auto".into(),
-            model: "parakeet-tdt-0.6b-v3-int8".into(),
+            model: "nemo-parakeet-tdt-0.6b-v3".into(),
+            quantization: Some("int8".into()),
             language: "en".into(),
             word_timestamps: true,
             vad: true,
@@ -227,7 +234,7 @@ mod tests {
             engine: Some(EngineInfo {
                 name: "onnx-asr".into(),
                 version: "0.6.0".into(),
-                model: "parakeet-tdt-0.6b-v3-int8".into(),
+                model: "nemo-parakeet-tdt-0.6b-v3".into(),
             }),
             warnings: vec![],
             error: None,
@@ -306,6 +313,7 @@ mod tests {
 
         let back: TranscribeSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(back.contract_version, TRANSCRIBE_SPEC_VERSION);
-        assert_eq!(back.params.model, "parakeet-tdt-0.6b-v3-int8");
+        assert_eq!(back.params.model, "nemo-parakeet-tdt-0.6b-v3");
+        assert_eq!(back.params.quantization.as_deref(), Some("int8"));
     }
 }

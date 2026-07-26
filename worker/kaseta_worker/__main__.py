@@ -93,14 +93,20 @@ def parse_spec(raw: str) -> tuple[str, list[Track], dict]:
     return job_id, tracks, spec.get("params", {})
 
 
+DEFAULT_MODEL = "nemo-parakeet-tdt-0.6b-v3"
+
+
 def load_model(params: dict):
-    """Loads the recogniser named by the spec.
+    """Loads the recogniser, with voice activity detection where available.
 
     `onnx-asr` runs Parakeet through ONNX Runtime with no PyTorch, NeMo, or
     transformers dependency, which keeps both install size and peak memory far
-    below the reference implementation. The model is quantised to int8: on a
-    CPU-only machine that is the difference between transcription being
-    practical and taking longer than the meeting did.
+    below the reference implementation. Quantising to int8 is what makes this
+    practical on a CPU-only machine rather than slower than the meeting itself.
+
+    Voice activity detection is what produces utterance segments with start and
+    end times. Without it the model returns one block of text per file, which
+    cannot be placed on a timeline or interleaved with the other speaker.
     """
     try:
         import onnx_asr
@@ -109,60 +115,114 @@ def load_model(params: dict):
             "onnx-asr is not installed; see worker/README.md for setup"
         ) from e
 
-    model = params.get("model", "parakeet-tdt-0.6b-v3-int8")
-    # onnx-asr names quantisation separately from the model.
-    name, _, quantisation = model.partition("-int8")
-    return onnx_asr.load_model(
-        name if quantisation == "" else name,
-        quantization="int8" if "int8" in model else None,
+    model = onnx_asr.load_model(
+        params.get("model", DEFAULT_MODEL),
+        quantization=params.get("quantization") or None,
     )
 
+    if not params.get("vad", True):
+        return model.with_timestamps(), False
 
-def transcribe_track(model, track: Track, params: dict) -> dict:
-    """Transcribes one track into segments with offsets from its own start."""
-    result = model.recognize(
-        str(track.audio_path),
-        timestamps=params.get("word_timestamps", True),
-    )
+    try:
+        vad = onnx_asr.load_vad("silero")
+    except Exception as e:
+        # Losing segmentation costs timing, not the transcript, so it is worth
+        # continuing without it.
+        print(f"voice activity detection unavailable: {e}", file=sys.stderr)
+        return model.with_timestamps(), False
 
+    return model.with_vad(vad), True
+
+
+def transcribe_track(model, segmented: bool, track: Track, params: dict) -> dict:
+    """Transcribes one track into segments with offsets from its own start.
+
+    The daemon supplies mono 16 kHz WAV, which is what the recogniser reads and
+    what the model expects, so nothing is decoded or resampled here.
+    """
+    result = model.recognize(str(track.audio_path))
     segments = []
-    for seg in getattr(result, "segments", None) or []:
-        segments.append(
-            {
-                "start_ns": int(seg.start * NS_PER_SECOND),
-                "end_ns": int(seg.end * NS_PER_SECOND),
-                "text": seg.text.strip(),
-                "speaker_hint": track.speaker_hint,
-                "words": [
-                    {
-                        "start_ns": int(w.start * NS_PER_SECOND),
-                        "end_ns": int(w.end * NS_PER_SECOND),
-                        "text": w.text,
-                    }
-                    for w in (getattr(seg, "words", None) or [])
-                ],
-            }
-        )
 
-    # Some engines return only flat text when no timing was requested. A single
-    # segment spanning the track is still usable, and is better than discarding
-    # the transcript because its shape was unexpected.
-    if not segments and getattr(result, "text", "").strip():
-        segments = [
-            {
-                "start_ns": 0,
-                "end_ns": 0,
-                "text": result.text.strip(),
-                "speaker_hint": track.speaker_hint,
-                "words": [],
-            }
-        ]
+    if segmented:
+        # With voice activity detection the result is an iterable of utterances
+        # already carrying their own start and end.
+        for seg in result:
+            text = (seg.text or "").strip()
+            if not text:
+                continue
+            segments.append(
+                {
+                    "start_ns": int(seg.start * NS_PER_SECOND),
+                    "end_ns": int(seg.end * NS_PER_SECOND),
+                    "text": text,
+                    "speaker_hint": track.speaker_hint,
+                    "words": [],
+                }
+            )
+    else:
+        # Without it, all that comes back is text plus per-token timestamps.
+        # Grouping tokens into utterances at pauses recovers usable segments.
+        segments = group_tokens(result, track.speaker_hint)
 
     return {
         "track_id": track.track_id,
         "language": params.get("language") or None,
         "segments": segments,
     }
+
+
+# A pause longer than this is treated as the end of an utterance. Short enough
+# to break between turns, long enough not to split mid-sentence.
+UTTERANCE_GAP_SECONDS = 0.8
+
+
+def group_tokens(result, speaker_hint: str) -> list[dict]:
+    """Builds utterances from token timestamps when segmentation is absent."""
+    tokens = getattr(result, "tokens", None) or []
+    stamps = getattr(result, "timestamps", None) or []
+    if not tokens or len(tokens) != len(stamps):
+        text = (getattr(result, "text", "") or "").strip()
+        # One segment spanning the track is still readable, and better than
+        # discarding a transcript because its shape was unexpected.
+        return (
+            [{"start_ns": 0, "end_ns": 0, "text": text,
+              "speaker_hint": speaker_hint, "words": []}]
+            if text
+            else []
+        )
+
+    segments: list[dict] = []
+    current: list[str] = []
+    started = stamps[0]
+    previous = stamps[0]
+
+    for token, stamp in zip(tokens, stamps):
+        if current and stamp - previous > UTTERANCE_GAP_SECONDS:
+            segments.append(
+                {
+                    "start_ns": int(started * NS_PER_SECOND),
+                    "end_ns": int(previous * NS_PER_SECOND),
+                    "text": "".join(current).strip(),
+                    "speaker_hint": speaker_hint,
+                    "words": [],
+                }
+            )
+            current, started = [], stamp
+        current.append(token)
+        previous = stamp
+
+    if current:
+        segments.append(
+            {
+                "start_ns": int(started * NS_PER_SECOND),
+                "end_ns": int(previous * NS_PER_SECOND),
+                "text": "".join(current).strip(),
+                "speaker_hint": speaker_hint,
+                "words": [],
+            }
+        )
+
+    return [s for s in segments if s["text"]]
 
 
 def main() -> int:
@@ -176,7 +236,7 @@ def main() -> int:
         return fail("bad_spec", str(e))
 
     try:
-        model = load_model(params)
+        model, segmented = load_model(params)
     except Exception as e:
         # A missing or unloadable model is worth retrying once it is installed,
         # so it is reported as retryable rather than terminal.
@@ -186,7 +246,7 @@ def main() -> int:
     warnings = []
     for track in tracks:
         try:
-            transcripts.append(transcribe_track(model, track, params))
+            transcripts.append(transcribe_track(model, segmented, track, params))
         except Exception as e:
             # One unreadable track must not discard the others: half a meeting
             # transcribed is far better than none.
@@ -208,7 +268,7 @@ def main() -> int:
             "engine": {
                 "name": "onnx-asr",
                 "version": getattr(model, "__version__", "unknown"),
-                "model": params.get("model", "parakeet-tdt-0.6b-v3-int8"),
+                "model": params.get("model", DEFAULT_MODEL),
             },
             "warnings": warnings,
             "tracks": transcripts,

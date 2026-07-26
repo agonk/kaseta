@@ -249,6 +249,110 @@ pub fn mix_recording(
     }))
 }
 
+/// Sample rate speech models expect. Higher rates carry no speech information
+/// they can use and cost proportionally more to process.
+pub const ASR_SAMPLE_RATE_HZ: u32 = 16_000;
+
+/// Writes a track as mono 16 kHz WAV, ready for transcription.
+///
+/// The recogniser reads WAV through Python's standard library and accepts mono
+/// only, while archives are stereo FLAC — so the conversion has to happen
+/// somewhere. Doing it here keeps the worker free of audio-decoding
+/// dependencies and produces exactly the format the model wants, roughly a
+/// sixth the size of the archive.
+pub fn write_asr_audio(
+    store: &dyn BlobStore,
+    track: &Track,
+    prefix: &kaseta_contracts::RecordingPrefix,
+) -> Result<BlobKey> {
+    let source_rate = track
+        .format
+        .sample_rate_hz
+        .context("track has no sample rate")?;
+    let channels = track.format.channels.unwrap_or(1).max(1);
+
+    let (samples, _) = decode_track(store, track)?;
+    let mono = downmix_to_mono(&samples, channels);
+    let resampled = resample(&mono, source_rate, ASR_SAMPLE_RATE_HZ);
+    let wav = encode_wav(&resampled, ASR_SAMPLE_RATE_HZ);
+
+    let key = prefix
+        .export(&format!("{}.asr.wav", track.track_id))
+        .context("building transcription audio key")?;
+    store
+        .put(&key, &wav)
+        .with_context(|| format!("writing transcription audio for {}", track.track_id))?;
+    Ok(key)
+}
+
+/// Averages channels rather than discarding all but one.
+///
+/// Taking a single channel would silence anything panned to the other, which on
+/// a stereo playback capture can mean losing a speaker entirely.
+fn downmix_to_mono(samples: &[i16], channels: u16) -> Vec<i16> {
+    if channels <= 1 {
+        return samples.to_vec();
+    }
+    samples
+        .chunks_exact(channels as usize)
+        .map(|frame| {
+            let sum: i32 = frame.iter().map(|s| *s as i32).sum();
+            (sum / frame.len() as i32) as i16
+        })
+        .collect()
+}
+
+/// Resamples by averaging groups of input samples.
+///
+/// Averaging rather than picking every Nth sample matters: plain decimation
+/// folds everything above the new Nyquist limit back down into the audible
+/// band as aliasing, which speech models hear as noise. A box average is a
+/// crude low-pass, but the ratios here are small integers and speech content
+/// sits well below the limit, so it is enough.
+fn resample(samples: &[i16], from_hz: u32, to_hz: u32) -> Vec<i16> {
+    if from_hz == to_hz || from_hz == 0 || to_hz == 0 || samples.is_empty() {
+        return samples.to_vec();
+    }
+
+    let out_len = (samples.len() as u64 * to_hz as u64 / from_hz as u64) as usize;
+    let mut out = Vec::with_capacity(out_len);
+
+    for i in 0..out_len {
+        let start = (i as u64 * from_hz as u64 / to_hz as u64) as usize;
+        let end = (((i + 1) as u64 * from_hz as u64 / to_hz as u64) as usize).min(samples.len());
+        let window = &samples[start..end.max(start + 1).min(samples.len())];
+        if window.is_empty() {
+            break;
+        }
+        let sum: i32 = window.iter().map(|s| *s as i32).sum();
+        out.push((sum / window.len() as i32) as i16);
+    }
+    out
+}
+
+/// Encodes mono 16-bit samples as a WAV file.
+fn encode_wav(samples: &[i16], sample_rate_hz: u32) -> Vec<u8> {
+    let data_bytes = (samples.len() * 2) as u32;
+    let mut wav = Vec::with_capacity(44 + data_bytes as usize);
+
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes()); // PCM header size
+    wav.extend_from_slice(&1u16.to_le_bytes()); // uncompressed
+    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&sample_rate_hz.to_le_bytes());
+    wav.extend_from_slice(&(sample_rate_hz * 2).to_le_bytes()); // bytes per second
+    wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+    wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_bytes.to_le_bytes());
+    for s in samples {
+        wav.extend_from_slice(&s.to_le_bytes());
+    }
+    wav
+}
+
 /// Converts a duration to whole frames, rounding to nearest.
 ///
 /// Rounding rather than truncating keeps repeated small gaps from accumulating
@@ -651,6 +755,72 @@ mod tests {
             err.to_string().contains("different sample rates"),
             "expected a rate mismatch error, got: {err}"
         );
+    }
+
+    #[test]
+    fn downmixing_keeps_audio_that_sits_in_one_channel() {
+        // Discarding a channel would silence anything panned to it, which on a
+        // stereo playback capture can mean losing a speaker entirely.
+        let stereo = vec![0i16, 1000, 0, 1000];
+        assert_eq!(downmix_to_mono(&stereo, 2), vec![500, 500]);
+        // Mono passes through untouched.
+        assert_eq!(downmix_to_mono(&[1, 2, 3], 1), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn resampling_lands_on_the_expected_length() {
+        let input: Vec<i16> = (0..48_000).map(|i| (i % 100) as i16).collect();
+        let out = resample(&input, 48_000, 16_000);
+        assert_eq!(out.len(), 16_000, "one second in, one second out");
+    }
+
+    #[test]
+    fn resampling_averages_rather_than_dropping_samples() {
+        // Plain decimation would return the first of each group and fold
+        // everything above the new Nyquist limit back into the audible band.
+        let input = vec![0i16, 300, 600, 0, 300, 600];
+        let out = resample(&input, 48_000, 16_000);
+        assert_eq!(out, vec![300, 300], "each output is the mean of its window");
+    }
+
+    #[test]
+    fn resampling_is_a_no_op_at_the_same_rate() {
+        let input = vec![1i16, 2, 3];
+        assert_eq!(resample(&input, 16_000, 16_000), input);
+        assert!(resample(&[], 48_000, 16_000).is_empty());
+    }
+
+    #[test]
+    fn the_wav_header_describes_what_follows() {
+        let wav = encode_wav(&[0i16, 1, -1], 16_000);
+
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[36..40], b"data");
+        assert_eq!(wav.len(), 44 + 6, "header plus three 16-bit samples");
+
+        let channels = u16::from_le_bytes([wav[22], wav[23]]);
+        let rate = u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]);
+        let bits = u16::from_le_bytes([wav[34], wav[35]]);
+        // The recogniser reads mono 16-bit WAV and rejects anything else.
+        assert_eq!((channels, rate, bits), (1, 16_000, 16));
+
+        let declared = u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]);
+        assert_eq!(declared as usize, wav.len() - 44);
+    }
+
+    #[test]
+    fn the_wav_python_reads_matches_what_we_write() {
+        // Python's `wave` module is what the worker uses, so the header must
+        // satisfy it rather than merely look plausible.
+        let wav = encode_wav(&[100i16, -100, 200], 16_000);
+        let riff_size = u32::from_le_bytes([wav[4], wav[5], wav[6], wav[7]]);
+        assert_eq!(riff_size as usize, wav.len() - 8);
+
+        let byte_rate = u32::from_le_bytes([wav[28], wav[29], wav[30], wav[31]]);
+        let block_align = u16::from_le_bytes([wav[32], wav[33]]);
+        assert_eq!(byte_rate, 16_000 * 2);
+        assert_eq!(block_align, 2);
     }
 
     #[test]
