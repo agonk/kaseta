@@ -5,273 +5,480 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Kaseta</title>
 <style>
-  /* One file, no build step, no framework. The page is compiled into the
-     daemon binary, so there is nothing to install or serve alongside it. */
+  /* Kaseta Utility System — design tokens, inlined.
+     No CDN and no web fonts: this page is served by a local daemon with no
+     network access, so an external stylesheet would silently fail and leave
+     the interface unstyled. Typefaces are named as preferences and fall back
+     to whatever the desktop provides. */
   :root {
-    color-scheme: light dark;
-    --bg: #fbfbfa;
-    --panel: #ffffff;
-    --line: #e4e4e1;
-    --text: #1a1a18;
-    --muted: #6b6b66;
-    --accent: #b4341f;
-    --accent-soft: #fdf0ee;
-    --radius: 10px;
+    color-scheme: dark light;
+
+    --surface:            #091421;
+    --surface-lowest:     #050f1c;
+    --surface-low:        #121c2a;
+    --surface-container:  #16202e;
+    --surface-highest:    #2b3544;
+    --on-surface:         #d9e3f6;
+    --on-surface-variant: #c2c6d6;
+    --outline:            #8c909f;
+    --outline-variant:    #424754;
+
+    --primary:            #adc6ff;
+    --on-primary:         #002e6a;
+    --primary-container:  #4d8eff;
+
+    /* The two-track distinction. Indigo is the operator, slate the far end.
+       Never the only signal — every use is paired with a text label. */
+    --you:                #818cf8;
+    --them:               #94a3b8;
+
+    --record:             #ef4444;
+    --warning:            #ffb95f;
+    --error:              #ffb4ab;
+    --ok:                 #22c55e;
+
+    --r-sm: 2px; --r: 4px; --r-lg: 8px; --r-full: 9999px;
+    --gutter: 12px;
+
+    --sans: Inter, "SF Pro Text", system-ui, -apple-system, "Segoe UI",
+            Cantarell, "Noto Sans", sans-serif;
+    --mono: "JetBrains Mono", "Fira Code", ui-monospace, "DejaVu Sans Mono", monospace;
   }
-  @media (prefers-color-scheme: dark) {
+
+  @media (prefers-color-scheme: light) {
     :root {
-      --bg: #16161a;
-      --panel: #1e1e23;
-      --line: #2e2e35;
-      --text: #ececf0;
-      --muted: #9a9aa4;
-      --accent: #e8624a;
-      --accent-soft: #2a1d1b;
+      --surface:            #f7f9fc;
+      --surface-lowest:     #ffffff;
+      --surface-low:        #eef1f7;
+      --surface-container:  #e7ebf3;
+      --surface-highest:    #d2d8e4;
+      --on-surface:         #131a24;
+      --on-surface-variant: #3f4654;
+      --outline:            #6d7484;
+      --outline-variant:    #c3c8d4;
+      --primary:            #005ac2;
+      --on-primary:         #ffffff;
+      --you:                #4338ca;
+      --them:               #475569;
+      --record:             #dc2626;
+      --warning:            #a45c00;
+      --error:              #9b2226;
+      --ok:                 #15803d;
     }
   }
+
   * { box-sizing: border-box; }
+  html, body { height: 100%; }
   body {
-    margin: 0; background: var(--bg); color: var(--text);
-    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    margin: 0; background: var(--surface); color: var(--on-surface);
+    font: 400 14px/20px var(--sans);
+    display: flex; flex-direction: column; overflow: hidden;
   }
-  main { max-width: 720px; margin: 0 auto; padding: 32px 20px 80px; }
-  h1 { font-size: 19px; margin: 0; letter-spacing: -0.01em; }
-  header { display: flex; align-items: baseline; gap: 10px; margin-bottom: 24px; }
-  header span { color: var(--muted); font-size: 13px; }
+  button, input { font: inherit; color: inherit; }
+  :focus-visible { outline: 2px solid var(--primary-container); outline-offset: 1px; }
+  .hint { color: var(--on-surface-variant); font: 500 12px/16px var(--mono); }
 
-  .recorder {
-    background: var(--panel); border: 1px solid var(--line);
-    border-radius: var(--radius); padding: 20px; margin-bottom: 28px;
-    display: flex; align-items: center; gap: 16px;
-  }
-  .recorder.live { border-color: var(--accent); background: var(--accent-soft); }
+  /* ---- title bar ------------------------------------------------------- */
 
-  button {
-    font: inherit; font-weight: 550; cursor: pointer;
-    border-radius: 8px; border: 1px solid var(--line);
-    background: var(--panel); color: var(--text); padding: 9px 16px;
+  .titlebar {
+    display: flex; align-items: center; gap: 16px; flex: 0 0 auto;
+    padding: 0 var(--gutter); height: 46px;
+    background: var(--surface-lowest); border-bottom: 1px solid var(--outline-variant);
   }
-  button:hover:not(:disabled) { border-color: var(--muted); }
-  button:disabled { opacity: .5; cursor: not-allowed; }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  button.primary:hover:not(:disabled) { filter: brightness(1.08); }
+  .brand { display: flex; align-items: center; gap: 9px; font-weight: 600; font-size: 16px; }
+  .search { flex: 1; max-width: 520px; margin: 0 auto; position: relative; }
+  .search input {
+    width: 100%; padding: 6px 10px 6px 30px; border-radius: var(--r);
+    border: 1px solid var(--outline-variant); background: var(--surface-lowest);
+  }
+  .search svg { position: absolute; left: 9px; top: 50%; transform: translateY(-50%); opacity: .55; }
 
-  .dot {
-    width: 9px; height: 9px; border-radius: 50%; background: var(--accent);
-    display: inline-block; animation: pulse 1.6s ease-in-out infinite;
-  }
-  @keyframes pulse { 50% { opacity: .25; } }
-  @media (prefers-reduced-motion: reduce) { .dot { animation: none; } }
+  /* ---- status rail ----------------------------------------------------- */
 
-  .elapsed { font-variant-numeric: tabular-nums; font-size: 22px; font-weight: 600; }
-  .state { color: var(--muted); font-size: 13px; }
+  .rail {
+    display: flex; align-items: center; gap: 14px; flex: 0 0 auto;
+    padding: 9px var(--gutter);
+    background: var(--surface-low); border-bottom: 1px solid var(--outline-variant);
+  }
+  .rail.live { background: color-mix(in srgb, var(--record) 8%, var(--surface-low)); }
 
-  ul { list-style: none; padding: 0; margin: 0; }
-  li {
-    background: var(--panel); border: 1px solid var(--line);
-    border-radius: var(--radius); padding: 14px 16px; margin-bottom: 10px;
+  .record-btn {
+    width: 36px; height: 36px; border-radius: var(--r-full); cursor: pointer; flex: 0 0 auto;
+    border: 2px solid var(--outline-variant); background: var(--surface-container);
+    display: grid; place-items: center;
   }
-  .row { display: flex; align-items: center; gap: 12px; }
-  .title { font-weight: 550; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
-  audio { width: 100%; margin-top: 12px; height: 34px; }
+  .record-btn:hover:not(:disabled) { border-color: var(--record); }
+  .record-btn:disabled { opacity: .45; cursor: not-allowed; }
+  .record-btn i { width: 14px; height: 14px; border-radius: var(--r-full); background: var(--record); display: block; }
+  .rail.live .record-btn { border-color: var(--record); }
+  /* A circle records, a square stops — the universal convention. */
+  .rail.live .record-btn i { border-radius: var(--r-sm); width: 12px; height: 12px; }
 
-  .icon {
-    padding: 5px 9px; font-size: 13px; color: var(--muted);
-    background: none; border: none;
+  .timer { font: 700 16px/20px var(--mono); letter-spacing: .02em; }
+  .rail.live .timer { color: var(--record); }
+  .rail-label {
+    font: 500 12px/16px var(--mono); letter-spacing: .05em;
+    text-transform: uppercase; color: var(--on-surface-variant);
   }
-  .icon:hover { color: var(--text); background: var(--bg); }
+  .pips { display: flex; align-items: center; gap: 6px; }
+  .pip { width: 7px; height: 7px; border-radius: var(--r-full); background: var(--outline-variant); }
+  .pip.on { background: var(--ok); }
+  .pip.warn { background: var(--warning); }
+  .pip.off { background: var(--record); }
+  .rail .meta { margin-left: auto; display: flex; gap: 18px; text-align: right; }
+  .meta-item { font: 500 12px/16px var(--mono); color: var(--on-surface-variant); }
+  .meta-item b { display: block; color: var(--on-surface); font-weight: 700; }
 
-  .tracks { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
-  .tracks button { font-size: 12px; padding: 4px 10px; color: var(--muted); }
+  .pulse { animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .35; } }
+  @media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }
 
-  .transcript {
-    margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line);
-    max-height: 340px; overflow-y: auto;
-  }
-  .line {
-    display: grid; grid-template-columns: 52px 54px 1fr; gap: 10px;
-    padding: 3px 6px; border-radius: 6px; cursor: pointer; align-items: baseline;
-  }
-  .line:hover { background: var(--bg); }
-  .line time { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
-  .line .who { font-size: 12px; font-weight: 600; }
-  .line.you .who { color: var(--accent); }
-  .line.them .who { color: var(--muted); }
-  .line mark { background: var(--accent-soft); color: inherit; font-weight: 600; }
+  /* ---- panes ----------------------------------------------------------- */
 
-  .summary {
-    margin-top: 12px; padding: 12px 14px; border-radius: 8px;
-    background: var(--bg); border: 1px solid var(--line);
+  .panes { flex: 1; display: grid; grid-template-columns: 264px 1fr; min-height: 0; }
+  .library {
+    border-right: 1px solid var(--outline-variant); background: var(--surface-lowest);
+    display: flex; flex-direction: column; min-height: 0;
   }
-  .summary h4 {
-    margin: 12px 0 4px; font-size: 12px; text-transform: uppercase;
-    letter-spacing: .05em; color: var(--muted);
+  .pane-head {
+    padding: 9px var(--gutter) 7px; display: flex; justify-content: space-between;
+    font: 500 12px/16px var(--mono); letter-spacing: .05em;
+    text-transform: uppercase; color: var(--on-surface-variant);
   }
-  .summary h4:first-child { margin-top: 0; }
-  .summary p { margin: 0; }
-  .summary ul { list-style: disc; padding-left: 18px; }
-  .summary li { background: none; border: none; padding: 1px 0; margin: 0; border-radius: 0; }
-  .owner { color: var(--muted); font-size: 12px; }
+  .list { overflow-y: auto; flex: 1; padding-bottom: 12px; }
+
+  .item {
+    display: block; width: 100%; text-align: left; cursor: pointer; line-height: 1.35;
+    padding: 7px var(--gutter); border: none; border-left: 2px solid transparent; background: none;
+  }
+  .item:nth-child(even) { background: color-mix(in srgb, var(--on-surface) 3%, transparent); }
+  .item:hover { background: var(--surface-container); }
+  .item[aria-current="true"] { background: var(--surface-container); border-left-color: var(--primary-container); }
+  .item .name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .item .sub { display: flex; gap: 10px; margin-top: 1px; font: 500 12px/16px var(--mono); color: var(--on-surface-variant); }
+
+  .detail { display: flex; flex-direction: column; min-height: 0; overflow-y: auto; }
+  .placeholder { margin: auto; text-align: center; color: var(--on-surface-variant); max-width: 340px; padding: 40px 20px; }
+  .placeholder svg { opacity: .3; margin-bottom: 10px; }
+
+  /* ---- detail ---------------------------------------------------------- */
+
+  .detail-head { padding: 15px var(--gutter) 12px; border-bottom: 1px solid var(--outline-variant); }
+  .detail-head h2 { margin: 0; font: 600 24px/32px var(--sans); letter-spacing: -.02em; }
+  .head-row { display: flex; align-items: flex-start; gap: 10px; }
+  .head-row .grow { flex: 1; min-width: 0; }
+
+  .seg { display: inline-flex; border: 1px solid var(--outline-variant); border-radius: var(--r); overflow: hidden; }
+  .seg button {
+    padding: 5px 12px; border: none; cursor: pointer; background: var(--surface-container);
+    font: 500 12px/16px var(--mono); letter-spacing: .05em;
+  }
+  .seg button + button { border-left: 1px solid var(--outline-variant); }
+  .seg button[aria-pressed="true"] { background: var(--primary-container); color: #fff; }
+
+  .wave {
+    height: 64px; margin: 12px 0 8px; position: relative; cursor: pointer;
+    background: var(--surface-lowest); border: 1px solid var(--outline-variant);
+    border-radius: var(--r); overflow: hidden;
+  }
+  .wave canvas { display: block; width: 100%; height: 100%; }
+  .playhead { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--primary); pointer-events: none; }
+
+  .player { display: flex; align-items: center; gap: 12px; }
+  .play {
+    width: 32px; height: 32px; border-radius: var(--r-full); flex: 0 0 auto; cursor: pointer;
+    border: 1px solid var(--outline-variant); background: var(--surface-container);
+    display: grid; place-items: center;
+  }
+  .time { font: 500 12px/16px var(--mono); color: var(--on-surface-variant); }
+
+  .split { display: grid; grid-template-columns: 1fr 336px; flex: 1; min-height: 0; }
+  .transcript-pane { padding: 14px var(--gutter); border-right: 1px solid var(--outline-variant); min-width: 0; }
+  .summary-pane { padding: 14px var(--gutter); background: var(--surface-lowest); }
+
+  .sec-head {
+    font: 500 12px/16px var(--mono); letter-spacing: .05em; text-transform: uppercase;
+    color: var(--on-surface-variant); margin: 18px 0 8px;
+  }
+  .sec-head:first-child { margin-top: 0; }
+
+  .line { padding: 5px 0 5px 10px; margin-bottom: 6px; }
+  .line .who { font: 500 12px/16px var(--mono); letter-spacing: .05em; text-transform: uppercase; margin-bottom: 2px; }
+  /* Labels alongside colour, so this reads in greyscale. */
+  .line.you { border-left: 2px solid var(--you); }
+  .line.you .who { color: var(--you); }
+  .line.them { border-left: 2px solid var(--them); }
+  .line.them .who { color: var(--them); }
+  .line.unknown { border-left: 2px solid var(--outline-variant); }
+  .line.unknown .who { color: var(--on-surface-variant); }
+  .line .text { user-select: text; }
+  mark { background: color-mix(in srgb, var(--primary-container) 35%, transparent); color: inherit; }
+  .seek {
+    background: none; border: none; padding: 0; cursor: pointer; color: inherit;
+    font: 500 12px/16px var(--mono); opacity: .75;
+  }
+  .seek:hover, .seek:focus-visible { opacity: 1; text-decoration: underline; }
+
+  .overview { background: var(--surface-container); border-radius: var(--r); padding: 10px 12px; }
+  .summary-pane ul { list-style: none; margin: 0; padding: 0; }
+  .summary-pane li { padding: 4px 0 4px 14px; position: relative; }
+  .summary-pane li::before { content: "›"; position: absolute; left: 2px; color: var(--outline); }
+  .action { border-left: 2px solid var(--outline-variant); padding: 6px 0 6px 10px; margin-bottom: 8px; }
+  .action::before { content: none; }
+  .owner { display: inline-block; margin-top: 4px; padding: 1px 7px; border-radius: var(--r-sm);
+           font: 500 12px/16px var(--mono); letter-spacing: .05em; }
+  .owner.assigned { background: var(--primary-container); color: #fff; }
+  .owner.unassigned { background: var(--surface-highest); color: var(--on-surface-variant); }
+
+  /* ---- controls -------------------------------------------------------- */
+
+  .btn { padding: 5px 11px; border-radius: var(--r); cursor: pointer;
+         border: 1px solid var(--outline-variant); background: transparent; }
+  .btn:hover { border-color: var(--outline); }
+  .btn.primary { background: var(--primary); border-color: var(--primary); color: var(--on-primary); font-weight: 600; }
+  .icon-btn { width: 30px; height: 30px; display: grid; place-items: center; cursor: pointer;
+              border: none; background: none; border-radius: var(--r); color: var(--on-surface-variant); }
+  .icon-btn:hover { background: var(--surface-container); color: var(--on-surface); }
+
+  .banner { padding: 7px var(--gutter); font-size: 13px; flex: 0 0 auto;
+            border-bottom: 1px solid var(--outline-variant); }
+  .banner.warn { background: color-mix(in srgb, var(--warning) 15%, var(--surface)); color: var(--warning); }
+  .banner.err { background: color-mix(in srgb, var(--error) 15%, var(--surface)); color: var(--error); }
+
+  /* ---- settings -------------------------------------------------------- */
 
   dialog {
-    border: 1px solid var(--line); border-radius: var(--radius);
-    background: var(--panel); color: var(--text); padding: 0;
-    max-width: 520px; width: calc(100% - 32px);
+    border: 1px solid var(--outline-variant); border-radius: var(--r-lg); padding: 0;
+    background: var(--surface-low); color: var(--on-surface);
+    width: min(680px, calc(100% - 32px)); max-height: 88vh;
   }
-  dialog::backdrop { background: rgba(0,0,0,.4); }
-  .sheet { padding: 22px 24px; }
-  .sheet h2 { margin: 0 0 4px; font-size: 17px; }
-  .sheet h3 {
-    margin: 22px 0 8px; font-size: 12px; text-transform: uppercase;
-    letter-spacing: .05em; color: var(--muted);
-  }
-  .sheet label { display: block; margin-bottom: 10px; font-size: 13px; }
-  .sheet label span { display: block; color: var(--muted); margin-bottom: 3px; }
-  .sheet input[type=text], .sheet input[type=password] {
-    width: 100%; padding: 7px 10px; border-radius: 7px;
-    border: 1px solid var(--line); background: var(--bg); color: var(--text);
-    font: inherit;
-  }
-  .check { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
-  .check input { margin: 0; }
-  .check span { display: inline; color: var(--text); }
-  .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 22px; }
-  .note { color: var(--muted); font-size: 12px; margin: 4px 0 0; }
-  .set { color: var(--accent); font-size: 12px; }
+  dialog::backdrop { background: rgba(0,0,0,.55); }
+  .sheet-head { display: flex; align-items: center; gap: 10px; padding: 14px 18px;
+                border-bottom: 1px solid var(--outline-variant); }
+  .sheet-head h2 { margin: 0; font: 600 18px/24px var(--sans); flex: 1; }
+  .sheet-body { padding: 18px; overflow-y: auto; max-height: calc(88vh - 118px); }
+  .sheet-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 18px;
+                border-top: 1px solid var(--outline-variant); }
+  .field { margin-bottom: 12px; }
+  .field label { display: block; margin-bottom: 4px; font-size: 13px; }
+  .field input { width: 100%; padding: 7px 10px; border-radius: var(--r);
+                 border: 1px solid var(--outline-variant); background: var(--surface-lowest); }
+  .field input:disabled { opacity: .55; cursor: not-allowed; }
+  .field .hint { margin-top: 4px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
+  .row-between { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .switch { position: relative; width: 40px; height: 22px; flex: 0 0 auto; }
+  .switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+  .switch span { position: absolute; inset: 0; border-radius: var(--r-full); background: var(--surface-highest); }
+  .switch span::after { content: ""; position: absolute; width: 16px; height: 16px; border-radius: var(--r-full);
+                        background: var(--on-surface-variant); top: 3px; left: 3px; transition: transform .12s; }
+  .switch input:checked + span { background: var(--primary-container); }
+  .switch input:checked + span::after { transform: translateX(18px); background: #fff; }
+  .switch input:focus-visible + span { outline: 2px solid var(--primary-container); outline-offset: 2px; }
 
-  .search { display: flex; gap: 8px; margin-bottom: 16px; }
-  .search input { flex: 1; border-color: var(--line); }
-  .badge {
-    font-size: 11px; color: var(--muted); border: 1px solid var(--line);
-    border-radius: 999px; padding: 1px 8px; white-space: nowrap;
-  }
+  .privacy { border-left: 2px solid var(--primary-container); background: var(--surface-container);
+             padding: 10px 12px; border-radius: 0 var(--r) var(--r) 0; font-size: 13px; }
+  .keys { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .keys th { text-align: left; padding: 6px 0; border-bottom: 1px solid var(--outline-variant);
+             font: 500 12px/16px var(--mono); letter-spacing: .05em;
+             text-transform: uppercase; color: var(--on-surface-variant); }
+  .keys td { padding: 6px 0; border-bottom: 1px solid var(--outline-variant); }
+  kbd { font: 500 12px/16px var(--mono); padding: 1px 6px; border-radius: var(--r-sm);
+        border: 1px solid var(--outline-variant); background: var(--surface-lowest); }
+  .divider { height: 1px; background: var(--outline-variant); margin: 18px 0; }
 
-  .empty, .error {
-    color: var(--muted); text-align: center; padding: 36px 20px;
-    border: 1px dashed var(--line); border-radius: var(--radius);
+  .statusbar {
+    flex: 0 0 auto; display: flex; align-items: center; gap: 12px;
+    padding: 5px var(--gutter); border-top: 1px solid var(--outline-variant);
+    background: var(--surface-lowest);
+    font: 500 12px/16px var(--mono); color: var(--on-surface-variant);
   }
-  .error { color: var(--accent); border-color: var(--accent); text-align: left; padding: 14px 16px; }
-  .warn { color: var(--accent); font-size: 13px; margin-top: 6px; }
-  input[type=text] {
-    font: inherit; flex: 1; padding: 7px 10px; border-radius: 8px;
-    border: 1px solid var(--accent); background: var(--bg); color: var(--text);
+  .statusbar .right { margin-left: auto; }
+
+  @media (max-width: 1080px) {
+    .split { grid-template-columns: 1fr; }
+    .transcript-pane { border-right: none; border-bottom: 1px solid var(--outline-variant); }
+    .panes { grid-template-columns: 210px 1fr; }
   }
 </style>
 </head>
 <body>
-<main>
-  <header>
-    <h1>Kaseta</h1>
-    <span id="sub">meeting recorder</span>
-    <button class="icon" id="open-settings" style="margin-left:auto">Settings</button>
-  </header>
 
-  <dialog id="settings">
-    <form class="sheet" method="dialog">
-      <h2>Settings</h2>
-
-      <h3>Summaries</h3>
-      <label class="check">
-        <input type="checkbox" id="sum-enabled">
-        <span>Summarise meetings after transcribing</span>
-      </label>
-      <label>
-        <span>OpenRouter API key <em id="sum-key-state" class="set"></em></span>
-        <input type="password" id="sum-key" placeholder="sk-or-…" autocomplete="off">
-      </label>
-      <label>
-        <span>Model</span>
-        <input type="text" id="sum-model" placeholder="anthropic/claude-3.5-haiku">
-      </label>
-      <p class="note" id="sum-note"></p>
-
-      <h3>Cloud backup</h3>
-      <label class="check">
-        <input type="checkbox" id="r2-enabled">
-        <span>Copy recordings to S3-compatible storage</span>
-      </label>
-      <label>
-        <span>Endpoint <em class="note">blank for Amazon S3</em></span>
-        <input type="text" id="r2-endpoint" placeholder="https://ACCOUNT.r2.cloudflarestorage.com">
-      </label>
-      <label>
-        <span>Bucket</span>
-        <input type="text" id="r2-bucket" placeholder="meetings">
-      </label>
-      <label>
-        <span>Region</span>
-        <input type="text" id="r2-region" placeholder="auto">
-      </label>
-      <label>
-        <span>Access key ID</span>
-        <input type="text" id="r2-access" autocomplete="off">
-      </label>
-      <label>
-        <span>Secret access key <em id="r2-secret-state" class="set"></em></span>
-        <input type="password" id="r2-secret" autocomplete="off">
-      </label>
-      <label class="check">
-        <input type="checkbox" id="r2-delete">
-        <span>Delete local audio once uploaded</span>
-      </label>
-      <p class="note">Uploading is not implemented yet; these are saved for when it is.</p>
-
-      <div class="actions">
-        <button type="button" id="settings-cancel">Cancel</button>
-        <button type="button" class="primary" id="settings-save">Save</button>
-      </div>
-    </form>
-  </dialog>
-
-  <div class="recorder" id="recorder">
-    <div style="flex:1">
-      <div class="elapsed" id="elapsed">Ready</div>
-      <div class="state" id="state">Records your microphone and everything you hear, as separate tracks.</div>
-      <div class="warn" id="warn" hidden></div>
-    </div>
-    <button class="primary" id="toggle">Start recording</button>
+<div class="titlebar">
+  <div class="brand">
+    <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="1.5" y="5" width="21" height="14" rx="2.5" fill="var(--primary)"/>
+      <circle cx="8.5" cy="11.5" r="2.6" fill="var(--surface)"/>
+      <circle cx="15.5" cy="11.5" r="2.6" fill="var(--surface)"/>
+      <rect x="10.4" y="10.7" width="3.2" height="1.6" fill="var(--surface)"/>
+    </svg>
+    Kaseta
   </div>
-
   <div class="search">
-    <input type="text" id="q" placeholder="Search everything that was said…" autocomplete="off">
-    <button id="clear" hidden>Clear</button>
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+      <circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>
+    </svg>
+    <input type="text" id="q" placeholder="Search everything that was said…" autocomplete="off" aria-label="Search transcripts">
   </div>
+  <button class="icon-btn" id="open-settings" title="Settings" aria-label="Settings">
+    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <circle cx="12" cy="12" r="3"/>
+      <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2v.2a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0-1.2-2.9H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>
+    </svg>
+  </button>
+</div>
 
-  <div id="error" class="error" hidden></div>
-  <ul id="list"></ul>
-  <div id="empty" class="empty" hidden>No recordings yet.</div>
-</main>
+<div class="rail" id="rail">
+  <button class="record-btn" id="record" aria-label="Start recording"><i></i></button>
+  <div>
+    <div class="timer" id="timer">00:00:00</div>
+    <div class="rail-label" id="rail-label">Idle — ready to capture</div>
+  </div>
+  <div class="pips" id="pips" hidden>
+    <span class="pip" id="pip-you"></span><span class="rail-label">You</span>
+    <span class="pip" id="pip-them" style="margin-left:8px"></span><span class="rail-label">Them</span>
+  </div>
+  <div class="meta">
+    <div class="meta-item">Format<b>FLAC · lossless</b></div>
+    <div class="meta-item">Library<b id="stat-count">—</b></div>
+  </div>
+</div>
+
+<div id="banners"></div>
+
+<div class="panes">
+  <div class="library">
+    <div class="pane-head"><span>Recordings</span><span id="list-count"></span></div>
+    <div class="list" id="list" role="listbox" aria-label="Recordings"></div>
+  </div>
+  <div class="detail" id="detail">
+    <div class="placeholder" id="placeholder">
+      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+        <rect x="2" y="5" width="20" height="14" rx="2"/><circle cx="8.5" cy="12" r="2.5"/><circle cx="15.5" cy="12" r="2.5"/>
+      </svg>
+      <p>Select a recording, or press record to capture one.</p>
+    </div>
+  </div>
+</div>
+
+<div class="statusbar">
+  <span>Local storage only</span><span>·</span>
+  <span>Audio and transcripts never leave this machine</span>
+  <span class="right" id="engine"></span>
+</div>
+
+<dialog id="settings">
+  <div class="sheet-head">
+    <h2>Settings</h2>
+    <button class="icon-btn" id="settings-close" aria-label="Close">✕</button>
+  </div>
+  <div class="sheet-body">
+    <div class="row-between">
+      <div class="sec-head" style="margin:0">Summaries</div>
+      <label class="switch"><input type="checkbox" id="sum-enabled" aria-label="Enable summaries"><span></span></label>
+    </div>
+    <p class="hint" style="margin:6px 0 12px">Sends the transcript to a provider after each meeting. Audio never leaves.</p>
+    <div class="grid2">
+      <div class="field">
+        <label for="sum-model">Model</label>
+        <input type="text" id="sum-model" placeholder="anthropic/claude-3.5-haiku">
+      </div>
+      <div class="field">
+        <label for="sum-key">API key</label>
+        <input type="password" id="sum-key" autocomplete="off" placeholder="sk-or-…">
+        <div class="hint" id="sum-key-hint"></div>
+      </div>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="row-between">
+      <div class="sec-head" style="margin:0">Cloud backup</div>
+      <label class="switch"><input type="checkbox" id="r2-enabled" aria-label="Enable cloud backup"><span></span></label>
+    </div>
+    <p class="hint" style="margin:6px 0 12px">Copies recordings to S3-compatible storage such as Cloudflare R2.</p>
+    <div class="field">
+      <label for="r2-endpoint">Endpoint <span class="hint" style="display:inline">— blank for Amazon S3</span></label>
+      <input type="text" id="r2-endpoint" placeholder="https://ACCOUNT.r2.cloudflarestorage.com">
+    </div>
+    <div class="grid2">
+      <div class="field"><label for="r2-bucket">Bucket</label><input type="text" id="r2-bucket" placeholder="meetings"></div>
+      <div class="field"><label for="r2-region">Region</label><input type="text" id="r2-region" placeholder="auto"></div>
+      <div class="field"><label for="r2-access">Access key ID</label><input type="text" id="r2-access" autocomplete="off"></div>
+      <div class="field">
+        <label for="r2-secret">Secret access key</label>
+        <input type="password" id="r2-secret" autocomplete="off">
+        <div class="hint" id="r2-secret-hint"></div>
+      </div>
+    </div>
+    <div class="row-between">
+      <span style="font-size:13px">Delete local audio once uploaded</span>
+      <label class="switch"><input type="checkbox" id="r2-delete" aria-label="Delete local audio after upload"><span></span></label>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="privacy">
+      <strong>Privacy.</strong> Recordings and transcripts are produced and kept on this machine.
+      Transcription runs locally. Only transcript text is sent to your chosen provider, and only
+      when summaries are switched on.
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="sec-head">Shortcuts</div>
+    <table class="keys">
+      <thead><tr><th>Action</th><th style="text-align:right">Key</th></tr></thead>
+      <tbody>
+        <tr><td>Start or stop recording</td><td style="text-align:right"><kbd>R</kbd></td></tr>
+        <tr><td>Play or pause</td><td style="text-align:right"><kbd>Space</kbd></td></tr>
+        <tr><td>Search</td><td style="text-align:right"><kbd>Ctrl</kbd> <kbd>F</kbd></td></tr>
+        <tr><td>Move through recordings</td><td style="text-align:right"><kbd>↑</kbd> <kbd>↓</kbd></td></tr>
+        <tr><td>Close or cancel</td><td style="text-align:right"><kbd>Esc</kbd></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="sheet-foot">
+    <button class="btn" id="settings-cancel">Cancel</button>
+    <button class="btn primary" id="settings-save">Save changes</button>
+  </div>
+</dialog>
 
 <script>
-// Minted per daemon run and substituted into this page when it is served. A
-// page on another origin cannot read it, which is what stops a hostile site
-// from driving the recorder.
 const TOKEN = "__KASETA_TOKEN__";
-
 const $ = (id) => document.getElementById(id);
-let state = { state: "idle" };
-let busy = false;
-
-const fmtDuration = (ms) => {
-  const s = Math.floor(ms / 1000);
-  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
-  return h ? `${h}:${String(m).padStart(2,"0")}:${String(sec).padStart(2,"0")}`
-           : `${m}:${String(sec).padStart(2,"0")}`;
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
 };
 
-const fmtDate = (iso) => new Date(iso).toLocaleString(undefined, {
-  weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit",
-});
+let state = { state: "idle" };
+let items = [];
+let selectedId = null;
+let query = "";
+let busy = false;
+let searchTimer = null;
+let audio = null;
+
+const pad = (n) => String(n).padStart(2, "0");
+const clock = (s) => {
+  s = Math.max(0, Math.floor(s));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return h ? `${pad(h)}:${pad(m)}:${pad(s % 60)}` : `${pad(m)}:${pad(s % 60)}`;
+};
+const clockLong = (s) => {
+  s = Math.max(0, Math.floor(s));
+  return `${pad(Math.floor(s / 3600))}:${pad(Math.floor((s % 3600) / 60))}:${pad(s % 60)}`;
+};
+const when = (iso) => new Date(iso).toLocaleString(undefined,
+  { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
 
 async function api(path, options = {}) {
   const res = await fetch(path, {
     ...options,
-    headers: {
-      "content-type": "application/json",
-      "x-kaseta-token": TOKEN,
-      ...(options.headers || {}),
-    },
+    headers: { "content-type": "application/json", "x-kaseta-token": TOKEN, ...(options.headers || {}) },
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
@@ -280,365 +487,392 @@ async function api(path, options = {}) {
   return res.status === 204 ? null : res.json();
 }
 
-function showError(e) {
-  $("error").textContent = e.message;
-  $("error").hidden = false;
-}
+const fail = (message) => $("banners").prepend(el("div", "banner err", message));
+
+const trackName = (id) =>
+  id.includes("local-mic") ? "Your microphone"
+  : id.includes("remote-mix") ? "Everyone else" : id;
+
+// ---- recorder --------------------------------------------------------------
 
 function renderStatus(s) {
   state = s;
   const live = s.state === "recording";
-  const finalizing = s.state === "finalizing";
+  const sealing = s.state === "finalizing";
 
-  $("recorder").classList.toggle("live", live);
-  $("toggle").textContent = live ? "Stop recording" : "Start recording";
-  $("toggle").disabled = finalizing || busy;
+  $("rail").classList.toggle("live", live);
+  $("timer").textContent = live ? clockLong(s.elapsed_s) : sealing ? "· · ·" : "00:00:00";
+  $("timer").classList.toggle("pulse", live);
+  $("rail-label").textContent = live ? "Recording you + everyone else"
+    : sealing ? "Saving — preparing audio" : "Idle — ready to capture";
 
+  $("record").disabled = sealing || busy;
+  $("record").setAttribute("aria-label", live ? "Stop recording" : "Start recording");
+
+  $("pips").hidden = !live;
   if (live) {
-    $("elapsed").innerHTML = `<span class="dot"></span> ${fmtDuration(s.elapsed_s * 1000)}`;
-    $("state").textContent = "Recording you and everyone else.";
-  } else if (finalizing) {
-    $("elapsed").textContent = "Saving…";
-    $("state").textContent = "Sealing the recording and preparing audio.";
-  } else {
-    $("elapsed").textContent = "Ready";
-    $("state").textContent = "Records your microphone and everything you hear, as separate tracks.";
+    const bad = s.degraded_tracks || [];
+    const iffy = s.reconnecting || [];
+    const pip = (id, key) => {
+      $(id).className = "pip " + (bad.some((t) => t.includes(key)) ? "off"
+        : iffy.some((t) => t.includes(key)) ? "warn" : "on");
+    };
+    pip("pip-you", "local-mic");
+    pip("pip-them", "remote-mix");
   }
 
-  // A recording can be materially broken while still appearing to run, so a
-  // track that stopped early is surfaced rather than discovered afterwards.
-  const problems = [];
-  if (s.failure) problems.push(s.failure);
-  // A device coming back is different from one that is gone: the first is
-  // temporary and recovering, the second means that side is lost from here on.
-  for (const t of s.reconnecting || []) problems.push(`${t} — device lost, reconnecting…`);
-  for (const t of s.degraded_tracks || []) problems.push(`${t} stopped capturing`);
-  $("warn").hidden = problems.length === 0;
-  $("warn").textContent = problems.join(" · ");
+  const box = $("banners");
+  box.replaceChildren();
+  // A write failure means nothing is being saved while the timer still counts.
+  // It is the most serious thing this interface can report.
+  if (s.failure) box.append(el("div", "banner err", `Recording is not being saved: ${s.failure}`));
+  // Reconnecting and degraded are deliberately different: one is recovering,
+  // the other means that side is lost from here on.
+  for (const t of s.reconnecting || [])
+    box.append(el("div", "banner warn", `${trackName(t)} — device disconnected, reconnecting…`));
+  for (const t of s.degraded_tracks || [])
+    box.append(el("div", "banner err", `${trackName(t)} stopped capturing — that side is incomplete`));
 }
 
-function renderList(items) {
-  $("empty").hidden = items.length > 0;
-  $("list").replaceChildren(...items.map(render));
-}
-
-function render(item) {
-  const li = document.createElement("li");
-  li.dataset.id = item.id;
-
-  const row = document.createElement("div");
-  row.className = "row";
-
-  const info = document.createElement("div");
-  info.style.flex = "1";
-  info.style.minWidth = "0";
-
-  const title = document.createElement("div");
-  title.className = "title";
-  title.textContent = item.title;
-
-  const meta = document.createElement("div");
-  meta.className = "meta";
-  meta.textContent = `${fmtDate(item.started_at)} · ${fmtDuration(item.duration_ms)}`;
-
-  info.append(title, meta);
-
-  const rename = document.createElement("button");
-  rename.className = "icon";
-  rename.textContent = "Rename";
-  rename.onclick = () => startRename(li, item);
-
-  const remove = document.createElement("button");
-  remove.className = "icon";
-  remove.textContent = "Delete";
-  remove.onclick = () => destroy(item);
-
-  row.append(info, rename, remove);
-  li.append(row);
-
-  if (item.has_transcript) {
-    const summary = document.createElement("button");
-    summary.className = "icon";
-    summary.textContent = "Summary";
-    summary.onclick = () => toggleSummary(li, item, summary);
-    row.insertBefore(summary, rename);
-
-    const show = document.createElement("button");
-    show.className = "icon";
-    show.textContent = "Transcript";
-    show.onclick = () => toggleTranscript(li, item, show);
-    row.insertBefore(show, rename);
-  }
-
-  if (item.mixed_audio_url) {
-    const audio = document.createElement("audio");
-    audio.controls = true;
-    audio.preload = "none";
-    audio.src = item.mixed_audio_url;
-    li.append(audio);
-  }
-
-  // Both sides are kept separately; the mix is what you usually want, but each
-  // side alone is what makes attribution possible.
-  if (item.tracks?.length) {
-    const tracks = document.createElement("div");
-    tracks.className = "tracks";
-    for (const t of item.tracks) {
-      const b = document.createElement("button");
-      b.textContent = `▸ ${t.label} only`;
-      b.onclick = () => {
-        const a = li.querySelector("audio");
-        if (a) { a.src = t.audio_url; a.play(); }
-      };
-      tracks.append(b);
+async function toggleRecording() {
+  if (busy || state.state === "finalizing") return;
+  busy = true;
+  $("record").disabled = true;
+  try {
+    if (state.state === "recording") {
+      await api("/api/v1/recordings/active/stop", { method: "POST" });
+      // Exports run after stopping, so the new recording appears shortly after.
+      setTimeout(refreshList, 1500);
+    } else {
+      await api("/api/v1/recordings", { method: "POST", body: JSON.stringify({}) });
     }
-    li.append(tracks);
+  } catch (e) {
+    fail(e.message);
+  } finally {
+    busy = false;
+    refreshStatus();
   }
-
-  return li;
 }
+$("record").onclick = toggleRecording;
 
-async function toggleSummary(li, item, button) {
-  const existing = li.querySelector(".summary");
-  if (existing) {
-    existing.remove();
-    button.textContent = "Summary";
+// ---- library ---------------------------------------------------------------
+
+function renderList(next) {
+  items = next;
+  $("list-count").textContent = items.length || "";
+  const list = $("list");
+  list.replaceChildren();
+
+  if (!items.length) {
+    const empty = el("div", "placeholder");
+    empty.style.padding = "28px 16px";
+    empty.append(el("p", null, query ? `Nothing matching “${query}”.` : "No recordings yet."));
+    list.append(empty);
     return;
   }
 
-  const box = document.createElement("div");
-  box.className = "summary";
-  li.append(box);
-  button.textContent = "Hide";
+  for (const item of items) {
+    const row = el("button", "item");
+    row.type = "button";
+    row.setAttribute("role", "option");
+    row.setAttribute("aria-current", String(item.id === selectedId));
+    row.append(el("span", "name", item.title));
 
-  try {
-    const s = await api(`/api/v1/recordings/${item.id}/summary`);
+    const sub = el("div", "sub");
+    sub.append(el("span", null, clock(item.duration_ms / 1000)));
+    sub.append(el("span", null, when(item.started_at)));
+    if (item.has_transcript) sub.append(el("span", null, "TXT"));
+    row.append(sub);
 
-    const section = (title, build) => {
-      const h = document.createElement("h4");
-      h.textContent = title;
-      box.append(h, build());
-    };
-
-    if (s.overview) {
-      section("Overview", () => {
-        const p = document.createElement("p");
-        p.textContent = s.overview;
-        return p;
-      });
-    }
-
-    const bullets = (items, render) => () => {
-      const ul = document.createElement("ul");
-      for (const item of items) ul.append(render(item));
-      return ul;
-    };
-
-    if (s.decisions?.length) {
-      section("Decisions", bullets(s.decisions, (d) => {
-        const li = document.createElement("li");
-        li.textContent = d;
-        return li;
-      }));
-    }
-
-    if (s.action_items?.length) {
-      section("Action items", bullets(s.action_items, (a) => {
-        const li = document.createElement("li");
-        li.textContent = a.what;
-        // An unowned action is shown as such rather than silently attributed.
-        const owner = document.createElement("span");
-        owner.className = "owner";
-        owner.textContent = a.owner ? `  — ${a.owner}` : "  — unassigned";
-        li.append(owner);
-        return li;
-      }));
-    }
-
-    if (s.topics?.length) {
-      section("Topics", bullets(s.topics, (t) => {
-        const li = document.createElement("li");
-        li.textContent = t;
-        return li;
-      }));
-    }
-
-    if (!box.childElementCount) {
-      box.textContent = "The summary came back empty.";
-      box.style.color = "var(--muted)";
-    }
-  } catch (e) {
-    box.textContent = e.message.includes("not been summarised")
-      ? "Not summarised yet. Summaries need KASETA_OPENROUTER_KEY to be set."
-      : e.message;
-    box.style.color = "var(--muted)";
+    row.onclick = () => select(item.id);
+    list.append(row);
   }
 }
 
-async function toggleTranscript(li, item, button) {
-  const existing = li.querySelector(".transcript");
-  if (existing) {
-    existing.remove();
-    button.textContent = "Transcript";
+function select(id) {
+  selectedId = id;
+  renderList(items);
+  renderDetail(items.find((i) => i.id === id));
+}
+
+// ---- detail ----------------------------------------------------------------
+
+function renderDetail(item) {
+  const pane = $("detail");
+  pane.replaceChildren();
+  audio = null;
+  if (!item) return;
+
+  const head = el("div", "detail-head");
+  const row = el("div", "head-row");
+  const grow = el("div", "grow");
+
+  const title = el("h2", null, item.title);
+  title.title = "Double-click to rename";
+  title.ondblclick = () => renameInline(title, item);
+  grow.append(title, el("div", "hint", `${when(item.started_at)} · ${clock(item.duration_ms / 1000)}`));
+  row.append(grow);
+
+  // The mix, or either side alone. Keeping both sides separately is what makes
+  // attribution possible, so they are offered rather than hidden.
+  const sources = [];
+  if (item.mixed_audio_url) sources.push({ name: "Mix", url: item.mixed_audio_url });
+  for (const t of item.tracks || [])
+    sources.push({ name: t.role === "local_mic" ? "You" : "Them", url: t.audio_url });
+
+  if (sources.length) {
+    const seg = el("div", "seg");
+    sources.forEach((src, i) => {
+      const b = el("button", null, src.name);
+      b.type = "button";
+      b.setAttribute("aria-pressed", String(i === 0));
+      b.onclick = () => {
+        for (const other of seg.children) other.setAttribute("aria-pressed", "false");
+        b.setAttribute("aria-pressed", "true");
+        if (audio) {
+          const at = audio.currentTime, playing = !audio.paused;
+          audio.src = src.url;
+          audio.currentTime = at;
+          if (playing) audio.play();
+        }
+      };
+      seg.append(b);
+    });
+    row.append(seg);
+  }
+
+  if (item.has_transcript) {
+    const dl = el("a", "btn", "Export");
+    dl.href = `/api/v1/recordings/${item.id}/transcript.txt`;
+    dl.style.textDecoration = "none";
+    row.append(dl);
+  }
+
+  const del = el("button", "icon-btn", "✕");
+  del.title = "Delete recording";
+  del.setAttribute("aria-label", "Delete recording");
+  del.onclick = () => destroy(item);
+  row.append(del);
+  head.append(row);
+
+  if (sources.length) {
+    audio = document.createElement("audio");
+    audio.src = sources[0].url;
+    audio.preload = "metadata";
+
+    const wave = el("div", "wave");
+    const canvas = document.createElement("canvas");
+    const playhead = el("div", "playhead");
+    playhead.style.left = "0";
+    wave.append(canvas, playhead);
+
+    const controls = el("div", "player");
+    const play = el("button", "play", "▶");
+    play.setAttribute("aria-label", "Play");
+    const elapsed = el("span", "time", "0:00");
+    const total = el("span", "time", clock(item.duration_ms / 1000));
+    total.style.marginLeft = "auto";
+
+    play.onclick = () => (audio.paused ? audio.play() : audio.pause());
+    audio.onplay = () => { play.textContent = "❚❚"; play.setAttribute("aria-label", "Pause"); };
+    audio.onpause = () => { play.textContent = "▶"; play.setAttribute("aria-label", "Play"); };
+    audio.ontimeupdate = () => {
+      const d = audio.duration || item.duration_ms / 1000 || 1;
+      elapsed.textContent = clock(audio.currentTime);
+      playhead.style.left = `${(audio.currentTime / d) * 100}%`;
+    };
+    wave.onclick = (e) => {
+      const box = wave.getBoundingClientRect();
+      audio.currentTime = ((e.clientX - box.left) / box.width) *
+        (audio.duration || item.duration_ms / 1000);
+    };
+
+    controls.append(play, elapsed, total);
+    head.append(wave, controls);
+    drawWaveform(canvas, item.id);
+  }
+  pane.append(head);
+
+  const split = el("div", "split");
+  const tx = el("div", "transcript-pane");
+  const sm = el("div", "summary-pane");
+  split.append(tx, sm);
+  pane.append(split);
+
+  loadTranscript(tx, item);
+  loadSummary(sm, item);
+}
+
+async function drawWaveform(canvas, id) {
+  let peaks = [];
+  try { peaks = await api(`/api/v1/recordings/${id}/waveform`); } catch { /* flat fallback */ }
+
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || 600, h = canvas.clientHeight || 64;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.fillStyle = getComputedStyle(document.body).getPropertyValue("--outline").trim() || "#8c909f";
+
+  // An absent waveform is not an error: the recording may predate them, or the
+  // mix may not have been produced yet.
+  if (!peaks.length) {
+    ctx.globalAlpha = 0.25;
+    ctx.fillRect(0, h / 2 - 1, w, 2);
+    return;
+  }
+
+  const step = w / peaks.length;
+  const bar = Math.max(1, step * 0.6);
+  peaks.forEach((p, i) => {
+    const height = Math.max(2, p * (h - 8));
+    ctx.fillRect(i * step, (h - height) / 2, bar, height);
+  });
+}
+
+async function loadTranscript(pane, item) {
+  pane.append(el("div", "sec-head", "Transcript"));
+
+  if (!item.has_transcript) {
+    // Absence cannot distinguish pending from disabled from failed, so the
+    // wording stays honest rather than guessing.
+    pane.append(el("p", "hint", "No transcript yet. One is produced automatically after a recording ends."));
     return;
   }
 
   try {
     const data = await api(`/api/v1/recordings/${item.id}/transcript`);
-    const box = document.createElement("div");
-    box.className = "transcript";
-
-    for (const line of data.lines) {
-      const el = document.createElement("div");
-      el.className = `line ${line.speaker}`;
-
-      const at = document.createElement("time");
-      at.textContent = fmtDuration(line.at_s * 1000);
-
-      const who = document.createElement("span");
-      who.className = "who";
-      who.textContent = line.speaker === "you" ? "You" : line.speaker === "them" ? "Them" : "";
-
-      const text = document.createElement("span");
-      // textContent, not innerHTML: a transcript is untrusted text and may
-      // contain anything that was said or misheard.
-      text.textContent = line.text;
-      if (lastQuery) highlight(text, lastQuery);
-
-      // Clicking a line seeks the player to that moment, which is the point of
-      // keeping timestamps through the whole pipeline.
-      el.onclick = () => {
-        const audio = li.querySelector("audio");
-        if (!audio) return;
-        audio.currentTime = line.at_s;
-        audio.play();
-      };
-
-      el.append(at, who, text);
-      box.append(el);
-    }
+    $("engine").textContent = data.engine ? `Transcribed locally with ${data.engine}` : "";
 
     if (!data.lines.length) {
-      box.textContent = "No speech was found in this recording.";
-      box.style.color = "var(--muted)";
+      pane.append(el("p", "hint", "No speech was found in this recording."));
+      return;
     }
 
-    li.append(box);
-    button.textContent = "Hide";
-  } catch (e) { showError(e); }
+    for (const line of data.lines) {
+      const row = el("div", `line ${line.speaker}`);
+      const who = el("div", "who");
+
+      // A separate seek control, so the text itself stays selectable — people
+      // copy quotes out of transcripts.
+      const jump = el("button", "seek", clock(line.at_s));
+      jump.type = "button";
+      jump.title = "Play from here";
+      jump.onclick = () => { if (audio) { audio.currentTime = line.at_s; audio.play(); } };
+
+      who.append(document.createTextNode(
+        line.speaker === "you" ? "You " : line.speaker === "them" ? "Them " : "Unknown "), jump);
+
+      const text = el("div", "text", line.text);
+      if (query) highlight(text, query);
+      row.append(who, text);
+      pane.append(row);
+    }
+  } catch (e) {
+    pane.append(el("p", "hint", e.message));
+  }
 }
 
-/// Wraps matches of `query` so a search result shows why it matched.
-function highlight(el, query) {
-  const text = el.textContent;
-  const at = text.toLowerCase().indexOf(query.toLowerCase());
+function highlight(node, term) {
+  const text = node.textContent;
+  const at = text.toLowerCase().indexOf(term.toLowerCase());
   if (at < 0) return;
-
-  el.textContent = "";
-  el.append(
+  node.textContent = "";
+  node.append(
     document.createTextNode(text.slice(0, at)),
-    Object.assign(document.createElement("mark"), {
-      textContent: text.slice(at, at + query.length),
-    }),
-    document.createTextNode(text.slice(at + query.length)),
+    el("mark", null, text.slice(at, at + term.length)),
+    document.createTextNode(text.slice(at + term.length)),
   );
 }
 
-function startRename(li, item) {
-  const row = li.querySelector(".row");
+async function loadSummary(pane, item) {
+  let data;
+  try {
+    data = await api(`/api/v1/recordings/${item.id}/summary`);
+  } catch {
+    pane.append(el("div", "sec-head", "Summary"));
+    pane.append(el("p", "hint", "Not summarised. Summaries need an API key in Settings."));
+    return;
+  }
+
+  const section = (name, build) => {
+    const body = build();
+    if (body) pane.append(el("div", "sec-head", name), body);
+  };
+
+  const bullets = (values) => {
+    const ul = el("ul");
+    for (const v of values) ul.append(el("li", null, v));
+    return ul;
+  };
+
+  section("Overview", () => (data.overview ? el("div", "overview", data.overview) : null));
+  section("Decisions", () => (data.decisions?.length ? bullets(data.decisions) : null));
+  section("Action items", () => {
+    if (!data.action_items?.length) return null;
+    const ul = el("ul");
+    for (const a of data.action_items) {
+      const li = el("li", "action");
+      li.append(el("div", null, a.what));
+      // An unassigned action says so rather than being quietly attributed:
+      // the far end may be several people.
+      li.append(a.owner ? el("span", "owner assigned", a.owner)
+                        : el("span", "owner unassigned", "Unassigned"));
+      ul.append(li);
+    }
+    return ul;
+  });
+  section("Topics", () => (data.topics?.length ? bullets(data.topics) : null));
+
+  if (!pane.childElementCount) {
+    pane.append(el("div", "sec-head", "Summary"), el("p", "hint", "The summary came back empty."));
+  }
+}
+
+function renameInline(title, item) {
   const input = document.createElement("input");
   input.type = "text";
   input.value = item.title;
+  input.style.cssText = "font:600 24px/32px var(--sans);width:100%;padding:2px 6px;" +
+    "background:var(--surface-lowest);color:inherit;border:1px solid var(--primary-container);border-radius:var(--r)";
 
+  let done = false;
   const save = async () => {
-    const title = input.value.trim();
+    if (done) return;
+    done = true;
     try {
       await api(`/api/v1/recordings/${item.id}`, {
-        method: "PATCH",
-        body: JSON.stringify({ title: title || null }),
+        method: "PATCH", body: JSON.stringify({ title: input.value.trim() || null }),
       });
       await refreshList();
-    } catch (e) { showError(e); }
+      select(item.id);
+    } catch (e) { fail(e.message); }
   };
 
   input.onkeydown = (e) => {
     if (e.key === "Enter") save();
-    if (e.key === "Escape") refreshList();
+    if (e.key === "Escape") { done = true; renderDetail(item); }
   };
   input.onblur = save;
-
-  row.replaceChildren(input);
+  title.replaceWith(input);
   input.focus();
   input.select();
 }
 
 async function destroy(item) {
-  if (!confirm(`Delete "${item.title}"? The audio is removed permanently.`)) return;
+  if (!confirm(`Delete “${item.title}”?\n\nThe audio and transcript are removed permanently.`)) return;
   try {
     await api(`/api/v1/recordings/${item.id}`, { method: "DELETE" });
+    selectedId = null;
     await refreshList();
-  } catch (e) { showError(e); }
+    $("detail").replaceChildren($("placeholder"));
+  } catch (e) { fail(e.message); }
 }
 
-$("toggle").onclick = async () => {
-  busy = true;
-  $("toggle").disabled = true;
-  $("error").hidden = true;
-  try {
-    if (state.state === "recording") {
-      await api("/api/v1/recordings/active/stop", { method: "POST" });
-      await refreshList();
-    } else {
-      await api("/api/v1/recordings", { method: "POST", body: JSON.stringify({}) });
-    }
-  } catch (e) {
-    showError(e);
-  } finally {
-    busy = false;
-    await refreshStatus();
-  }
-};
+// ---- settings --------------------------------------------------------------
 
-async function refreshStatus() {
-  try { renderStatus(await api("/api/v1/status")); }
-  catch (e) { showError(e); }
-}
-
-let lastQuery = "";
-let searchTimer = null;
-
-async function refreshList() {
-  try {
-    const path = lastQuery
-      ? `/api/v1/search?q=${encodeURIComponent(lastQuery)}`
-      : "/api/v1/recordings";
-    const { items } = await api(path);
-    renderList(items);
-    $("empty").textContent = lastQuery
-      ? `Nothing matching "${lastQuery}".`
-      : "No recordings yet.";
-  } catch (e) { showError(e); }
-}
-
-$("q").oninput = (e) => {
-  // Debounced: searching on every keystroke would query the index far faster
-  // than anyone types meaningfully.
-  clearTimeout(searchTimer);
-  lastQuery = e.target.value.trim();
-  $("clear").hidden = !lastQuery;
-  searchTimer = setTimeout(refreshList, 200);
-};
-
-$("clear").onclick = () => {
-  $("q").value = "";
-  lastQuery = "";
-  $("clear").hidden = true;
-  refreshList();
-};
-
-// --- settings -------------------------------------------------------------
-
-const dialog = $("settings");
+const sheet = $("settings");
 
 $("open-settings").onclick = async () => {
   try {
@@ -646,16 +880,13 @@ $("open-settings").onclick = async () => {
 
     $("sum-enabled").checked = s.summaries.enabled;
     $("sum-model").value = s.summaries.model || "";
-    // A saved secret is never sent back, so the field starts empty and its
-    // placeholder says whether one exists.
     $("sum-key").value = "";
-    $("sum-key").placeholder = s.summaries.api_key_set
-      ? `saved ${s.summaries.api_key_hint || ""}`
-      : "sk-or-…";
-    $("sum-key-state").textContent = s.summaries.api_key_set ? "saved" : "";
-    $("sum-note").textContent = s.summaries.from_environment
-      ? "A key is set in the environment and takes precedence over this one."
-      : "Without a key, meetings are still recorded and transcribed.";
+    $("sum-key").disabled = s.summaries.from_environment;
+    $("sum-key-hint").textContent = s.summaries.from_environment
+      ? "Set in the environment, which takes precedence over this."
+      : s.summaries.api_key_set
+        ? `Saved ${s.summaries.api_key_hint || ""} — leave blank to keep it`
+        : "Required for summaries";
 
     $("r2-enabled").checked = s.remote_storage.enabled;
     $("r2-endpoint").value = s.remote_storage.endpoint;
@@ -663,19 +894,20 @@ $("open-settings").onclick = async () => {
     $("r2-region").value = s.remote_storage.region;
     $("r2-access").value = s.remote_storage.access_key_id;
     $("r2-secret").value = "";
-    $("r2-secret").placeholder = s.remote_storage.secret_set ? "saved" : "";
-    $("r2-secret-state").textContent = s.remote_storage.secret_set ? "saved" : "";
+    $("r2-secret-hint").textContent = s.remote_storage.secret_set
+      ? "Saved — leave blank to keep it" : "";
     $("r2-delete").checked = s.remote_storage.delete_local_after_upload;
 
-    dialog.showModal();
-  } catch (e) { showError(e); }
+    sheet.showModal();
+  } catch (e) { fail(e.message); }
 };
 
-$("settings-cancel").onclick = () => dialog.close();
+$("settings-cancel").onclick = () => sheet.close();
+$("settings-close").onclick = () => sheet.close();
 
 $("settings-save").onclick = async () => {
-  // A blank secret field means "leave it alone", so it is omitted entirely
-  // rather than sent as an empty string — which would clear the stored key.
+  // A blank secret means "leave it alone", so it is omitted rather than sent
+  // empty — which is how the API is told to clear one.
   const body = {
     summaries_enabled: $("sum-enabled").checked,
     summaries_model: $("sum-model").value,
@@ -691,14 +923,64 @@ $("settings-save").onclick = async () => {
 
   try {
     await api("/api/v1/settings", { method: "PUT", body: JSON.stringify(body) });
-    dialog.close();
-  } catch (e) { showError(e); }
+    sheet.close();
+  } catch (e) { fail(e.message); }
+};
+
+// ---- keyboard --------------------------------------------------------------
+
+document.addEventListener("keydown", (e) => {
+  const typing = ["INPUT", "TEXTAREA"].includes(e.target.tagName);
+  if (typing) {
+    if (e.key === "Escape") e.target.blur();
+    return;
+  }
+  if (sheet.open) return;
+
+  if (e.key === "r" || e.key === "R") { e.preventDefault(); toggleRecording(); }
+  else if (e.key === " ") { e.preventDefault(); if (audio) audio.paused ? audio.play() : audio.pause(); }
+  else if (e.key === "f" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $("q").focus(); }
+  else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    if (!items.length) return;
+    e.preventDefault();
+    const at = items.findIndex((i) => i.id === selectedId);
+    const next = e.key === "ArrowDown"
+      ? Math.min(items.length - 1, at + 1)
+      : Math.max(0, at < 0 ? 0 : at - 1);
+    select(items[next].id);
+  }
+});
+
+// ---- data ------------------------------------------------------------------
+
+async function refreshStatus() {
+  try { renderStatus(await api("/api/v1/status")); }
+  catch (e) { $("banners").replaceChildren(el("div", "banner err", `Not connected: ${e.message}`)); }
+}
+
+async function refreshList() {
+  try {
+    const path = query ? `/api/v1/search?q=${encodeURIComponent(query)}` : "/api/v1/recordings";
+    const { items: next } = await api(path);
+    renderList(next);
+    $("stat-count").textContent = `${next.length} recording${next.length === 1 ? "" : "s"}`;
+    if (selectedId && !next.some((i) => i.id === selectedId)) {
+      selectedId = null;
+      $("detail").replaceChildren($("placeholder"));
+    }
+  } catch (e) { fail(e.message); }
+}
+
+$("q").oninput = (e) => {
+  clearTimeout(searchTimer);
+  query = e.target.value.trim();
+  // Debounced: searching every keystroke queries the index far faster than
+  // anyone types meaningfully.
+  searchTimer = setTimeout(refreshList, 200);
 };
 
 refreshStatus();
 refreshList();
-// Polling rather than a socket: the page is open occasionally and briefly, and
-// a second of latency on an elapsed counter costs nothing.
 setInterval(refreshStatus, 1000);
 </script>
 </body>

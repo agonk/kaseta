@@ -432,6 +432,17 @@ pub fn mix_recording(
     let key = prefix.export("mixed.flac").context("building export key")?;
     store.put(&key, &encoded).context("writing mixed recording")?;
 
+    // Computed here rather than on demand: the samples are already in hand, and
+    // drawing a waveform later would mean decoding the whole recording again.
+    let peaks = peaks_from(&samples, 2, WAVEFORM_POINTS);
+    if let Ok(peaks_key) = prefix.export("mixed.peaks.json") {
+        let encoded = serde_json::to_vec(&peaks).unwrap_or_else(|_| b"[]".to_vec());
+        if let Err(e) = store.put(&peaks_key, &encoded) {
+            // A missing waveform costs a nicer scrubber, not the recording.
+            tracing::warn!(error = %format!("{e:#}"), "could not write the waveform");
+        }
+    }
+
     Ok(Some(MixedRecording {
         key,
         bytes: encoded.len() as u64,
@@ -439,6 +450,37 @@ pub fn mix_recording(
         sample_rate_hz: sample_rate,
         gain,
     }))
+}
+
+/// How many points a waveform is reduced to.
+///
+/// Enough to look like the audio at any window width, small enough to send as
+/// part of a page load. The player scales it to whatever space it has.
+pub const WAVEFORM_POINTS: usize = 800;
+
+/// Reduces audio to a peak per bucket, for drawing.
+///
+/// Peaks rather than averages: averaging washes speech down to a flat band,
+/// because a waveform's mean over a bucket is near zero regardless of how loud
+/// it was. The peak is what makes speech look like speech.
+fn peaks_from(samples: &[i16], channels: u16, points: usize) -> Vec<f32> {
+    let channels = channels.max(1) as usize;
+    let frames = samples.len() / channels;
+    if frames == 0 || points == 0 {
+        return Vec::new();
+    }
+
+    let per_point = frames.div_ceil(points).max(1);
+    let mut peaks = Vec::with_capacity(points);
+
+    for bucket in samples.chunks(per_point * channels) {
+        let peak = bucket
+            .iter()
+            .map(|s| s.saturating_abs() as f32)
+            .fold(0.0f32, f32::max);
+        peaks.push(peak / i16::MAX as f32);
+    }
+    peaks
 }
 
 /// Sample rate speech models expect. Higher rates carry no speech information
@@ -1073,6 +1115,41 @@ mod tests {
         let reader = TrackReader::new(&store, &track).unwrap();
         // Two seconds of audio plus half a second of padded gap.
         assert_eq!(reader.total_samples(), 48_000 * 2 + 24_000);
+    }
+
+    #[test]
+    fn a_waveform_reflects_where_the_audio_is_loud() {
+        // Quiet first half, loud second half. Averaging would flatten both to
+        // nearly nothing, because a waveform's mean is near zero either way.
+        let mut samples = vec![100i16; 1_000];
+        samples.extend(vec![20_000i16; 1_000]);
+
+        let peaks = peaks_from(&samples, 1, 4);
+        assert_eq!(peaks.len(), 4);
+        assert!(peaks[0] < 0.05, "the quiet part should read quiet");
+        assert!(peaks[3] > 0.5, "the loud part should read loud");
+    }
+
+    #[test]
+    fn waveform_values_stay_within_range() {
+        let peaks = peaks_from(&[i16::MIN, i16::MAX, 0], 1, 3);
+        for p in peaks {
+            assert!((0.0..=1.0).contains(&p), "{p} is outside 0..1");
+        }
+    }
+
+    #[test]
+    fn a_waveform_of_nothing_is_empty_rather_than_a_panic() {
+        assert!(peaks_from(&[], 1, 100).is_empty());
+        assert!(peaks_from(&[1, 2, 3], 1, 0).is_empty());
+    }
+
+    #[test]
+    fn short_audio_still_produces_a_waveform() {
+        // Fewer frames than requested points must not divide by zero or loop.
+        let peaks = peaks_from(&[1_000i16; 3], 1, 800);
+        assert!(!peaks.is_empty());
+        assert!(peaks.len() <= 800);
     }
 
     #[test]

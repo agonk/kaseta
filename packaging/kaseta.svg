@@ -1,10 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
-  <rect x="4" y="12" width="56" height="40" rx="5" fill="#b4341f"/>
-  <rect x="9" y="17" width="46" height="21" rx="2.5" fill="#fdf0ee"/>
-  <circle cx="23" cy="27.5" r="6.5" fill="#b4341f"/>
-  <circle cx="41" cy="27.5" r="6.5" fill="#b4341f"/>
-  <circle cx="23" cy="27.5" r="2.4" fill="#fdf0ee"/>
-  <circle cx="41" cy="27.5" r="2.4" fill="#fdf0ee"/>
-  <rect x="27.5" y="25.5" width="9" height="4" fill="#7d2416"/>
-  <rect x="17" y="43" width="30" height="4" rx="2" fill="#fdf0ee" opacity=".85"/>
+  <!-- Two channels, already separate: the product in one mark. Reads at 16px
+       because it is two filled circles on a plain field, nothing finer. -->
+  <rect width="64" height="64" rx="13" fill="#091421"/>
+  <rect x="8" y="17" width="48" height="30" rx="4" fill="#adc6ff"/>
+  <circle cx="24" cy="32" r="7.5" fill="#091421"/>
+  <circle cx="40" cy="32" r="7.5" fill="#091421"/>
+  <rect x="28.5" y="30" width="7" height="4" fill="#091421"/>
+  <rect x="24" y="30.5" width="0" height="3" fill="none"/>
 </svg>

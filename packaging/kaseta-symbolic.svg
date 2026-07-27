@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- Tray variant: one colour, no fills that depend on hue, legible on light
+       and dark panels. Follows Linux symbolic-icon convention. -->
+  <path fill="currentColor" d="M1.5 4h13a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1h-13a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1zm1 1.5v5h11v-5h-11z"/>
+  <circle cx="5.75" cy="8" r="1.75" fill="currentColor"/>
+  <circle cx="10.25" cy="8" r="1.75" fill="currentColor"/>
+</svg>

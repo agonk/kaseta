@@ -92,6 +92,8 @@ pub fn router(
         .route("/api/v1/recordings/{id}/audio/{file}", get(audio))
         .route("/api/v1/recordings/{id}/transcript", get(transcript))
         .route("/api/v1/recordings/{id}/summary", get(summary))
+        .route("/api/v1/recordings/{id}/waveform", get(waveform))
+        .route("/api/v1/recordings/{id}/transcript.txt", get(transcript_text))
         .route("/api/v1/search", get(search))
         .route("/api/v1/settings", get(get_settings).put(put_settings))
         .with_state(state)
@@ -332,6 +334,86 @@ async fn delete_recording(
             .ok_or_else(|| ApiError::not_found("no such recording"))
     })
     .await
+}
+
+/// Peak data for drawing the player's scrubber.
+async fn waveform(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<f32>>, ApiError> {
+    let id = parse_id(&id)?;
+    let started_at = with_db(&state, move |db| {
+        library::get(db, id)
+            .map_err(ApiError::from_anyhow)?
+            .map(|r| r.started_at)
+            .ok_or_else(|| ApiError::not_found("no such recording"))
+    })
+    .await?;
+
+    let store = Arc::clone(&state.store);
+    let peaks = tokio::task::spawn_blocking(move || {
+        let prefix = kaseta_contracts::RecordingPrefix::new(id, started_at);
+        let key = prefix.export("mixed.peaks.json").ok()?;
+        let bytes = store.get(&key).ok()?;
+        serde_json::from_slice::<Vec<f32>>(&bytes).ok()
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("reading the waveform failed: {e}")))?;
+
+    // An absent waveform is not an error: the recording predates them, or the
+    // mix has not been produced yet. The player falls back to a plain bar.
+    Ok(Json(peaks.unwrap_or_default()))
+}
+
+/// A transcript as plain text, for saving or pasting elsewhere.
+async fn transcript_text(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let id = parse_id(&id)?;
+    let (transcript, title) = with_db(&state, move |db| {
+        let transcript = library::transcript(db, id)
+            .map_err(ApiError::from_anyhow)?
+            .ok_or_else(|| ApiError::not_found("this recording has not been transcribed"))?;
+        let title = library::get(db, id)
+            .map_err(ApiError::from_anyhow)?
+            .map(|r| r.title)
+            .unwrap_or_else(|| "Recording".into());
+        Ok((transcript, title))
+    })
+    .await?;
+
+    let body = crate::summarize::render(&transcript.lines);
+    let filename = sanitise_filename(&title);
+
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}.txt\""),
+            ),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+/// Makes a title safe to offer as a download filename.
+///
+/// A title is user-supplied and may contain quotes, slashes or newlines, any of
+/// which would break the header or suggest a path.
+fn sanitise_filename(title: &str) -> String {
+    let cleaned: String = title
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == ' ' { c } else { '_' })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('_').trim();
+    if trimmed.is_empty() {
+        "recording".into()
+    } else {
+        trimmed.chars().take(80).collect()
+    }
 }
 
 async fn get_settings(
@@ -668,6 +750,29 @@ mod tests {
             INDEX_HTML.contains("__KASETA_TOKEN__"),
             "the page must receive a token, or every mutation will be rejected"
         );
+    }
+
+    #[test]
+    fn a_download_filename_cannot_break_the_header_or_suggest_a_path() {
+        // Titles are user-supplied; a quote would terminate the header early
+        // and a slash would read as a directory.
+        assert_eq!(sanitise_filename("Weekly sync"), "Weekly sync");
+        assert!(!sanitise_filename("../../etc/passwd").contains('/'));
+        assert!(!sanitise_filename("say \"hello\"").contains('"'));
+        assert!(!sanitise_filename("line\nbreak").contains('\n'));
+    }
+
+    #[test]
+    fn an_unnameable_recording_still_downloads() {
+        assert_eq!(sanitise_filename(""), "recording");
+        assert_eq!(sanitise_filename("///"), "recording");
+        assert_eq!(sanitise_filename("   "), "recording");
+    }
+
+    #[test]
+    fn a_very_long_title_is_shortened() {
+        let long = "a".repeat(500);
+        assert!(sanitise_filename(&long).len() <= 80);
     }
 
     #[test]
