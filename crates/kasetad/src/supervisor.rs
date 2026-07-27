@@ -74,6 +74,10 @@ pub struct DaemonStatus {
     pub elapsed_s: u64,
     /// Tracks that stopped capturing before a stop was requested.
     pub degraded_tracks: Vec<String>,
+    /// Tracks whose device went away and are being reattached. Distinct from
+    /// degraded: audio is being lost right now, but the track is expected back.
+    #[serde(default)]
+    pub reconnecting: Vec<String>,
     /// Set when persistence failed; nothing further is being written.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
@@ -87,6 +91,7 @@ impl Default for DaemonStatus {
             started_at: None,
             elapsed_s: 0,
             degraded_tracks: Vec::new(),
+            reconnecting: Vec::new(),
             failure: None,
         }
     }
@@ -217,6 +222,7 @@ fn run(
                     started_at: Some(session.started_at),
                     elapsed_s: session.elapsed_s(),
                     degraded_tracks: session.degraded_track_names(),
+                    reconnecting: Vec::new(),
                     failure: session.session.failure(),
                 });
 
@@ -324,6 +330,7 @@ fn publish(
                     .iter()
                     .map(|(id, _)| id.to_string())
                     .collect(),
+                reconnecting: health.reconnecting.iter().map(|id| id.to_string()).collect(),
                 failure: health.failure,
             }
         }

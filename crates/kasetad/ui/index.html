@@ -225,6 +225,9 @@ function renderStatus(s) {
   // track that stopped early is surfaced rather than discovered afterwards.
   const problems = [];
   if (s.failure) problems.push(s.failure);
+  // A device coming back is different from one that is gone: the first is
+  // temporary and recovering, the second means that side is lost from here on.
+  for (const t of s.reconnecting || []) problems.push(`${t} — device lost, reconnecting…`);
   for (const t of s.degraded_tracks || []) problems.push(`${t} stopped capturing`);
   $("warn").hidden = problems.length === 0;
   $("warn").textContent = problems.join(" · ");

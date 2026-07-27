@@ -10,8 +10,12 @@
 //! never synchronised live — see [`super::chunk`] for why alignment is computed
 //! after the fact instead.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::thread::JoinHandle;
+
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use pipewire::spa;
@@ -39,6 +43,10 @@ pub enum CaptureEvent {
     /// than logged because elapsed-time gap detection cannot see this loss: the
     /// next buffer still arrives on schedule.
     Dropped,
+    /// The stream dropped and capture is being reattempted. Reported so the
+    /// interface can show that a device went away without implying the
+    /// recording is over.
+    Reconnecting { reason: String, attempt: u32 },
     /// The stream stopped on its own — the device disappeared, or the server
     /// went away. The owner decides whether to reconnect.
     Ended { reason: String },
@@ -50,6 +58,9 @@ struct Terminate;
 pub struct CaptureStream {
     thread: Option<JoinHandle<()>>,
     terminate: pipewire::channel::Sender<Terminate>,
+    /// Distinguishes a deliberate stop from a device disappearing, so a
+    /// requested stop is not mistaken for something to reconnect to.
+    stopping: Arc<AtomicBool>,
 }
 
 impl CaptureStream {
@@ -59,14 +70,13 @@ impl CaptureStream {
     /// asynchronously and is reported as [`CaptureEvent::Negotiated`].
     pub fn start(target: CaptureTarget, events: Sender<CaptureEvent>) -> Result<Self> {
         let (terminate, receiver) = pipewire::channel::channel::<Terminate>();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stopping);
 
         let thread = std::thread::Builder::new()
             .name(format!("kaseta-capture-{}", target.node_name))
             .spawn(move || {
-                let reason = match run_capture_loop(&target, &events, receiver) {
-                    Ok(()) => "stopped".to_string(),
-                    Err(e) => format!("{e:#}"),
-                };
+                let reason = run_with_reconnect(&target, &events, receiver, &stop_flag);
                 // Best effort: the owner may already have dropped the receiver.
                 let _ = events.send(CaptureEvent::Ended { reason });
             })
@@ -75,6 +85,7 @@ impl CaptureStream {
         Ok(Self {
             thread: Some(thread),
             terminate,
+            stopping,
         })
     }
 
@@ -87,6 +98,7 @@ impl CaptureStream {
     }
 
     fn shutdown(&mut self) {
+        self.stopping.store(true, Ordering::SeqCst);
         // A send failure means the loop has already exited, which is fine.
         let _ = self.terminate.send(Terminate);
         if let Some(thread) = self.thread.take() {
@@ -104,6 +116,81 @@ impl Drop for CaptureStream {
     }
 }
 
+/// How long to wait between reconnection attempts.
+///
+/// Unplugging a headset and plugging in another takes seconds, and the
+/// replacement device takes a moment to appear. Retrying faster would burn the
+/// budget before the device exists; slower would lose more of the meeting.
+const RECONNECT_DELAY: Duration = Duration::from_millis(750);
+
+/// How many times a dropped stream is reattached before giving up.
+///
+/// Bounded so a device that is genuinely gone ends the track rather than
+/// retrying for the rest of the meeting.
+const RECONNECT_ATTEMPTS: u32 = 8;
+
+/// Runs capture, reattaching if the device disappears.
+///
+/// Unplugging a headset mid-meeting destroys the stream. Without this the track
+/// simply ended and the rest of the conversation was lost from that side, with
+/// nothing recorded but a log line.
+fn run_with_reconnect(
+    target: &CaptureTarget,
+    events: &Sender<CaptureEvent>,
+    receiver: pipewire::channel::Receiver<Terminate>,
+    stopping: &Arc<AtomicBool>,
+) -> String {
+    // The terminate channel is consumed by the loop it is attached to, so only
+    // the first attempt can own it. Later attempts poll the stop flag instead,
+    // which is set before the terminate signal is ever sent.
+    let mut receiver = Some(receiver);
+
+    for attempt in 0..=RECONNECT_ATTEMPTS {
+        let outcome = match receiver.take() {
+            Some(rx) => run_capture_loop(target, events, Some(rx), stopping),
+            None => run_capture_loop(target, events, None, stopping),
+        };
+
+        if stopping.load(Ordering::SeqCst) {
+            return "stopped".to_string();
+        }
+
+        let reason = match outcome {
+            // A clean end without a stop having been requested means the server
+            // dropped the stream — the device went away.
+            Ok(()) => "the device stopped providing audio".to_string(),
+            Err(e) => format!("{e:#}"),
+        };
+
+        if attempt == RECONNECT_ATTEMPTS {
+            return format!("{reason} (gave up after {RECONNECT_ATTEMPTS} attempts)");
+        }
+
+        tracing::warn!(
+            device = %target.node_name,
+            attempt = attempt + 1,
+            %reason,
+            "capture dropped; reattaching"
+        );
+        let _ = events.send(CaptureEvent::Reconnecting {
+            reason: reason.clone(),
+            attempt: attempt + 1,
+        });
+
+        // Sleep in slices so a stop during the wait is noticed promptly rather
+        // than after the full delay.
+        let deadline = std::time::Instant::now() + RECONNECT_DELAY;
+        while std::time::Instant::now() < deadline {
+            if stopping.load(Ordering::SeqCst) {
+                return "stopped".to_string();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    "stopped".to_string()
+}
+
 /// Per-stream state shared between the PipeWire callbacks.
 #[derive(Default)]
 struct StreamState {
@@ -114,7 +201,8 @@ struct StreamState {
 fn run_capture_loop(
     target: &CaptureTarget,
     events: &Sender<CaptureEvent>,
-    receiver: pipewire::channel::Receiver<Terminate>,
+    receiver: Option<pipewire::channel::Receiver<Terminate>>,
+    stopping: &Arc<AtomicBool>,
 ) -> Result<()> {
     pipewire::init();
 
@@ -257,9 +345,28 @@ fn run_capture_loop(
 
     // Waking the loop from another thread requires attaching the receiver to it.
     let quit_loop = mainloop.clone();
-    let _terminate = receiver.attach(mainloop.loop_(), move |_| {
-        quit_loop.quit();
+    let _terminate = receiver.map(|rx| {
+        rx.attach(mainloop.loop_(), move |_| {
+            quit_loop.quit();
+        })
     });
+
+    // A reconnected stream has no terminate channel of its own, so a stop is
+    // noticed by polling the shared flag on a timer.
+    let poll_quit = mainloop.clone();
+    let stop_check = Arc::clone(stopping);
+    let _timer = {
+        let timer = mainloop.loop_().add_timer(move |_| {
+            if stop_check.load(Ordering::SeqCst) {
+                poll_quit.quit();
+            }
+        });
+        let _ = timer.update_timer(
+            Some(Duration::from_millis(100)),
+            Some(Duration::from_millis(100)),
+        );
+        timer
+    };
 
     mainloop.run();
 

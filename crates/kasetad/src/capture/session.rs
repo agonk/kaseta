@@ -103,6 +103,8 @@ type CollectedTracks = BTreeMap<usize, TrackAccumulator>;
 pub struct SessionHealth {
     /// Set when persistence failed; nothing further is being written.
     pub failure: Option<String>,
+    /// Tracks whose device went away and are being reattached.
+    pub reconnecting: std::collections::BTreeSet<TrackId>,
     /// Tracks whose capture stream ended before a stop was requested, with the
     /// reason reported by the stream.
     pub degraded_tracks: Vec<(TrackId, String)>,
@@ -530,6 +532,20 @@ fn spawn_collector(
                             writer.note_drop();
                         }
                     }
+                    CaptureEvent::Reconnecting { reason, attempt } => {
+                        // The stream broke and is being reattached. Audio during
+                        // the gap is lost, and the chunk writer will see the
+                        // hole as a discontinuity once capture resumes.
+                        tracing::warn!(
+                            track = %spec.track_id,
+                            %reason,
+                            attempt,
+                            "capture dropped; reattaching"
+                        );
+                        if let Ok(mut h) = health.lock() {
+                            h.reconnecting.insert(spec.track_id.clone());
+                        }
+                    }
                     CaptureEvent::Ended { reason } => {
                         // A stream ending before a stop was requested means the
                         // device went away or the server dropped it. The rest of
@@ -542,6 +558,7 @@ fn spawn_collector(
                                 "capture stream ended unexpectedly; this track is incomplete"
                             );
                             if let Ok(mut h) = health.lock() {
+                                h.reconnecting.remove(&spec.track_id);
                                 h.degraded_tracks
                                     .push((spec.track_id.clone(), reason.clone()));
                             }
