@@ -59,11 +59,16 @@ pub struct LibraryItem {
 pub struct StageState {
     /// `transcribe`, `summarize`, or `upload_remote`.
     pub stage: String,
-    /// `queued`, `running`, `succeeded`, `failed`, or `retrying`.
+    /// `queued`, `running`, `succeeded`, `skipped`, `failed`, or `retrying`.
     pub state: String,
+    /// Why it failed, or why it was skipped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Whether asking again would achieve anything.
+    ///
+    /// True for a failure worth retrying and for a skip, which is not a failure
+    /// at all — the stage found nothing to do, and correcting whatever caused
+    /// that is exactly the case where running it again is the point.
     pub retryable: bool,
 }
 
@@ -334,7 +339,8 @@ fn ids_in(db: &Db, sql: &str) -> Result<HashSet<String>> {
 /// is history, not something to show or offer to retry.
 fn stages_by_recording(db: &Db) -> Result<std::collections::HashMap<String, Vec<StageState>>> {
     let mut stmt = db.conn().prepare(
-        "SELECT recording_id, job_type, state, error_message, attempt, max_attempts
+        "SELECT recording_id, job_type, state, error_message, attempt, max_attempts,
+                error_code
          FROM jobs j
          WHERE enqueue_seq = (
              SELECT MAX(enqueue_seq) FROM jobs
@@ -350,12 +356,13 @@ fn stages_by_recording(db: &Db) -> Result<std::collections::HashMap<String, Vec<
             r.get::<_, Option<String>>(3)?,
             r.get::<_, i64>(4)?,
             r.get::<_, i64>(5)?,
+            r.get::<_, Option<String>>(6)?,
         ))
     })?;
 
     let mut out: std::collections::HashMap<String, Vec<StageState>> = Default::default();
     for row in rows {
-        let (recording_id, stage, state, error, attempt, max_attempts) = row?;
+        let (recording_id, stage, state, error, attempt, max_attempts, code) = row?;
 
         // `failed_retryable` with attempts left is waiting, not finished — the
         // difference decides whether the interface offers a retry or says it is
@@ -363,6 +370,11 @@ fn stages_by_recording(db: &Db) -> Result<std::collections::HashMap<String, Vec<
         let (state, retryable) = match state.as_str() {
             "queued" => ("queued", false),
             "running" => ("running", false),
+            // A stage that ran and found nothing to do is not the same as one
+            // that did the work. Shown apart so "summaries are off" does not
+            // read as "summarised", and offered as runnable so switching the
+            // setting on is enough to act on it.
+            "succeeded" if code.as_deref() == Some("skipped") => ("skipped", true),
             "succeeded" => ("succeeded", false),
             // Only genuinely coming back around. Once the budget is spent it is
             // a failure, however it is stored — otherwise a dead job shows as
@@ -376,7 +388,7 @@ fn stages_by_recording(db: &Db) -> Result<std::collections::HashMap<String, Vec<
         out.entry(recording_id).or_default().push(StageState {
             stage,
             state: state.to_string(),
-            error: error.filter(|_| state == "failed"),
+            error: error.filter(|_| state == "failed" || state == "skipped"),
             retryable,
         });
     }

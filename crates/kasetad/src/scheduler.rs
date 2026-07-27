@@ -77,9 +77,19 @@ impl Drop for Scheduler {
 }
 
 /// Queues the work that should follow a finished recording.
+///
+/// Transcription and backup are queued side by side rather than in sequence.
+/// Backup used to hang off the end of the chain, which meant a recording whose
+/// transcription failed was never copied anywhere — precisely the recording
+/// most worth having a copy of. The transcript follows it up: writing one marks
+/// the recording changed, and the sweep brings it round for a second pass.
+///
+/// Idempotent, so being called twice after a crash costs nothing.
 pub fn enqueue_for_recording(db: &Db, recording_id: Ulid) -> Result<()> {
-    db.enqueue(recording_id, JobType::Transcribe, 1)
+    db.enqueue_once(recording_id, JobType::Transcribe, 1)
         .context("queueing transcription")?;
+    db.enqueue_once(recording_id, JobType::UploadRemote, 1)
+        .context("queueing backup")?;
     Ok(())
 }
 
@@ -186,12 +196,17 @@ pub fn why_not_runnable(
                     .map(|e| format!("cloud backup is not usable: {e}"))
             }
         }
+        JobType::Transcribe => {
+            if !settings.transcription.enabled {
+                Some("transcription is switched off in Settings".into())
+            } else {
+                None
+            }
+        }
         // Listed rather than defaulted: a stage added later becomes a
         // compilation error here, which is the only reliable way to notice that
         // it needs preconditions of its own.
-        JobType::Transcribe
-        | JobType::FinalizeRecording
-        | JobType::MergeTranscript => None,
+        JobType::FinalizeRecording | JobType::MergeTranscript => None,
     })
 }
 
@@ -201,8 +216,31 @@ fn execute(
     storage_root: &str,
     job_type: JobType,
     recording_id: Ulid,
-) -> Result<()> {
+) -> Result<StageOutcome> {
     let manifest = load_manifest(store, db, recording_id)?;
+    let settings = crate::config::Settings::load().unwrap_or_default();
+
+    // Asked once, for every stage, before any work starts. A stage that cannot
+    // run says so rather than running and quietly achieving nothing.
+    {
+        let guard = db.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        if let Some(reason) = why_not_runnable(&guard, &settings, recording_id, job_type)? {
+            // One combination deserves more than a skip note. Someone who set a
+            // key in the environment and never opened Settings would otherwise
+            // just stop getting summaries with nothing said about why.
+            if job_type == JobType::Summarize
+                && !settings.summaries.enabled
+                && std::env::var(crate::summarize::API_KEY_ENV)
+                    .is_ok_and(|k| !k.trim().is_empty())
+            {
+                tracing::warn!(
+                    "a summary key is set in the environment but summaries are switched off, \
+                     so nothing was sent; switch them on in Settings to use it"
+                );
+            }
+            return Ok(StageOutcome::Skipped(reason));
+        }
+    }
 
     match job_type {
         JobType::Transcribe => {
@@ -224,43 +262,9 @@ fn execute(
                 &transcription,
             )?;
             tracing::info!(%recording_id, segments, "transcribed");
-            Ok(())
+            Ok(StageOutcome::Done)
         }
         JobType::Summarize => {
-            let settings = crate::config::Settings::load().unwrap_or_default();
-
-            // Absent configuration is not a failure: summaries are optional and
-            // a recording without one is still complete.
-            //
-            // The switch alone decides, with no exception for a key found in
-            // the environment. Letting an exported key override it would mean
-            // transcripts leaving a machine whose interface says they do not,
-            // and a privacy control that something else can quietly overrule is
-            // not a control.
-            let skip = {
-                let guard = db.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
-                why_not_runnable(&guard, &settings, recording_id, job_type)?
-            };
-            if let Some(reason) = skip {
-                // A key in the environment with the switch off used to mean
-                // "summarise anyway". Someone who set it up that way and never
-                // opened Settings would otherwise just stop getting summaries
-                // with nothing said, so that specific combination is called
-                // out rather than logged at the usual level.
-                if !settings.summaries.enabled
-                    && std::env::var(crate::summarize::API_KEY_ENV)
-                        .is_ok_and(|k| !k.trim().is_empty())
-                {
-                    tracing::warn!(
-                        "a summary key is set in the environment but summaries are switched \
-                         off, so nothing was sent; switch them on in Settings to use it"
-                    );
-                } else {
-                    tracing::info!(%reason, "skipping summary");
-                }
-                return Ok(());
-            }
-
             let config = crate::summarize::SummarizeConfig::resolve(&settings)?;
 
             let transcript = {
@@ -270,7 +274,9 @@ fn execute(
             // Checked a moment ago, so its absence now means retention or a
             // delete landed in between. Still not a failure.
             let Some(transcript) = transcript else {
-                return Ok(());
+                return Ok(StageOutcome::Skipped(
+                    "the transcript went away before it could be summarised".into(),
+                ));
             };
 
             // The call is made without the lock held: it reaches the network and
@@ -292,19 +298,9 @@ fn execute(
                 &summary,
             )?;
             tracing::info!(%recording_id, "summarised");
-            Ok(())
+            Ok(StageOutcome::Done)
         }
         JobType::UploadRemote => {
-            let settings = crate::config::Settings::load().unwrap_or_default();
-            let skip = {
-                let guard = db.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
-                why_not_runnable(&guard, &settings, recording_id, job_type)?
-            };
-            if let Some(reason) = skip {
-                tracing::debug!(%reason, "skipping backup");
-                return Ok(());
-            }
-
             let target = crate::remote::RemoteTarget::from_settings(&settings.remote_storage)?;
             let prefix = kaseta_contracts::RecordingPrefix::new(
                 manifest.recording_id,
@@ -362,16 +358,21 @@ fn execute(
                 // the bucket, and nothing would ever go back for it.
                 if store_complete {
                     let _ = crate::derived::clear_remote_dirty(&guard, recording_id);
+                    // Recorded only for a copy that is actually complete. The
+                    // interface reads this as "there is a remote copy", and
+                    // saying so of a recording whose transcript failed to be
+                    // written would be the same overstatement this whole change
+                    // set exists to remove.
+                    let _ = guard.conn().execute(
+                        "UPDATE recordings SET uploaded_at = strftime('%s','now') WHERE id = ?1",
+                        rusqlite::params![recording_id.to_string()],
+                    );
                 } else {
                     tracing::warn!(
                         %recording_id,
                         "backed up, but something derived is missing; it stays queued for another pass"
                     );
                 }
-                let _ = guard.conn().execute(
-                    "UPDATE recordings SET uploaded_at = strftime('%s','now') WHERE id = ?1",
-                    rusqlite::params![recording_id.to_string()],
-                );
             }
 
             // Chunks are also what transcription reads: the model's input is
@@ -389,7 +390,9 @@ fn execute(
 
             // Only after every object is confirmed present: deleting on a
             // partial upload would destroy the only complete copy.
-            if settings.remote_storage.delete_local_after_upload && !transcribed {
+            if settings.remote_storage.delete_local_after_upload
+                && !may_delete_local(&settings, transcribed)
+            {
                 tracing::info!(
                     %recording_id,
                     "keeping local audio until it has been transcribed"
@@ -410,14 +413,16 @@ fn execute(
                 }
                 tracing::info!(%recording_id, "local audio removed after backup");
             }
-            Ok(())
+            Ok(StageOutcome::Done)
         }
-        // Stages that exist in the model but have no implementation yet succeed
-        // rather than failing, so they do not strand a recording in the queue.
-        other => {
-            tracing::debug!(?other, "no handler for this stage");
-            Ok(())
-        }
+        // Named rather than caught by a wildcard. These exist in the job model
+        // and are performed elsewhere — sealing happens as capture ends, and
+        // merging is folded into transcription — so reaching one here means
+        // nothing is owed. A wildcard would have quietly reported success for a
+        // stage added later and never implemented.
+        JobType::FinalizeRecording | JobType::MergeTranscript => Ok(StageOutcome::Skipped(
+            "this stage is handled elsewhere in the pipeline".into(),
+        )),
     }
 }
 
@@ -460,16 +465,38 @@ fn load_manifest(
 ///
 /// Deferring costs nothing. Writing a transcript marks the recording as
 /// changed, which brings it round for another upload, and the chunks go then.
+/// Waiting forever is not the same as waiting: with transcription switched off
+/// there is no transcript coming, and holding the chunks for one would quietly
+/// refuse a setting the person did ask for.
 fn may_delete_local(settings: &crate::config::Settings, transcribed: bool) -> bool {
-    settings.remote_storage.delete_local_after_upload && transcribed
+    settings.remote_storage.delete_local_after_upload
+        && (transcribed || !settings.transcription.enabled)
+}
+
+/// What a stage did, as distinct from whether it failed.
+///
+/// A stage that was switched off has neither succeeded nor failed: it had
+/// nothing to do. Collapsing that into success made two things go wrong at
+/// once — the next stage was queued as though work had been done, and the
+/// interface offered to run something it had no way of knowing was skipped.
+#[derive(Debug)]
+pub enum StageOutcome {
+    Done,
+    /// Nothing to do, and why — in words meant for a person.
+    Skipped(String),
 }
 
 fn next_stage(job_type: JobType) -> Option<JobType> {
     match job_type {
+        // Summarising reads the transcript, so it follows transcription.
+        // Backup does not: a recording whose transcription failed is the one
+        // most worth having a copy of, so it is queued at finalisation and
+        // brought round again by the sweep whenever anything derived changes.
         JobType::Transcribe => Some(JobType::Summarize),
-        // Backup last: it copies everything the earlier stages produced.
-        JobType::Summarize => Some(JobType::UploadRemote),
-        _ => None,
+        JobType::Summarize
+        | JobType::UploadRemote
+        | JobType::FinalizeRecording
+        | JobType::MergeTranscript => None,
     }
 }
 
@@ -478,7 +505,7 @@ fn finish(
     job_id: Ulid,
     job_type: JobType,
     recording_id: Ulid,
-    outcome: Result<()>,
+    outcome: Result<StageOutcome>,
 ) {
     let Ok(guard) = db.lock() else {
         tracing::error!("database lock poisoned; job state not recorded");
@@ -486,9 +513,20 @@ fn finish(
     };
 
     match outcome {
-        Ok(()) => {
+        Ok(stage) => {
             if let Err(e) = guard.transition_job(job_id, JobState::Succeeded) {
                 tracing::error!(error = %format!("{e:#}"), "could not record success");
+                return;
+            }
+
+            // A skip is recorded rather than left to look like work. Without
+            // it the interface cannot tell "summarised" from "summaries are
+            // off", and the finished row would refuse a later manual run.
+            if let StageOutcome::Skipped(reason) = &stage {
+                if let Err(e) = guard.mark_job_skipped(job_id, reason) {
+                    tracing::warn!(error = %format!("{e:#}"), "could not record a skip");
+                }
+                tracing::info!(?job_type, %reason, "stage skipped");
                 return;
             }
             // Chained only after the current stage is durably successful, and
@@ -552,7 +590,10 @@ mod tests {
         let (db, rec) = db_with_recording();
         {
             let guard = db.lock().unwrap();
-            enqueue_for_recording(&guard, rec).unwrap();
+            // One stage, not the whole set: finalisation now queues backup
+            // alongside transcription, and failing both would count two
+            // budgets as one.
+            guard.enqueue(rec, JobType::Transcribe, 1).unwrap();
         }
 
         // Fail it as many times as the budget allows. Backoff is skipped so the
@@ -588,20 +629,72 @@ mod tests {
 
         let job = claim(&db).unwrap().unwrap();
         assert_eq!(job.job_type, JobType::Transcribe);
-        finish(&db, job.id, job.job_type, rec, Ok(()));
+        finish(&db, job.id, job.job_type, rec, Ok(StageOutcome::Done));
 
-        let next = claim(&db).unwrap().expect("transcription should queue a summary");
-        assert_eq!(next.job_type, JobType::Summarize);
-        assert_ne!(next.id, job.id, "the finished job must not be reclaimed");
+        // Backup was queued alongside transcription, not behind it.
+        let mut seen = Vec::new();
+        while let Some(next) = claim(&db).unwrap() {
+            assert_ne!(next.id, job.id, "the finished job must not be reclaimed");
+            seen.push(next.job_type);
+            finish(&db, next.id, next.job_type, rec, Ok(StageOutcome::Done));
+        }
 
-        finish(&db, next.id, next.job_type, rec, Ok(()));
+        assert!(seen.contains(&JobType::UploadRemote), "backup must be queued");
+        assert!(
+            seen.contains(&JobType::Summarize),
+            "transcription should queue a summary"
+        );
+        assert_eq!(seen.len(), 2, "nothing else should have been queued");
+    }
 
-        // Backup is the final stage: it copies what everything before produced.
-        let last = claim(&db).unwrap().expect("a summary should queue a backup");
-        assert_eq!(last.job_type, JobType::UploadRemote);
+    /// Backup is queued at finalisation rather than at the end of the chain, so
+    /// a recording whose transcription never succeeds is still copied — which
+    /// is the case where a copy matters most.
+    #[test]
+    fn backup_is_queued_even_if_transcription_never_succeeds() {
+        let (db, rec) = db_with_recording();
+        {
+            let guard = db.lock().unwrap();
+            enqueue_for_recording(&guard, rec).unwrap();
+        }
 
-        finish(&db, last.id, last.job_type, rec, Ok(()));
-        assert!(claim(&db).unwrap().is_none(), "nothing follows the last stage");
+        let job = claim(&db).unwrap().unwrap();
+        assert_eq!(job.job_type, JobType::Transcribe);
+        finish(
+            &db,
+            job.id,
+            job.job_type,
+            rec,
+            Err(anyhow::anyhow!("the model would not load")),
+        );
+
+        let next = claim(&db).unwrap().expect("backup must still be waiting");
+        assert_eq!(next.job_type, JobType::UploadRemote);
+    }
+
+    /// A stage that had nothing to do must not pretend work happened. Chaining
+    /// on a skip would queue a summary for a transcript that was never made.
+    #[test]
+    fn a_skipped_stage_does_not_queue_the_next_one() {
+        let (db, rec) = db_with_recording();
+        {
+            let guard = db.lock().unwrap();
+            guard.enqueue(rec, JobType::Transcribe, 1).unwrap();
+        }
+
+        let job = claim(&db).unwrap().unwrap();
+        finish(
+            &db,
+            job.id,
+            job.job_type,
+            rec,
+            Ok(StageOutcome::Skipped("transcription is switched off".into())),
+        );
+
+        assert!(
+            claim(&db).unwrap().is_none(),
+            "a skipped stage must not queue the one that depends on it"
+        );
     }
 
     #[test]

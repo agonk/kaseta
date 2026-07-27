@@ -460,16 +460,74 @@ async fn put_settings(
 
     // Read, modify and write on the blocking pool: this touches the filesystem,
     // and the file it writes must not be built from a stale copy.
+    let db = Arc::clone(&state.db);
     let updated = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
         let mut settings = crate::config::Settings::load().map_err(ApiError::from_anyhow)?;
+        let before = settings.clone();
         settings.apply(update);
+
+        // Marked before the settings are written, which is the order that
+        // survives a failure. The decision is made by comparing the old state
+        // with the new, so saving first and failing here would leave the new
+        // state on disk and the same save decided against ever repeating —
+        // stranding recordings that should have been revisited, permanently.
+        //
+        // This way round, a failure leaves the settings untouched and the same
+        // request can simply be made again. The worst case is marking work that
+        // turns out to be unnecessary, which costs an upload that finds every
+        // object already present and skips it.
+        let revisit = affects_finished_recordings(&before, &settings);
+        let mark = || -> Result<(), ApiError> {
+            let guard = db
+                .lock()
+                .map_err(|_| ApiError::internal("database lock poisoned"))?;
+            crate::derived::mark_uploaded_for_revisit(&guard)
+                .map(|_| ())
+                .map_err(ApiError::from_anyhow)
+        };
+
+        if revisit {
+            mark()?;
+        }
+
         settings.save().map_err(ApiError::from_anyhow)?;
+
+        // Marked again, because the scheduler reads settings from disk on its
+        // own schedule. Between the first mark and this save it could have
+        // queued and finished an upload under the old rules, consuming the
+        // flag and clearing it — leaving the new setting on disk with the
+        // revisit already spent under settings that no longer apply.
+        //
+        // Cheap to repeat: the mark only sets a flag on recordings already
+        // uploaded, so doing it twice costs one statement.
+        if revisit {
+            mark()?;
+        }
+
         Ok(settings.redacted())
     })
     .await
     .map_err(|e| ApiError::internal(format!("saving settings failed: {e}")))??;
 
     Ok(Json(updated))
+}
+
+/// Whether a settings change alters what should already have happened, rather
+/// than only what happens next.
+///
+/// Switching transcription off releases every recording that was holding its
+/// audio waiting for a transcript. Asking to reclaim space says the same of
+/// every recording already uploaded. Neither is revisited on its own, because a
+/// finished backup clears the flag that brings a recording back around.
+fn affects_finished_recordings(
+    before: &crate::config::Settings,
+    after: &crate::config::Settings,
+) -> bool {
+    let cleanup_now_possible = |s: &crate::config::Settings| {
+        s.remote_storage.delete_local_after_upload && !s.transcription.enabled
+    };
+    (before.transcription.enabled && !after.transcription.enabled)
+        || (!cleanup_now_possible(before) && cleanup_now_possible(after))
 }
 
 #[derive(Debug, Serialize)]
@@ -519,11 +577,15 @@ async fn run_stage(
         }
 
         // Any earlier attempt is cleared first, so asking again after a failure
-        // actually re-runs rather than being refused as already-attempted.
+        // actually re-runs rather than being refused as already-attempted. A
+        // skip counts: it finished successfully having done nothing, and
+        // without clearing it, fixing the setting that caused the skip would
+        // leave the button permanently refusing to act.
         db.conn()
             .execute(
                 "DELETE FROM jobs WHERE recording_id = ?1 AND job_type = ?2
-                 AND state IN ('failed_terminal','failed_retryable','canceled')",
+                 AND (state IN ('failed_terminal','failed_retryable','canceled')
+                      OR (state = 'succeeded' AND error_code = 'skipped'))",
                 rusqlite::params![id.to_string(), job_type.as_str()],
             )
             .map_err(|e| ApiError::internal(e.to_string()))?;

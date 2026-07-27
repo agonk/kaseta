@@ -272,6 +272,20 @@ impl Db {
         self.enqueue(recording_id, job_type, revision).map(Some)
     }
 
+    /// Records that a finished job had nothing to do, and why.
+    ///
+    /// Stored on the job rather than inferred later, because "no summary
+    /// exists" has several possible causes and only the run itself knows which
+    /// one applied. Reuses the error columns: a skip is not an error, but it is
+    /// the same shape — a terminal outcome with a reason worth showing.
+    pub fn mark_job_skipped(&self, id: Ulid, reason: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE jobs SET error_code = 'skipped', error_message = ?1 WHERE id = ?2",
+            params![reason, id.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Queues a job that has already run, so it can run again.
     ///
     /// `enqueue_once` treats a previous success as a reason never to repeat the

@@ -29,6 +29,26 @@ pub struct Settings {
     pub summaries: SummarySettings,
     pub remote_storage: RemoteStorageSettings,
     pub retention: RetentionSettings,
+    #[serde(default)]
+    pub transcription: TranscriptionSettings,
+}
+
+/// Whether meetings are transcribed at all.
+///
+/// On by default: transcribing is the reason to run a recorder rather than a
+/// tape deck, and it happens entirely on this machine, so leaving it on costs
+/// nothing but time. Off is for someone who wants recordings and backup and
+/// would rather not spend the CPU.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TranscriptionSettings {
+    pub enabled: bool,
+}
+
+impl Default for TranscriptionSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// When recordings are removed automatically.
@@ -167,6 +187,7 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
 /// memory, and in anything that logs responses.
 #[derive(Clone, Debug, Serialize)]
 pub struct RedactedSettings {
+    pub transcription: TranscriptionSettings,
     pub summaries: RedactedSummary,
     pub remote_storage: RedactedRemoteStorage,
     pub retention: RetentionSettings,
@@ -229,6 +250,7 @@ impl Settings {
             .filter(|k| !k.trim().is_empty());
 
         RedactedSettings {
+            transcription: self.transcription.clone(),
             summaries: RedactedSummary {
                 enabled: self.summaries.enabled,
                 model: self.summaries.model.clone(),
@@ -266,6 +288,7 @@ impl Settings {
 pub struct SettingsUpdate {
     pub summaries_enabled: Option<bool>,
     pub summaries_model: Option<String>,
+    pub transcription_enabled: Option<bool>,
     pub summaries_api_key: Option<String>,
     pub remote_enabled: Option<bool>,
     pub remote_endpoint: Option<String>,
@@ -284,6 +307,9 @@ impl Settings {
     pub fn apply(&mut self, update: SettingsUpdate) {
         if let Some(v) = update.summaries_enabled {
             self.summaries.enabled = v;
+        }
+        if let Some(v) = update.transcription_enabled {
+            self.transcription.enabled = v;
         }
         if let Some(v) = update.summaries_model {
             self.summaries.model = non_empty(v);

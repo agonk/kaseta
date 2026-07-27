@@ -529,6 +529,20 @@ fn reindex_transcript(db: &Db, recording_id: Ulid, document: &TranscriptDocument
     Ok(())
 }
 
+/// Brings already-uploaded recordings back for another pass.
+///
+/// A finished backup clears the flag, so nothing would revisit a recording
+/// whose *rules* changed rather than whose contents did — switching
+/// transcription off, or asking to reclaim space after the fact. Both mean work
+/// that was correctly deferred is now owed.
+pub fn mark_uploaded_for_revisit(db: &Db) -> Result<usize> {
+    Ok(db.conn().execute(
+        "UPDATE recordings SET remote_dirty = 1
+         WHERE deleted_at IS NULL AND uploaded_at IS NOT NULL",
+        [],
+    )?)
+}
+
 /// Queues uploads for recordings whose stored copy has fallen behind.
 ///
 /// Run on a timer rather than from the rename itself, which is what keeps a

@@ -393,10 +393,21 @@
   </div>
   <div class="sheet-body">
     <div class="row-between">
+      <div>
+        <span style="font-size:13px">Transcribe meetings</span>
+        <div class="hint">Runs on this machine. Nothing is sent anywhere.</div>
+      </div>
+      <label class="switch"><input type="checkbox" id="tx-enabled" aria-label="Transcribe meetings"><span></span></label>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="row-between">
       <div class="sec-head" style="margin:0">Summaries</div>
       <label class="switch"><input type="checkbox" id="sum-enabled" aria-label="Enable summaries"><span></span></label>
     </div>
     <p class="hint" style="margin:6px 0 12px">Sends the transcript to a provider after each meeting. Audio never leaves.</p>
+    <p class="hint" id="sum-summaries-hint" style="margin:0 0 12px"></p>
     <div class="grid2">
       <div class="field">
         <label for="sum-model">Model</label>
@@ -838,10 +849,16 @@ function stageChips(item) {
       chip.textContent = `${stage.name} — retrying`;
     } else {
       const failed = st?.state === "failed";
+      const skipped = st?.state === "skipped";
       // `classList.add("")` throws, which aborted the whole detail pane for any
       // stage that had simply not run yet — the common case.
       if (failed) chip.classList.add("bad");
-      chip.append(document.createTextNode(failed ? `${stage.name} failed ` : `${stage.name} `));
+      // A stage that had nothing to do is neither done nor broken. Saying so —
+      // with the reason — is the difference between "summaries are off" and a
+      // button that appears to do nothing.
+      chip.append(document.createTextNode(
+        failed ? `${stage.name} failed ` : skipped ? `${stage.name} skipped ` : `${stage.name} `));
+      if (skipped && st.error) chip.title = st.error;
 
       const act = el("button", null, failed ? "retry" : "run");
       act.type = "button";
@@ -1087,6 +1104,14 @@ $("open-settings").onclick = async () => {
   try {
     const s = await api("/api/v1/settings");
 
+    $("tx-enabled").checked = s.transcription.enabled;
+    // Summarising reads a transcript, so without one the switch has nothing to
+    // act on. Left as the person set it rather than cleared — turning
+    // transcription back on should restore what they asked for, not a guess.
+    $("sum-enabled").disabled = !s.transcription.enabled;
+    $("sum-summaries-hint").textContent = s.transcription.enabled
+      ? ""
+      : "Unavailable while transcription is off — there would be nothing to summarise.";
     $("sum-enabled").checked = s.summaries.enabled;
     // The value is only ever an explicit choice; the fallback is a prompt. A
     // default shown as a value would be saved back as one, outliving the
@@ -1130,6 +1155,7 @@ $("settings-save").onclick = async () => {
   // A blank secret means "leave it alone", so it is omitted rather than sent
   // empty — which is how the API is told to clear one.
   const body = {
+    transcription_enabled: $("tx-enabled").checked,
     summaries_enabled: $("sum-enabled").checked,
     summaries_model: $("sum-model").value,
     remote_enabled: $("r2-enabled").checked,
