@@ -10,6 +10,8 @@ mod db;
 mod export;
 mod http;
 mod library;
+mod remote;
+mod retention;
 mod scheduler;
 mod summarize;
 mod supervisor;
@@ -519,6 +521,22 @@ fn cmd_serve(port: u16) -> Result<()> {
         Arc::clone(&store),
         Arc::clone(&db),
     )?);
+
+    // Applied once at startup and then daily by the scheduler. Running it here
+    // means a policy set while the daemon was stopped takes effect on the next
+    // launch rather than waiting a day.
+    {
+        let settings = config::Settings::load().unwrap_or_default();
+        let guard = db.lock().expect("fresh mutex");
+        if let Err(e) = retention::sweep(
+            &*store,
+            &guard,
+            &settings.retention,
+            time::OffsetDateTime::now_utc(),
+        ) {
+            tracing::error!(error = %format!("{e:#}"), "retention sweep failed");
+        }
+    }
 
     // Held for the lifetime of the daemon: dropping it stops the worker thread.
     let _scheduler = scheduler::Scheduler::spawn(

@@ -418,6 +418,30 @@
 
     <div class="divider"></div>
 
+    <div class="row-between">
+      <div class="sec-head" style="margin:0">Retention</div>
+      <label class="switch"><input type="checkbox" id="ret-enabled" aria-label="Enable retention"><span></span></label>
+    </div>
+    <p class="hint" style="margin:6px 0 12px">Removes old recordings automatically. Off by default.</p>
+    <div class="grid2">
+      <div class="field">
+        <label for="ret-days">Keep for</label>
+        <input type="text" id="ret-days" inputmode="numeric" placeholder="90">
+        <div class="hint">days</div>
+      </div>
+      <div class="field">
+        <label style="margin-top:26px">
+          <span class="row-between">
+            <span style="font-size:13px">Keep transcripts, delete audio</span>
+            <span class="switch"><input type="checkbox" id="ret-audio-only" aria-label="Keep transcripts only"><span></span></span>
+          </span>
+        </label>
+        <div class="hint">Audio is nearly all of the size</div>
+      </div>
+    </div>
+
+    <div class="divider"></div>
+
     <div class="privacy">
       <strong>Privacy.</strong> Recordings and transcripts are produced and kept on this machine.
       Transcription runs locally. Only transcript text is sent to your chosen provider, and only
@@ -898,6 +922,10 @@ $("open-settings").onclick = async () => {
       ? "Saved — leave blank to keep it" : "";
     $("r2-delete").checked = s.remote_storage.delete_local_after_upload;
 
+    $("ret-enabled").checked = s.retention.enabled;
+    $("ret-days").value = s.retention.keep_days || "";
+    $("ret-audio-only").checked = s.retention.audio_only;
+
     sheet.showModal();
   } catch (e) { fail(e.message); }
 };
@@ -917,7 +945,11 @@ $("settings-save").onclick = async () => {
     remote_region: $("r2-region").value,
     remote_access_key_id: $("r2-access").value,
     remote_delete_local: $("r2-delete").checked,
+    retention_enabled: $("ret-enabled").checked,
+    retention_audio_only: $("ret-audio-only").checked,
   };
+  const days = parseInt($("ret-days").value, 10);
+  if (Number.isFinite(days) && days > 0) body.retention_keep_days = days;
   if ($("sum-key").value) body.summaries_api_key = $("sum-key").value;
   if ($("r2-secret").value) body.remote_secret_access_key = $("r2-secret").value;
 

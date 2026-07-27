@@ -28,6 +28,23 @@ use serde::{Deserialize, Serialize};
 pub struct Settings {
     pub summaries: SummarySettings,
     pub remote_storage: RemoteStorageSettings,
+    pub retention: RetentionSettings,
+}
+
+/// When recordings are removed automatically.
+///
+/// Off by default. Deleting someone's meetings without being asked is not a
+/// sensible default, however much disk it saves.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RetentionSettings {
+    pub enabled: bool,
+    /// Age past which a recording is deleted. Zero or absent means never.
+    pub keep_days: Option<u32>,
+    /// Keep only the audio's derived artefacts, discarding the audio itself.
+    /// A transcript is a fraction of the size and is usually what is wanted
+    /// months later.
+    pub audio_only: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -144,6 +161,7 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
 pub struct RedactedSettings {
     pub summaries: RedactedSummary,
     pub remote_storage: RedactedRemoteStorage,
+    pub retention: RetentionSettings,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -213,6 +231,7 @@ impl Settings {
                 secret_set: self.remote_storage.secret_access_key.is_some(),
                 delete_local_after_upload: self.remote_storage.delete_local_after_upload,
             },
+            retention: self.retention.clone(),
         }
     }
 }
@@ -235,6 +254,9 @@ pub struct SettingsUpdate {
     pub remote_access_key_id: Option<String>,
     pub remote_secret_access_key: Option<String>,
     pub remote_delete_local: Option<bool>,
+    pub retention_enabled: Option<bool>,
+    pub retention_keep_days: Option<u32>,
+    pub retention_audio_only: Option<bool>,
 }
 
 impl Settings {
@@ -272,6 +294,17 @@ impl Settings {
         }
         if let Some(v) = update.remote_delete_local {
             self.remote_storage.delete_local_after_upload = v;
+        }
+        if let Some(v) = update.retention_enabled {
+            self.retention.enabled = v;
+        }
+        if let Some(v) = update.retention_keep_days {
+            // Zero would mean "delete everything immediately", which is never
+            // what someone means by a retention period.
+            self.retention.keep_days = (v > 0).then_some(v);
+        }
+        if let Some(v) = update.retention_audio_only {
+            self.retention.audio_only = v;
         }
     }
 }

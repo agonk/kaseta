@@ -31,6 +31,12 @@ use crate::db::Db;
 /// channel to keep alive across a crash.
 const IDLE_POLL: Duration = Duration::from_secs(1);
 
+/// How often the retention policy is applied while the daemon runs.
+///
+/// Retention is measured in days, so checking more often than daily would only
+/// burn wakeups.
+const RETENTION_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+
 pub struct Scheduler {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -75,7 +81,24 @@ fn run(
     storage_root: String,
     stop: Arc<AtomicBool>,
 ) {
+    let mut next_sweep = std::time::Instant::now() + RETENTION_INTERVAL;
+
     while !stop.load(Ordering::SeqCst) {
+        if std::time::Instant::now() >= next_sweep {
+            next_sweep = std::time::Instant::now() + RETENTION_INTERVAL;
+            let settings = crate::config::Settings::load().unwrap_or_default();
+            if let Ok(guard) = db.lock() {
+                if let Err(e) = crate::retention::sweep(
+                    &*store,
+                    &guard,
+                    &settings.retention,
+                    time::OffsetDateTime::now_utc(),
+                ) {
+                    tracing::error!(error = %format!("{e:#}"), "retention sweep failed");
+                }
+            }
+        }
+
         match claim(&db) {
             Ok(Some(job)) => {
                 let outcome = execute(&*store, &db, &storage_root, job.job_type, job.recording_id);
@@ -155,6 +178,53 @@ fn execute(
             tracing::info!(%recording_id, "summarised");
             Ok(())
         }
+        JobType::UploadRemote => {
+            let settings = crate::config::Settings::load().unwrap_or_default();
+            if !settings.remote_storage.enabled {
+                tracing::debug!("cloud backup is turned off");
+                return Ok(());
+            }
+
+            let target = crate::remote::RemoteTarget::from_settings(&settings.remote_storage)?;
+            let prefix = kaseta_contracts::RecordingPrefix::new(
+                manifest.recording_id,
+                manifest.started_at,
+            );
+
+            // Everything under the recording's prefix: audio, metadata,
+            // exports. Uploading only the exports would leave a copy that
+            // cannot be rebuilt if the local chunks are removed.
+            let keys = store.list_prefix(prefix.root().as_str())?;
+            let client = crate::remote::client()?;
+
+            let mut uploaded = 0usize;
+            let mut skipped = 0usize;
+            for key in &keys {
+                let bytes = store.get(key)?;
+                match crate::remote::put_object(&client, &target, key.as_str(), &bytes)? {
+                    crate::remote::PutResult::Uploaded => uploaded += 1,
+                    crate::remote::PutResult::AlreadyPresent => skipped += 1,
+                }
+            }
+            tracing::info!(%recording_id, uploaded, skipped, "backed up");
+
+            // Only after every object is confirmed present: deleting on a
+            // partial upload would destroy the only complete copy.
+            if settings.remote_storage.delete_local_after_upload {
+                for key in &keys {
+                    // Exports are derived and can be rebuilt; the chunks and
+                    // manifest are the recording itself and are what the remote
+                    // copy now holds.
+                    if key.as_str().contains("/tracks/") {
+                        if let Err(e) = store.delete(key) {
+                            tracing::warn!(%key, error = %format!("{e:#}"), "could not remove local copy");
+                        }
+                    }
+                }
+                tracing::info!(%recording_id, "local audio removed after backup");
+            }
+            Ok(())
+        }
         // Stages that exist in the model but have no implementation yet succeed
         // rather than failing, so they do not strand a recording in the queue.
         other => {
@@ -197,6 +267,8 @@ fn load_manifest(
 fn next_stage(job_type: JobType) -> Option<JobType> {
     match job_type {
         JobType::Transcribe => Some(JobType::Summarize),
+        // Backup last: it copies everything the earlier stages produced.
+        JobType::Summarize => Some(JobType::UploadRemote),
         _ => None,
     }
 }
@@ -323,10 +395,13 @@ mod tests {
         assert_ne!(next.id, job.id, "the finished job must not be reclaimed");
 
         finish(&db, next.id, next.job_type, rec, Ok(()));
-        assert!(
-            claim(&db).unwrap().is_none(),
-            "nothing follows the last stage"
-        );
+
+        // Backup is the final stage: it copies what everything before produced.
+        let last = claim(&db).unwrap().expect("a summary should queue a backup");
+        assert_eq!(last.job_type, JobType::UploadRemote);
+
+        finish(&db, last.id, last.job_type, rec, Ok(()));
+        assert!(claim(&db).unwrap().is_none(), "nothing follows the last stage");
     }
 
     #[test]
