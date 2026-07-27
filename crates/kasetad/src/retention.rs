@@ -8,6 +8,8 @@
 //! summary — discards the audio, which is almost all of the size, while leaving
 //! what someone actually wants months later.
 
+use std::sync::{Arc, Mutex};
+
 use anyhow::{Context, Result};
 use ulid::Ulid;
 
@@ -23,9 +25,13 @@ pub struct Swept {
 }
 
 /// Applies the retention policy once.
+///
+/// The lock is taken per recording rather than for the whole sweep: expiring
+/// many recordings from slow storage would otherwise block every request and
+/// every queued job behind it.
 pub fn sweep(
     store: &dyn BlobStore,
-    db: &Db,
+    db: &Arc<Mutex<Db>>,
     settings: &RetentionSettings,
     now: time::OffsetDateTime,
 ) -> Result<Swept> {
@@ -37,25 +43,33 @@ pub fn sweep(
     }
 
     let cutoff = now - time::Duration::days(keep_days as i64);
-    let expired = expired_before(db, cutoff)?;
+    let expired = {
+        let guard = db.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        expired_before(&guard, cutoff)?
+    };
 
     let mut swept = Swept::default();
     for (id, started_at) in expired {
+        let guard = match db.lock() {
+            Ok(guard) => guard,
+            Err(_) => break,
+        };
         if settings.audio_only {
             // The transcript and summary live in the database and are left
             // alone; only the audio, which is nearly all of the size, goes.
-            match remove_audio(store, db, id, started_at) {
+            match remove_audio(store, &guard, id, started_at) {
                 Ok(true) => swept.audio_removed += 1,
                 Ok(false) => {}
                 Err(e) => tracing::warn!(%id, error = %format!("{e:#}"), "could not remove audio"),
             }
         } else {
-            match crate::library::delete(store, db, id) {
+            match crate::library::delete(store, &guard, id) {
                 Ok(true) => swept.deleted += 1,
                 Ok(false) => {}
                 Err(e) => tracing::warn!(%id, error = %format!("{e:#}"), "could not delete"),
             }
         }
+        drop(guard);
     }
 
     if swept != Swept::default() {
@@ -143,19 +157,19 @@ mod tests {
 
     const NOW: time::OffsetDateTime = datetime!(2026-07-27 12:00:00 UTC);
 
-    fn setup() -> (TempDir, LocalFsStore, Db) {
+    fn setup() -> (TempDir, LocalFsStore, Arc<Mutex<Db>>) {
         let dir = TempDir::new().unwrap();
         let store = LocalFsStore::new(dir.path()).unwrap();
-        let db = Db::open_in_memory().unwrap();
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
         (dir, store, db)
     }
 
     /// Inserts a recording with audio and metadata on disk.
-    fn recording(store: &LocalFsStore, db: &Db, days_ago: i64) -> Ulid {
+    fn recording(store: &LocalFsStore, db: &Arc<Mutex<Db>>, days_ago: i64) -> Ulid {
         let id = Ulid::new();
         let started = NOW - time::Duration::days(days_ago);
 
-        db.conn()
+        db.lock().unwrap().conn()
             .execute(
                 "INSERT INTO recordings (id, owner_id, status, started_at, manifest_version,
                                          has_mixed, tracks_json)
@@ -219,7 +233,7 @@ mod tests {
         let swept = sweep(&store, &db, &policy(true, 30, false), NOW).unwrap();
         assert_eq!(swept.deleted, 1);
 
-        let left = crate::library::list(&db).unwrap();
+        let left = crate::library::list(&db.lock().unwrap()).unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].id, recent);
         assert_ne!(left[0].id, old);
@@ -236,7 +250,7 @@ mod tests {
 
         // The recording is still listed — a transcript months later is usually
         // the point — but has no audio to offer.
-        let left = crate::library::list(&db).unwrap();
+        let left = crate::library::list(&db.lock().unwrap()).unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].id, id);
         assert!(left[0].mixed_audio_url.is_none());

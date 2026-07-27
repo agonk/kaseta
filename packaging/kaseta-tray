@@ -10,11 +10,10 @@ set -euo pipefail
 PORT="${KASETA_PORT:-7777}"
 API="http://127.0.0.1:${PORT}/api/v1"
 
-# The token is minted per daemon run and embedded in the page it protects, so
-# reading it from there is how anything else authenticates.
+# The token is minted per daemon run. It is fetched from the API rather than
+# scraped out of the page, so restyling the interface cannot break this.
 token() {
-    curl -sf --max-time 2 "http://127.0.0.1:${PORT}/" \
-        | grep -oP 'const TOKEN = "\K[a-f0-9]+' || true
+    curl -sf --max-time 2 "$API/token" || true
 }
 
 status() { curl -sf --max-time 2 "$API/status" || echo '{"state":"unreachable"}'; }

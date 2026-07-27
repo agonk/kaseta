@@ -87,15 +87,16 @@ fn run(
         if std::time::Instant::now() >= next_sweep {
             next_sweep = std::time::Instant::now() + RETENTION_INTERVAL;
             let settings = crate::config::Settings::load().unwrap_or_default();
-            if let Ok(guard) = db.lock() {
-                if let Err(e) = crate::retention::sweep(
-                    &*store,
-                    &guard,
-                    &settings.retention,
-                    time::OffsetDateTime::now_utc(),
-                ) {
-                    tracing::error!(error = %format!("{e:#}"), "retention sweep failed");
-                }
+            // Takes the lock itself, per recording, rather than holding it for
+            // the whole sweep: deleting many recordings from slow storage would
+            // otherwise stall every request behind it for minutes.
+            if let Err(e) = crate::retention::sweep(
+                &*store,
+                &db,
+                &settings.retention,
+                time::OffsetDateTime::now_utc(),
+            ) {
+                tracing::error!(error = %format!("{e:#}"), "retention sweep failed");
             }
         }
 

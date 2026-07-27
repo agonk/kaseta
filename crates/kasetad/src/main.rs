@@ -527,10 +527,9 @@ fn cmd_serve(port: u16) -> Result<()> {
     // launch rather than waiting a day.
     {
         let settings = config::Settings::load().unwrap_or_default();
-        let guard = db.lock().expect("fresh mutex");
         if let Err(e) = retention::sweep(
             &*store,
-            &guard,
+            &db,
             &settings.retention,
             time::OffsetDateTime::now_utc(),
         ) {

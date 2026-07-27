@@ -623,8 +623,15 @@ function select(id) {
 
 function renderDetail(item) {
   const pane = $("detail");
-  pane.replaceChildren();
+  // Stopped explicitly: dropping the reference leaves the element playing
+  // detached from the page, audible with nothing on screen controlling it.
+  if (audio) {
+    audio.pause();
+    audio.removeAttribute("src");
+    audio.load();
+  }
   audio = null;
+  pane.replaceChildren();
   if (!item) return;
 
   const head = el("div", "detail-head");

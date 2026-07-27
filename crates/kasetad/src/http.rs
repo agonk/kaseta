@@ -83,6 +83,7 @@ pub fn router(
     Router::new()
         .route("/", get(index))
         .route("/api/v1/status", get(status))
+        .route("/api/v1/token", get(session_token))
         .route("/api/v1/devices", get(devices))
         .route("/api/v1/recordings", get(list_recordings).post(start_recording))
         .route("/api/v1/recordings/active/stop", post(stop_recording))
@@ -172,6 +173,28 @@ where
 
 async fn status(State(state): State<AppState>) -> Json<DaemonStatus> {
     Json(state.supervisor.status())
+}
+
+/// Hands the run's token to local tooling.
+///
+/// Safe to expose, and not a way around the token's purpose. That purpose is to
+/// stop a page on another origin driving the recorder — and such a page can
+/// issue this request but cannot read the reply, because the same-origin policy
+/// withholds the response body without CORS headers, which are deliberately not
+/// sent. A local process could read the token out of the served page anyway;
+/// this only means it does not have to scrape markup that may be restyled.
+async fn session_token(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<String, ApiError> {
+    // Belt and braces: browsers label cross-site requests, and script cannot
+    // forge the header.
+    if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+        if site != "same-origin" && site != "none" {
+            return Err(ApiError::forbidden("cross-site requests cannot read the token"));
+        }
+    }
+    Ok(state.token.to_string())
 }
 
 async fn devices() -> Result<Json<Vec<crate::capture::AudioDevice>>, ApiError> {

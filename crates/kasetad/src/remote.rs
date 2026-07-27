@@ -92,8 +92,26 @@ impl RemoteTarget {
             .unwrap_or_default()
     }
 
+    /// Any path the endpoint itself carries, e.g. `https://host/minio`.
+    ///
+    /// This has to appear in the signature as well as the URL. Signing
+    /// `/bucket/key` while requesting `/minio/bucket/key` is rejected as a
+    /// signature mismatch, with nothing in the error naming the cause.
+    fn base_path(&self) -> &str {
+        let without_scheme = self.endpoint.trim_start_matches("https://");
+        match without_scheme.find('/') {
+            Some(at) => &without_scheme[at..],
+            None => "",
+        }
+    }
+
+    /// The path S3 signs and serves, identical in both.
+    fn canonical_uri(&self, key: &str) -> String {
+        format!("{}/{}/{}", self.base_path(), self.bucket, encode_key(key))
+    }
+
     fn url_for(&self, key: &str) -> String {
-        format!("{}/{}/{}", self.endpoint, self.bucket, encode_key(key))
+        format!("https://{}{}", self.host(), self.canonical_uri(key))
     }
 }
 
@@ -166,7 +184,7 @@ pub fn sign(
     let content_sha256 = hex::encode(Sha256::digest(payload));
 
     let host = target.host().to_string();
-    let canonical_uri = format!("/{}/{}", target.bucket, encode_key(key));
+    let canonical_uri = target.canonical_uri(key);
 
     let canonical_headers =
         format!("host:{host}\nx-amz-content-sha256:{content_sha256}\nx-amz-date:{amz_date}\n");
@@ -216,6 +234,10 @@ pub fn put_object(
         .header("authorization", &signed.authorization)
         .header("x-amz-date", &signed.amz_date)
         .header("x-amz-content-sha256", &signed.content_sha256)
+        // Recorded so a later run can tell "already uploaded" from "same size
+        // by coincidence". Not signed, because metadata headers would have to
+        // join the canonical request and every server treats that differently.
+        .header(DIGEST_HEADER, &signed.content_sha256)
         .header("content-length", payload.len().to_string())
         .body(payload.to_vec())
         .send()
@@ -238,10 +260,18 @@ pub enum PutResult {
     AlreadyPresent,
 }
 
+/// Header carrying the digest of what was uploaded.
+///
+/// Length alone cannot decide this: a regenerated export can be a different
+/// recording of the same size, and skipping it would leave stale audio under a
+/// key that claims to be current.
+const DIGEST_HEADER: &str = "x-amz-meta-kaseta-sha256";
+
 /// Whether the object already holds exactly these bytes.
 ///
-/// Compared by size rather than by downloading: the objects are audio, and
-/// re-reading them to check would cost as much as uploading again.
+/// Compared by a digest stored alongside the object rather than by downloading
+/// it: the objects are audio, and re-reading them would cost as much as
+/// uploading again.
 fn object_matches(
     client: &reqwest::blocking::Client,
     target: &RemoteTarget,
@@ -264,13 +294,20 @@ fn object_matches(
         return Ok(false);
     }
 
-    let remote_len = response
+    let remote_digest = response
         .headers()
-        .get("content-length")
+        .get(DIGEST_HEADER)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<usize>().ok());
+        .map(str::to_string);
 
-    Ok(remote_len == Some(payload.len()))
+    // Without a digest the object predates this check, or was written by
+    // something else. Re-uploading is the safe answer: it costs bandwidth,
+    // where trusting it could leave the wrong audio in place.
+    let Some(remote_digest) = remote_digest else {
+        return Ok(false);
+    };
+
+    Ok(remote_digest == hex::encode(Sha256::digest(payload)))
 }
 
 pub fn client() -> Result<reqwest::blocking::Client> {
@@ -398,6 +435,44 @@ mod tests {
         };
         let err = RemoteTarget::from_settings(&settings).unwrap_err();
         assert!(err.to_string().contains("https"));
+    }
+
+    #[test]
+    fn an_endpoint_path_prefix_is_signed_as_well_as_requested() {
+        // Signing /bucket/key while requesting /minio/bucket/key is rejected
+        // as a signature mismatch, and nothing in the error names the cause.
+        let mut t = target();
+        t.endpoint = "https://storage.example.com/minio".into();
+
+        assert_eq!(t.base_path(), "/minio");
+        assert_eq!(t.canonical_uri("a.flac"), "/minio/examplebucket/a.flac");
+        assert_eq!(
+            t.url_for("a.flac"),
+            "https://storage.example.com/minio/examplebucket/a.flac"
+        );
+
+        // What is signed must be exactly what is requested.
+        let signed = sign(&t, "PUT", "a.flac", b"x", datetime!(2026-07-27 12:00:00 UTC));
+        assert!(signed.url.ends_with(&t.canonical_uri("a.flac")));
+    }
+
+    #[test]
+    fn an_endpoint_without_a_path_signs_from_the_root() {
+        let t = target();
+        assert_eq!(t.base_path(), "");
+        assert_eq!(t.canonical_uri("a.flac"), "/examplebucket/a.flac");
+    }
+
+    #[test]
+    fn a_path_prefix_changes_the_signature() {
+        let at = datetime!(2026-07-27 12:00:00 UTC);
+        let plain = sign(&target(), "PUT", "k", b"x", at);
+
+        let mut prefixed = target();
+        prefixed.endpoint = "https://s3.us-east-1.amazonaws.com/sub".into();
+        let signed = sign(&prefixed, "PUT", "k", b"x", at);
+
+        assert_ne!(plain.authorization, signed.authorization);
     }
 
     #[test]
