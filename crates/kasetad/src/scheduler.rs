@@ -121,9 +121,15 @@ fn execute(
             Ok(())
         }
         JobType::Summarize => {
+            let settings = crate::config::Settings::load().unwrap_or_default();
+            if !settings.summaries.enabled && std::env::var(crate::summarize::API_KEY_ENV).is_err() {
+                tracing::info!("summaries are turned off");
+                return Ok(());
+            }
+
             // Absent configuration is not a failure: summaries are optional and
             // a recording without one is still complete.
-            let config = match crate::summarize::SummarizeConfig::from_env() {
+            let config = match crate::summarize::SummarizeConfig::resolve(&settings) {
                 Ok(config) => config,
                 Err(e) => {
                     tracing::info!(reason = %e, "skipping summary");

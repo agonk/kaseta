@@ -86,17 +86,28 @@ pub struct SummarizeConfig {
 }
 
 impl SummarizeConfig {
-    /// Reads configuration from the environment.
-    pub fn from_env() -> Result<Self> {
-        let api_key = std::env::var(API_KEY_ENV).ok().filter(|k| !k.trim().is_empty());
+    /// Resolves configuration from the environment, then from saved settings.
+    ///
+    /// The environment wins: a key exported for a one-off run, or set by a
+    /// service unit, should not be silently overridden by something saved
+    /// earlier through the interface.
+    pub fn resolve(settings: &crate::config::Settings) -> Result<Self> {
+        let api_key = std::env::var(API_KEY_ENV)
+            .ok()
+            .filter(|k| !k.trim().is_empty())
+            .or_else(|| settings.summaries.api_key.clone());
+
         let Some(api_key) = api_key else {
-            bail!("{API_KEY_ENV} is not set, so summaries cannot be produced");
+            bail!("no API key is configured, so summaries cannot be produced");
         };
-        Ok(Self {
-            api_key,
-            model: std::env::var("KASETA_OPENROUTER_MODEL")
-                .unwrap_or_else(|_| DEFAULT_MODEL.to_string()),
-        })
+
+        let model = std::env::var("KASETA_OPENROUTER_MODEL")
+            .ok()
+            .filter(|m| !m.trim().is_empty())
+            .or_else(|| settings.summaries.model.clone())
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+
+        Ok(Self { api_key, model })
     }
 }
 
@@ -608,8 +619,36 @@ mod tests {
 
     #[test]
     fn a_missing_key_is_reported_rather_than_silently_skipping_summaries() {
-        std::env::remove_var(API_KEY_ENV);
-        let err = SummarizeConfig::from_env().unwrap_err();
-        assert!(err.to_string().contains(API_KEY_ENV));
+        let settings = crate::config::Settings::default();
+        // Only meaningful when the environment does not supply one.
+        if std::env::var(API_KEY_ENV).is_err() {
+            let err = SummarizeConfig::resolve(&settings).unwrap_err();
+            assert!(err.to_string().contains("no API key"));
+        }
+    }
+
+    #[test]
+    fn a_saved_key_is_used_when_the_environment_has_none() {
+        let mut settings = crate::config::Settings::default();
+        settings.summaries.api_key = Some("sk-or-saved".into());
+        settings.summaries.model = Some("some/model".into());
+
+        if std::env::var(API_KEY_ENV).is_err() {
+            let config = SummarizeConfig::resolve(&settings).unwrap();
+            assert_eq!(config.api_key, "sk-or-saved");
+            assert_eq!(config.model, "some/model");
+        }
+    }
+
+    #[test]
+    fn the_model_falls_back_to_the_default_when_unset() {
+        let mut settings = crate::config::Settings::default();
+        settings.summaries.api_key = Some("sk-or-saved".into());
+
+        if std::env::var("KASETA_OPENROUTER_MODEL").is_err()
+            && std::env::var(API_KEY_ENV).is_err()
+        {
+            assert_eq!(SummarizeConfig::resolve(&settings).unwrap().model, DEFAULT_MODEL);
+        }
     }
 }

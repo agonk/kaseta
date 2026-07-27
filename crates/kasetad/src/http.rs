@@ -93,6 +93,7 @@ pub fn router(
         .route("/api/v1/recordings/{id}/transcript", get(transcript))
         .route("/api/v1/recordings/{id}/summary", get(summary))
         .route("/api/v1/search", get(search))
+        .route("/api/v1/settings", get(get_settings).put(put_settings))
         .with_state(state)
 }
 
@@ -331,6 +332,37 @@ async fn delete_recording(
             .ok_or_else(|| ApiError::not_found("no such recording"))
     })
     .await
+}
+
+async fn get_settings(
+    State(_state): State<AppState>,
+) -> Result<Json<crate::config::RedactedSettings>, ApiError> {
+    let settings = tokio::task::spawn_blocking(crate::config::Settings::load)
+        .await
+        .map_err(|e| ApiError::internal(format!("reading settings failed: {e}")))?
+        .map_err(ApiError::from_anyhow)?;
+    Ok(Json(settings.redacted()))
+}
+
+async fn put_settings(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(update): Json<crate::config::SettingsUpdate>,
+) -> Result<Json<crate::config::RedactedSettings>, ApiError> {
+    authorize(&state, &headers)?;
+
+    // Read, modify and write on the blocking pool: this touches the filesystem,
+    // and the file it writes must not be built from a stale copy.
+    let updated = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
+        let mut settings = crate::config::Settings::load().map_err(ApiError::from_anyhow)?;
+        settings.apply(update);
+        settings.save().map_err(ApiError::from_anyhow)?;
+        Ok(settings.redacted())
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("saving settings failed: {e}")))??;
+
+    Ok(Json(updated))
 }
 
 async fn transcript(

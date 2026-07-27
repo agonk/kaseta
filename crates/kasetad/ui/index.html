@@ -114,6 +114,32 @@
   .summary li { background: none; border: none; padding: 1px 0; margin: 0; border-radius: 0; }
   .owner { color: var(--muted); font-size: 12px; }
 
+  dialog {
+    border: 1px solid var(--line); border-radius: var(--radius);
+    background: var(--panel); color: var(--text); padding: 0;
+    max-width: 520px; width: calc(100% - 32px);
+  }
+  dialog::backdrop { background: rgba(0,0,0,.4); }
+  .sheet { padding: 22px 24px; }
+  .sheet h2 { margin: 0 0 4px; font-size: 17px; }
+  .sheet h3 {
+    margin: 22px 0 8px; font-size: 12px; text-transform: uppercase;
+    letter-spacing: .05em; color: var(--muted);
+  }
+  .sheet label { display: block; margin-bottom: 10px; font-size: 13px; }
+  .sheet label span { display: block; color: var(--muted); margin-bottom: 3px; }
+  .sheet input[type=text], .sheet input[type=password] {
+    width: 100%; padding: 7px 10px; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--text);
+    font: inherit;
+  }
+  .check { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .check input { margin: 0; }
+  .check span { display: inline; color: var(--text); }
+  .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 22px; }
+  .note { color: var(--muted); font-size: 12px; margin: 4px 0 0; }
+  .set { color: var(--accent); font-size: 12px; }
+
   .search { display: flex; gap: 8px; margin-bottom: 16px; }
   .search input { flex: 1; border-color: var(--line); }
   .badge {
@@ -138,7 +164,65 @@
   <header>
     <h1>Kaseta</h1>
     <span id="sub">meeting recorder</span>
+    <button class="icon" id="open-settings" style="margin-left:auto">Settings</button>
   </header>
+
+  <dialog id="settings">
+    <form class="sheet" method="dialog">
+      <h2>Settings</h2>
+
+      <h3>Summaries</h3>
+      <label class="check">
+        <input type="checkbox" id="sum-enabled">
+        <span>Summarise meetings after transcribing</span>
+      </label>
+      <label>
+        <span>OpenRouter API key <em id="sum-key-state" class="set"></em></span>
+        <input type="password" id="sum-key" placeholder="sk-or-…" autocomplete="off">
+      </label>
+      <label>
+        <span>Model</span>
+        <input type="text" id="sum-model" placeholder="anthropic/claude-3.5-haiku">
+      </label>
+      <p class="note" id="sum-note"></p>
+
+      <h3>Cloud backup</h3>
+      <label class="check">
+        <input type="checkbox" id="r2-enabled">
+        <span>Copy recordings to S3-compatible storage</span>
+      </label>
+      <label>
+        <span>Endpoint <em class="note">blank for Amazon S3</em></span>
+        <input type="text" id="r2-endpoint" placeholder="https://ACCOUNT.r2.cloudflarestorage.com">
+      </label>
+      <label>
+        <span>Bucket</span>
+        <input type="text" id="r2-bucket" placeholder="meetings">
+      </label>
+      <label>
+        <span>Region</span>
+        <input type="text" id="r2-region" placeholder="auto">
+      </label>
+      <label>
+        <span>Access key ID</span>
+        <input type="text" id="r2-access" autocomplete="off">
+      </label>
+      <label>
+        <span>Secret access key <em id="r2-secret-state" class="set"></em></span>
+        <input type="password" id="r2-secret" autocomplete="off">
+      </label>
+      <label class="check">
+        <input type="checkbox" id="r2-delete">
+        <span>Delete local audio once uploaded</span>
+      </label>
+      <p class="note">Uploading is not implemented yet; these are saved for when it is.</p>
+
+      <div class="actions">
+        <button type="button" id="settings-cancel">Cancel</button>
+        <button type="button" class="primary" id="settings-save">Save</button>
+      </div>
+    </form>
+  </dialog>
 
   <div class="recorder" id="recorder">
     <div style="flex:1">
@@ -550,6 +634,65 @@ $("clear").onclick = () => {
   lastQuery = "";
   $("clear").hidden = true;
   refreshList();
+};
+
+// --- settings -------------------------------------------------------------
+
+const dialog = $("settings");
+
+$("open-settings").onclick = async () => {
+  try {
+    const s = await api("/api/v1/settings");
+
+    $("sum-enabled").checked = s.summaries.enabled;
+    $("sum-model").value = s.summaries.model || "";
+    // A saved secret is never sent back, so the field starts empty and its
+    // placeholder says whether one exists.
+    $("sum-key").value = "";
+    $("sum-key").placeholder = s.summaries.api_key_set
+      ? `saved ${s.summaries.api_key_hint || ""}`
+      : "sk-or-…";
+    $("sum-key-state").textContent = s.summaries.api_key_set ? "saved" : "";
+    $("sum-note").textContent = s.summaries.from_environment
+      ? "A key is set in the environment and takes precedence over this one."
+      : "Without a key, meetings are still recorded and transcribed.";
+
+    $("r2-enabled").checked = s.remote_storage.enabled;
+    $("r2-endpoint").value = s.remote_storage.endpoint;
+    $("r2-bucket").value = s.remote_storage.bucket;
+    $("r2-region").value = s.remote_storage.region;
+    $("r2-access").value = s.remote_storage.access_key_id;
+    $("r2-secret").value = "";
+    $("r2-secret").placeholder = s.remote_storage.secret_set ? "saved" : "";
+    $("r2-secret-state").textContent = s.remote_storage.secret_set ? "saved" : "";
+    $("r2-delete").checked = s.remote_storage.delete_local_after_upload;
+
+    dialog.showModal();
+  } catch (e) { showError(e); }
+};
+
+$("settings-cancel").onclick = () => dialog.close();
+
+$("settings-save").onclick = async () => {
+  // A blank secret field means "leave it alone", so it is omitted entirely
+  // rather than sent as an empty string — which would clear the stored key.
+  const body = {
+    summaries_enabled: $("sum-enabled").checked,
+    summaries_model: $("sum-model").value,
+    remote_enabled: $("r2-enabled").checked,
+    remote_endpoint: $("r2-endpoint").value,
+    remote_bucket: $("r2-bucket").value,
+    remote_region: $("r2-region").value,
+    remote_access_key_id: $("r2-access").value,
+    remote_delete_local: $("r2-delete").checked,
+  };
+  if ($("sum-key").value) body.summaries_api_key = $("sum-key").value;
+  if ($("r2-secret").value) body.remote_secret_access_key = $("r2-secret").value;
+
+  try {
+    await api("/api/v1/settings", { method: "PUT", body: JSON.stringify(body) });
+    dialog.close();
+  } catch (e) { showError(e); }
 };
 
 refreshStatus();

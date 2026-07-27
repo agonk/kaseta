@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 
 mod blobstore;
 mod capture;
+mod config;
 mod clock;
 mod db;
 mod export;

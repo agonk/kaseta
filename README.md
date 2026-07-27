@@ -71,8 +71,14 @@ session. **Kaseta** then appears in your launcher as an ordinary application,
 with its own window and icon. Nothing runs as root and nothing is written
 outside your home directory.
 
-To enable summaries, add an OpenRouter key to `~/.config/kaseta/env`. Without
-one, meetings are still recorded and transcribed — only the summary is skipped.
+To enable summaries, open **Settings** in the application and paste an
+[OpenRouter](https://openrouter.ai/keys) key. Without one, meetings are still
+recorded and transcribed — only the summary is skipped. Cloud backup is
+configured in the same place.
+
+Credentials are written to `~/.config/kaseta/settings.json`, readable only by
+you, and deliberately **not** in the data directory — that is the directory
+cloud backup uploads, and a key does not belong in a bucket.
 
 ### What it installs
 
@@ -82,7 +88,8 @@ one, meetings are still recorded and transcribed — only the summary is skipped
 | `~/.local/share/applications/kaseta.desktop` | launcher entry |
 | `~/.config/systemd/user/kaseta.service` | starts it with your session |
 | `~/.local/share/kaseta/` | recordings, transcripts, database |
-| `~/.config/kaseta/env` | API key, kept out of the repo and the database |
+| `~/.config/kaseta/settings.json` | keys and cloud settings, mode 0600 |
+| `~/.config/kaseta/env` | optional environment overrides |
 
 ### Uninstall
 
@@ -180,7 +187,9 @@ transcript depends on.
 | `KASETA_OPENROUTER_KEY` | — | Enables summaries; without it they are skipped |
 | `KASETA_OPENROUTER_MODEL` | `anthropic/claude-3.5-haiku` | Model used for summaries |
 
-Installed setups read these from `~/.config/kaseta/env`.
+Installed setups read these from `~/.config/kaseta/env`. The environment wins
+over anything saved in Settings, so a key exported for a one-off run is not
+silently overridden.
 
 ### Headless machines
 
