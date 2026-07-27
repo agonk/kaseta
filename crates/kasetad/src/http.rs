@@ -90,6 +90,8 @@ pub fn router(
         .route("/api/v1/recordings/{id}", patch(rename_recording))
         .route("/api/v1/recordings/{id}", delete(delete_recording))
         .route("/api/v1/recordings/{id}/audio/{file}", get(audio))
+        .route("/api/v1/recordings/{id}/transcript", get(transcript))
+        .route("/api/v1/search", get(search))
         .with_state(state)
 }
 
@@ -328,6 +330,47 @@ async fn delete_recording(
             .ok_or_else(|| ApiError::not_found("no such recording"))
     })
     .await
+}
+
+async fn transcript(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<library::Transcript>, ApiError> {
+    let id = parse_id(&id)?;
+    with_db(&state, move |db| {
+        library::transcript(db, id)
+            .map_err(ApiError::from_anyhow)?
+            .ok_or_else(|| ApiError::not_found("this recording has not been transcribed"))
+    })
+    .await
+    .map(Json)
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchQuery {
+    q: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchResponse {
+    items: Vec<library::LibraryItem>,
+}
+
+/// Finds recordings whose transcript contains the query.
+async fn search(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<SearchQuery>,
+) -> Result<Json<SearchResponse>, ApiError> {
+    let items = with_db(&state, move |db| {
+        let matching = library::search(db, &query.q).map_err(ApiError::from_anyhow)?;
+        let all = library::list(db).map_err(ApiError::from_anyhow)?;
+        Ok(all
+            .into_iter()
+            .filter(|item| matching.contains(&item.id))
+            .collect::<Vec<_>>())
+    })
+    .await?;
+    Ok(Json(SearchResponse { items }))
 }
 
 /// Serves an exported audio file, honouring range requests.

@@ -85,6 +85,28 @@
   .tracks { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
   .tracks button { font-size: 12px; padding: 4px 10px; color: var(--muted); }
 
+  .transcript {
+    margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line);
+    max-height: 340px; overflow-y: auto;
+  }
+  .line {
+    display: grid; grid-template-columns: 52px 54px 1fr; gap: 10px;
+    padding: 3px 6px; border-radius: 6px; cursor: pointer; align-items: baseline;
+  }
+  .line:hover { background: var(--bg); }
+  .line time { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .line .who { font-size: 12px; font-weight: 600; }
+  .line.you .who { color: var(--accent); }
+  .line.them .who { color: var(--muted); }
+  .line mark { background: var(--accent-soft); color: inherit; font-weight: 600; }
+
+  .search { display: flex; gap: 8px; margin-bottom: 16px; }
+  .search input { flex: 1; border-color: var(--line); }
+  .badge {
+    font-size: 11px; color: var(--muted); border: 1px solid var(--line);
+    border-radius: 999px; padding: 1px 8px; white-space: nowrap;
+  }
+
   .empty, .error {
     color: var(--muted); text-align: center; padding: 36px 20px;
     border: 1px dashed var(--line); border-radius: var(--radius);
@@ -111,6 +133,11 @@
       <div class="warn" id="warn" hidden></div>
     </div>
     <button class="primary" id="toggle">Start recording</button>
+  </div>
+
+  <div class="search">
+    <input type="text" id="q" placeholder="Search everything that was said…" autocomplete="off">
+    <button id="clear" hidden>Clear</button>
   </div>
 
   <div id="error" class="error" hidden></div>
@@ -228,6 +255,14 @@ function render(item) {
   row.append(info, rename, remove);
   li.append(row);
 
+  if (item.has_transcript) {
+    const show = document.createElement("button");
+    show.className = "icon";
+    show.textContent = "Transcript";
+    show.onclick = () => toggleTranscript(li, item, show);
+    row.insertBefore(show, rename);
+  }
+
   if (item.mixed_audio_url) {
     const audio = document.createElement("audio");
     audio.controls = true;
@@ -254,6 +289,75 @@ function render(item) {
   }
 
   return li;
+}
+
+async function toggleTranscript(li, item, button) {
+  const existing = li.querySelector(".transcript");
+  if (existing) {
+    existing.remove();
+    button.textContent = "Transcript";
+    return;
+  }
+
+  try {
+    const data = await api(`/api/v1/recordings/${item.id}/transcript`);
+    const box = document.createElement("div");
+    box.className = "transcript";
+
+    for (const line of data.lines) {
+      const el = document.createElement("div");
+      el.className = `line ${line.speaker}`;
+
+      const at = document.createElement("time");
+      at.textContent = fmtDuration(line.at_s * 1000);
+
+      const who = document.createElement("span");
+      who.className = "who";
+      who.textContent = line.speaker === "you" ? "You" : line.speaker === "them" ? "Them" : "";
+
+      const text = document.createElement("span");
+      // textContent, not innerHTML: a transcript is untrusted text and may
+      // contain anything that was said or misheard.
+      text.textContent = line.text;
+      if (lastQuery) highlight(text, lastQuery);
+
+      // Clicking a line seeks the player to that moment, which is the point of
+      // keeping timestamps through the whole pipeline.
+      el.onclick = () => {
+        const audio = li.querySelector("audio");
+        if (!audio) return;
+        audio.currentTime = line.at_s;
+        audio.play();
+      };
+
+      el.append(at, who, text);
+      box.append(el);
+    }
+
+    if (!data.lines.length) {
+      box.textContent = "No speech was found in this recording.";
+      box.style.color = "var(--muted)";
+    }
+
+    li.append(box);
+    button.textContent = "Hide";
+  } catch (e) { showError(e); }
+}
+
+/// Wraps matches of `query` so a search result shows why it matched.
+function highlight(el, query) {
+  const text = el.textContent;
+  const at = text.toLowerCase().indexOf(query.toLowerCase());
+  if (at < 0) return;
+
+  el.textContent = "";
+  el.append(
+    document.createTextNode(text.slice(0, at)),
+    Object.assign(document.createElement("mark"), {
+      textContent: text.slice(at, at + query.length),
+    }),
+    document.createTextNode(text.slice(at + query.length)),
+  );
 }
 
 function startRename(li, item) {
@@ -316,10 +420,37 @@ async function refreshStatus() {
   catch (e) { showError(e); }
 }
 
+let lastQuery = "";
+let searchTimer = null;
+
 async function refreshList() {
-  try { renderList((await api("/api/v1/recordings")).items); }
-  catch (e) { showError(e); }
+  try {
+    const path = lastQuery
+      ? `/api/v1/search?q=${encodeURIComponent(lastQuery)}`
+      : "/api/v1/recordings";
+    const { items } = await api(path);
+    renderList(items);
+    $("empty").textContent = lastQuery
+      ? `Nothing matching "${lastQuery}".`
+      : "No recordings yet.";
+  } catch (e) { showError(e); }
 }
+
+$("q").oninput = (e) => {
+  // Debounced: searching on every keystroke would query the index far faster
+  // than anyone types meaningfully.
+  clearTimeout(searchTimer);
+  lastQuery = e.target.value.trim();
+  $("clear").hidden = !lastQuery;
+  searchTimer = setTimeout(refreshList, 200);
+};
+
+$("clear").onclick = () => {
+  $("q").value = "";
+  lastQuery = "";
+  $("clear").hidden = true;
+  refreshList();
+};
 
 refreshStatus();
 refreshList();

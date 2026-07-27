@@ -36,6 +36,8 @@ pub struct LibraryItem {
     pub ended_at: Option<time::OffsetDateTime>,
     pub duration_ms: i64,
     pub tracks: Vec<LibraryTrack>,
+    /// Whether a transcript exists, so the interface can offer to show it.
+    pub has_transcript: bool,
     /// Present once a mixed export exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mixed_audio_url: Option<String>,
@@ -257,8 +259,23 @@ pub fn list(db: &Db) -> Result<Vec<LibraryItem>> {
         })
     })?;
 
-    rows.map(|row| row.map_err(Into::into).and_then(into_item))
-        .collect()
+    let mut items: Vec<LibraryItem> = rows
+        .map(|row| row.map_err(Into::into).and_then(into_item))
+        .collect::<Result<_>>()?;
+
+    // One query for the whole page rather than one per row.
+    let with_transcripts: HashSet<String> = {
+        let mut stmt = db
+            .conn()
+            .prepare("SELECT DISTINCT recording_id FROM transcripts")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    for item in &mut items {
+        item.has_transcript = with_transcripts.contains(&item.id.to_string());
+    }
+
+    Ok(items)
 }
 
 struct Row {
@@ -293,6 +310,7 @@ fn into_item(row: Row) -> Result<LibraryItem> {
             .ended_at
             .and_then(|t| time::OffsetDateTime::from_unix_timestamp(t).ok()),
         duration_ms: row.duration_ms,
+        has_transcript: false,
         tracks: indexed
             .into_iter()
             .map(|t| LibraryTrack {
@@ -350,6 +368,134 @@ fn describe_track(track_id: &str) -> (&'static str, &'static str) {
     } else {
         ("unknown", "Audio")
     }
+}
+
+/// One line of a transcript, as the interface shows it.
+#[derive(Clone, Debug, Serialize)]
+pub struct TranscriptLine {
+    /// Seconds from the start of the recording, for seeking playback.
+    pub at_s: f64,
+    /// Who said it: `you`, `them`, or `unknown`.
+    pub speaker: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Transcript {
+    pub engine: Option<String>,
+    pub language: Option<String>,
+    pub lines: Vec<TranscriptLine>,
+}
+
+/// Reads a recording's transcript as a conversation.
+///
+/// Times are rebased from the canonical clock, which counts from system boot,
+/// onto the recording itself — the only frame of reference a listener has.
+pub fn transcript(db: &Db, id: Ulid) -> Result<Option<Transcript>> {
+    let header: Option<(String, Option<String>, Option<String>, Option<i64>)> = db
+        .conn()
+        .query_row(
+            "SELECT t.id, t.engine_model, t.language, r.clock_started_ns
+             FROM transcripts t
+             JOIN recordings r ON r.id = t.recording_id
+             WHERE t.recording_id = ?1
+             ORDER BY t.revision DESC
+             LIMIT 1",
+            params![id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+
+    let Some((transcript_id, engine, language, clock_started_ns)) = header else {
+        return Ok(None);
+    };
+
+
+    let mut stmt = db.conn().prepare(
+        "SELECT start_boottime_ns, speaker_hint, text
+         FROM transcript_segments
+         WHERE transcript_id = ?1
+         ORDER BY start_boottime_ns",
+    )?;
+    let rows = stmt.query_map(params![transcript_id], |r| {
+        Ok((
+            r.get::<_, i64>(0)? as u64,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+
+    let raw: Vec<(u64, Option<String>, String)> = rows.collect::<Result<_, _>>()?;
+
+    // Capture's clock origin is the right reference. Falling back to the first
+    // segment keeps a recording readable if that origin was never indexed,
+    // at the cost of the transcript appearing to start at zero.
+    let origin = match clock_started_ns {
+        Some(ns) if ns > 0 => ns as u64,
+        _ => raw.first().map(|(t, _, _)| *t).unwrap_or(0),
+    };
+
+    let lines = raw
+        .into_iter()
+        .map(|(start_ns, hint, text)| TranscriptLine {
+            at_s: start_ns.saturating_sub(origin) as f64 / 1e9,
+            speaker: match hint.as_deref() {
+                Some("local") => "you".into(),
+                Some("remote") => "them".into(),
+                _ => "unknown".into(),
+            },
+            text,
+        })
+        .collect();
+
+    Ok(Some(Transcript {
+        engine,
+        language,
+        lines,
+    }))
+}
+
+/// Whether a recording has a transcript, for the listing.
+pub fn has_transcript(db: &Db, id: Ulid) -> Result<bool> {
+    Ok(db
+        .conn()
+        .query_row(
+            "SELECT 1 FROM transcripts WHERE recording_id = ?1 LIMIT 1",
+            params![id.to_string()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Finds recordings whose transcript contains `query`.
+///
+/// Uses the full-text index rather than scanning, so search stays instant as
+/// the library grows.
+pub fn search(db: &Db, query: &str) -> Result<Vec<Ulid>> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut stmt = db.conn().prepare(
+        "SELECT DISTINCT t.recording_id
+         FROM transcript_search s
+         JOIN transcript_segments seg ON seg.rowid = s.rowid
+         JOIN transcripts t ON t.id = seg.transcript_id
+         JOIN recordings r ON r.id = t.recording_id
+         WHERE transcript_search MATCH ?1 AND r.deleted_at IS NULL",
+    )?;
+
+    // Quoted as a phrase so punctuation in the query cannot be read as FTS
+    // operator syntax and turn a search into a syntax error.
+    let phrase = format!("\"{}\"", trimmed.replace('"', ""));
+    let rows = stmt.query_map(params![phrase], |r| r.get::<_, String>(0))?;
+
+    Ok(rows
+        .filter_map(|r| r.ok())
+        .filter_map(|id| Ulid::from_string(&id).ok())
+        .collect())
 }
 
 /// Renames a recording without touching its capture record.

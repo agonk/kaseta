@@ -332,7 +332,6 @@ pub fn mix_recording(
     // detecting it and redoing the pass costs less than always paying for the
     // wider type. Each track is streamed rather than decoded whole.
     let mut mixed: Vec<i16> = Vec::new();
-    let mut clipped = false;
     let mut needed_attenuation = false;
 
     for pass in 0..2 {
@@ -340,7 +339,7 @@ pub fn mix_recording(
         // attenuation that pass proved necessary.
         let gain = if pass == 0 { 1.0f32 } else { 0.5f32 };
         mixed.clear();
-        clipped = false;
+        let mut clipped = false;
 
         for track in &tracks {
             let mut reader = TrackReader::new(store, track)?;

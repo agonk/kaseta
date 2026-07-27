@@ -31,6 +31,7 @@ use ulid::Ulid;
 
 use crate::blobstore::BlobStore;
 use crate::capture::devices::{self, DeviceKind};
+use crate::db::Db;
 use crate::capture::session::{RecordingSession, SessionOutcome, TrackSpec};
 
 /// Conditions the caller can correct, as opposed to faults.
@@ -128,13 +129,13 @@ pub struct Supervisor {
 type ExportsInFlight = Arc<AtomicUsize>;
 
 impl Supervisor {
-    pub fn spawn(store: Arc<dyn BlobStore>) -> Result<Self> {
+    pub fn spawn(store: Arc<dyn BlobStore>, db: Arc<std::sync::Mutex<Db>>) -> Result<Self> {
         let (commands, rx) = mpsc::channel::<Command>();
         let (status_tx, status) = watch::channel(DaemonStatus::default());
 
         let thread = std::thread::Builder::new()
             .name("kaseta-supervisor".into())
-            .spawn(move || run(rx, status_tx, store))
+            .spawn(move || run(rx, status_tx, store, db))
             .context("spawning supervisor thread")?;
 
         Ok(Self {
@@ -186,6 +187,7 @@ fn run(
     commands: mpsc::Receiver<Command>,
     status: watch::Sender<DaemonStatus>,
     store: Arc<dyn BlobStore>,
+    db: Arc<std::sync::Mutex<Db>>,
 ) {
     let mut active: Option<Active> = None;
     let exporting: ExportsInFlight = Arc::new(AtomicUsize::new(0));
@@ -226,6 +228,7 @@ fn run(
                         // another recording immediately.
                         spawn_exports(
                             Arc::clone(&store),
+                            Arc::clone(&db),
                             stopped.manifest.clone(),
                             stopped.prefix.clone(),
                             Arc::clone(&exporting),
@@ -358,6 +361,7 @@ fn start_recording(
 /// Produces a recording's exports off the supervisor thread.
 fn spawn_exports(
     store: Arc<dyn BlobStore>,
+    db: Arc<std::sync::Mutex<Db>>,
     manifest: RecordingManifest,
     prefix: RecordingPrefix,
     exporting: ExportsInFlight,
@@ -375,6 +379,21 @@ fn spawn_exports(
             if let Err(e) = crate::export::mix_recording(&*store, &manifest, &prefix) {
                 tracing::error!(error = %format!("{e:#}"), "mixing recording failed");
             }
+
+            // Queued only once the audio transcription needs actually exists.
+            // Queueing earlier would have the scheduler fail on missing exports
+            // and burn retries waiting for work that had not finished.
+            match db.lock() {
+                Ok(guard) => {
+                    if let Err(e) =
+                        crate::scheduler::enqueue_for_recording(&guard, manifest.recording_id)
+                    {
+                        tracing::error!(error = %format!("{e:#}"), "could not queue transcription");
+                    }
+                }
+                Err(_) => tracing::error!("database lock poisoned; transcription not queued"),
+            }
+
             counter.fetch_sub(1, Ordering::SeqCst);
         });
 

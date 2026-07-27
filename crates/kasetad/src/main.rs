@@ -9,6 +9,7 @@ mod db;
 mod export;
 mod http;
 mod library;
+mod scheduler;
 mod supervisor;
 mod transcribe;
 
@@ -479,7 +480,11 @@ fn cmd_serve(port: u16) -> Result<()> {
     use std::sync::Mutex;
 
     let root = std::env::var("KASETA_DATA").unwrap_or_else(|_| "./data".into());
-    let store: Arc<dyn blobstore::BlobStore> = Arc::new(blobstore::LocalFsStore::new(&root)?);
+    let local = blobstore::LocalFsStore::new(&root)?;
+    // The worker resolves blob keys against this, so it must be the resolved
+    // path rather than whatever was configured.
+    let storage_root = local.root().display().to_string();
+    let store: Arc<dyn blobstore::BlobStore> = Arc::new(local);
 
     let db = db::Db::open(&std::path::Path::new(&root).join("kaseta.db"))?;
 
@@ -507,8 +512,18 @@ fn cmd_serve(port: u16) -> Result<()> {
         Err(e) => tracing::error!(error = %format!("{e:#}"), "job recovery failed"),
     }
 
-    let supervisor = Arc::new(supervisor::Supervisor::spawn(Arc::clone(&store))?);
     let db = Arc::new(Mutex::new(db));
+    let supervisor = Arc::new(supervisor::Supervisor::spawn(
+        Arc::clone(&store),
+        Arc::clone(&db),
+    )?);
+
+    // Held for the lifetime of the daemon: dropping it stops the worker thread.
+    let _scheduler = scheduler::Scheduler::spawn(
+        Arc::clone(&store),
+        Arc::clone(&db),
+        storage_root,
+    )?;
 
     // A multi-thread runtime, so one slow request cannot stall the others.
     // Blocking work is additionally moved off the runtime with `spawn_blocking`;
