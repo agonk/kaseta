@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Kaseta — Start or stop recording
+Comment=Toggle recording without opening the window
+Exec=__BIN_DIR__/kaseta-tray toggle
+Icon=kaseta-symbolic
+Terminal=false
+NoDisplay=false
+Categories=AudioVideo;Audio;Recorder;
+Keywords=record;meeting;toggle;

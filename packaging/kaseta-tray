@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Kaseta in the system tray.
+#
+# Implemented against the daemon's HTTP API rather than inside it: a tray icon
+# needs a GUI toolkit and an event loop, and linking one into a 6 MB recorder
+# that usually runs with no window open would undo the point. This is a small
+# script the desktop already has everything to run.
+set -euo pipefail
+
+PORT="${KASETA_PORT:-7777}"
+API="http://127.0.0.1:${PORT}/api/v1"
+
+# The token is minted per daemon run and embedded in the page it protects, so
+# reading it from there is how anything else authenticates.
+token() {
+    curl -sf --max-time 2 "http://127.0.0.1:${PORT}/" \
+        | grep -oP 'const TOKEN = "\K[a-f0-9]+' || true
+}
+
+status() { curl -sf --max-time 2 "$API/status" || echo '{"state":"unreachable"}'; }
+
+state_of() { printf '%s' "$1" | grep -oP '"state":"\K[a-z]+' || echo unreachable; }
+
+toggle() {
+    local t s
+    t="$(token)"
+    [ -z "$t" ] && return 1
+    s="$(state_of "$(status)")"
+    if [ "$s" = "recording" ]; then
+        curl -sf -X POST "$API/recordings/active/stop" -H "x-kaseta-token: $t" >/dev/null
+    else
+        curl -sf -X POST "$API/recordings" -H "x-kaseta-token: $t" \
+             -H 'content-type: application/json' -d '{}' >/dev/null
+    fi
+}
+
+case "${1:-status}" in
+    toggle) toggle ;;
+    open)   exec kaseta-open ;;
+    status) state_of "$(status)" ;;
+    # Prints a line per second for status-bar programs that poll a command,
+    # which is how waybar, i3status and polybar all consume this sort of thing.
+    watch)
+        while :; do
+            case "$(state_of "$(status)")" in
+                recording)  echo "⏺ recording" ;;
+                finalizing) echo "⏳ saving" ;;
+                idle)       echo "⏸ idle" ;;
+                *)          echo "○ offline" ;;
+            esac
+            sleep 1
+        done
+        ;;
+    *) echo "usage: kaseta-tray {toggle|open|status|watch}" >&2; exit 2 ;;
+esac

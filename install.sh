@@ -26,11 +26,20 @@ mkdir -p "$BIN_DIR" "$APP_DIR" "$ICON_DIR" "$UNIT_DIR" "$CONF_DIR" "$DATA_DIR"
 
 install -m755 "$ROOT/target/release/kasetad" "$BIN_DIR/kasetad"
 install -m755 "$ROOT/packaging/kaseta-open" "$BIN_DIR/kaseta-open"
+install -m755 "$ROOT/packaging/kaseta-tray" "$BIN_DIR/kaseta-tray"
 # The desktop session's PATH may not include ~/.local/bin, so the entry points
 # at the launcher absolutely rather than by name.
 sed "s|__BIN_DIR__|$BIN_DIR|" "$ROOT/packaging/kaseta.desktop" > "$APP_DIR/kaseta.desktop"
 chmod 644 "$APP_DIR/kaseta.desktop"
+
+# A second entry so recording can be bound to a key in the desktop's own
+# shortcut settings. Binding a global hotkey needs the compositor's cooperation,
+# and every desktop exposes that differently; a launchable action is the one
+# mechanism all of them share.
+sed "s|__BIN_DIR__|$BIN_DIR|" "$ROOT/packaging/kaseta-record.desktop" > "$APP_DIR/kaseta-record.desktop"
+chmod 644 "$APP_DIR/kaseta-record.desktop"
 install -m644 "$ROOT/packaging/kaseta.svg" "$ICON_DIR/kaseta.svg"
+install -m644 "$ROOT/packaging/kaseta-symbolic.svg" "$ICON_DIR/kaseta-symbolic.svg"
 install -m644 "$ROOT/packaging/kaseta.service" "$UNIT_DIR/kaseta.service"
 
 # Created empty rather than overwritten: it holds the summariser key, and
@@ -76,7 +85,8 @@ say ""
 say "Kaseta is installed."
 printf '  %-22s %s\n' "Application:" "in your launcher, as “Kaseta”"
 printf '  %-22s %s\n' "Recordings:" "$DATA_DIR"
-printf '  %-22s %s\n' "Summaries:" "add a key to $CONF_DIR/env"
+printf '  %-22s %s\n' "Summaries:" "add a key in Settings"
+printf '  %-22s %s\n' "Hotkey:" "bind 'kaseta-tray toggle' in your desktop settings"
 say ""
 
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
