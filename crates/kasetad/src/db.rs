@@ -18,7 +18,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use ulid::Ulid;
 
 /// Bumped whenever the schema changes. Migrations run in order at startup.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// The single local user. Present so every query is already scoped by owner and
 /// adding real accounts does not mean rewriting them.
@@ -96,6 +96,11 @@ impl Db {
             self.conn
                 .execute_batch(include_str!("migrations/005_progress.sql"))
                 .context("applying migration 005_progress")?;
+        }
+        if current < 6 {
+            self.conn
+                .execute_batch(include_str!("migrations/006_derived_backup.sql"))
+                .context("applying migration 006_derived_backup")?;
         }
 
         self.conn
@@ -264,6 +269,55 @@ impl Db {
         if existing.is_some() {
             return Ok(None);
         }
+        self.enqueue(recording_id, job_type, revision).map(Some)
+    }
+
+    /// Queues a job that has already run, so it can run again.
+    ///
+    /// `enqueue_once` treats a previous success as a reason never to repeat the
+    /// work, which is right for anything derived from the audio: the audio has
+    /// not changed. It is wrong for an upload, because what is worth uploading
+    /// can change afterwards — a transcript arrives, or someone renames the
+    /// recording — and the bucket then holds a copy that is quietly out of
+    /// date.
+    ///
+    /// Only a previous *success* is cleared. A failure — retryable or not — is
+    /// left exactly where it is, because the retry machinery owns it: deleting
+    /// a `failed_retryable` row would discard its backoff and its attempt
+    /// count, and a sweep that runs every minute would then retry a failing
+    /// upload every minute, forever. Getting a terminally failed stage moving
+    /// again is a deliberate act, and there is a button for it.
+    ///
+    /// Work already queued or running is left alone; it will pick up whatever
+    /// is current when it runs.
+    pub fn enqueue_again(
+        &self,
+        recording_id: Ulid,
+        job_type: JobType,
+        revision: u32,
+    ) -> Result<Option<Ulid>> {
+        let pending: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM jobs
+                 WHERE recording_id = ?1 AND job_type = ?2 AND revision = ?3
+                   AND state IN ('queued','running','failed_retryable','failed_terminal')
+                 LIMIT 1",
+                params![recording_id.to_string(), job_type.as_str(), revision],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        if pending.is_some() {
+            return Ok(None);
+        }
+
+        self.conn.execute(
+            "DELETE FROM jobs
+             WHERE recording_id = ?1 AND job_type = ?2 AND revision = ?3
+               AND state IN ('succeeded','canceled')",
+            params![recording_id.to_string(), job_type.as_str(), revision],
+        )?;
         self.enqueue(recording_id, job_type, revision).map(Some)
     }
 
@@ -573,6 +627,46 @@ mod tests {
         elapse_backoff(&db, id);
         db.requeue_retryable().unwrap();
         assert!(db.claim_next_job(3).unwrap().is_some());
+    }
+
+    /// Re-queueing after a change must not become a way around backoff. The
+    /// sweep that calls this runs every minute; if it cleared a failing job's
+    /// retry budget, a failing upload would be retried every minute forever.
+    #[test]
+    fn re_queueing_leaves_a_failing_job_to_its_backoff() {
+        let (db, rec) = db_with_recording();
+        let id = db.enqueue(rec, JobType::UploadRemote, 1).unwrap();
+
+        db.claim_next_job(1).unwrap();
+        db.fail_job(id, "net", "connection reset", true).unwrap();
+
+        assert!(
+            db.enqueue_again(rec, JobType::UploadRemote, 1).unwrap().is_none(),
+            "a job waiting on backoff must not be replaced by a fresh one"
+        );
+
+        let job = Db::load_job(&db.conn, &id.to_string()).unwrap().unwrap();
+        assert_eq!(job.attempt, 1, "its attempt count must survive");
+    }
+
+    /// A success, though, is exactly what should be repeatable: the recording
+    /// changed after it was uploaded.
+    #[test]
+    fn re_queueing_runs_again_after_a_success() {
+        let (db, rec) = db_with_recording();
+        let id = db.enqueue(rec, JobType::UploadRemote, 1).unwrap();
+
+        db.claim_next_job(1).unwrap();
+        db.transition_job(id, JobState::Succeeded).unwrap();
+
+        assert!(
+            db.enqueue_once(rec, JobType::UploadRemote, 1).unwrap().is_none(),
+            "the ordinary path still refuses to repeat finished work"
+        );
+        assert!(
+            db.enqueue_again(rec, JobType::UploadRemote, 1).unwrap().is_some(),
+            "a recording that changed after upload must be uploadable again"
+        );
     }
 
     #[test]

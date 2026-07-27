@@ -206,6 +206,47 @@ impl RecordingPrefix {
             .join("exports")
             .and_then(|k| k.join(filename))
     }
+
+    /// One revision of the transcript.
+    ///
+    /// A transcript belongs beside the audio it came from rather than only in
+    /// the index. Anything held solely in the database is absent from a copy of
+    /// the store — which is what a backup is — and re-deriving it means
+    /// transcribing every recording again.
+    ///
+    /// Numbered rather than overwritten, like everything else here: a second
+    /// pass with a better model should not destroy what the first produced
+    /// while something already cites it.
+    pub fn transcript(&self, revision: u32) -> BlobKey {
+        self.root()
+            .join("transcripts")
+            .and_then(|k| k.join(&format!("v{revision}.json")))
+            .expect("literal segment is safe")
+    }
+
+    /// One revision of the summary. Numbered for the same reason.
+    pub fn summary(&self, revision: u32) -> BlobKey {
+        self.root()
+            .join("summaries")
+            .and_then(|k| k.join(&format!("v{revision}.json")))
+            .expect("literal segment is safe")
+    }
+
+    /// What a person changed after the fact — a title, so far.
+    ///
+    /// The one mutable object under the prefix, and deliberately separate from
+    /// the manifest, which is sealed when capture ends and describes what was
+    /// captured. A rename is not a fact about the recording; it is a fact about
+    /// how someone chose to file it, and it can change again tomorrow.
+    ///
+    /// Not named `notes`: the manifest already carries capture-time notes, and
+    /// two things called notes meaning different things is how a schema starts
+    /// lying.
+    pub fn library_metadata(&self) -> BlobKey {
+        self.root()
+            .join("library.json")
+            .expect("literal segment is safe")
+    }
 }
 
 /// A track identifier, e.g. `a_local-mic_01` or `v_screen_01`.

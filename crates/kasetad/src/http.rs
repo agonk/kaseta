@@ -333,8 +333,9 @@ async fn rename_recording(
     let id = parse_id(&id)?;
     let title = body.title.clone();
 
+    let store = Arc::clone(&state.store);
     with_db(&state, move |db| {
-        library::set_title(db, id, title.as_deref())
+        library::set_title(&*store, db, id, title.as_deref())
             .map_err(ApiError::from_anyhow)?
             .then_some(StatusCode::NO_CONTENT)
             .ok_or_else(|| ApiError::not_found("no such recording"))

@@ -424,7 +424,18 @@ pub fn parse_summary(content: &str) -> Result<Summary> {
 }
 
 /// Stores a summary, replacing any previous one for this recording.
-pub fn store(db: &Db, recording_id: Ulid, model: &str, summary: &Summary) -> Result<()> {
+///
+/// Written to the store as well as the index, so that a copy of the store —
+/// which is what a backup is — contains the summary rather than only the audio
+/// it was made from.
+pub fn store(
+    store: &dyn crate::blobstore::BlobStore,
+    prefix: &kaseta_contracts::RecordingPrefix,
+    db: &Db,
+    recording_id: Ulid,
+    model: &str,
+    summary: &Summary,
+) -> Result<()> {
     let json = serde_json::to_string(summary).context("serialising the summary")?;
     db.conn().execute(
         "INSERT INTO summaries (id, recording_id, revision, provider, model, content_json)
@@ -435,6 +446,26 @@ pub fn store(db: &Db, recording_id: Ulid, model: &str, summary: &Summary) -> Res
              created_at   = strftime('%s','now')",
         rusqlite::params![Ulid::new().to_string(), recording_id.to_string(), model, json],
     )?;
+
+    if let Some(document) = crate::derived::summary_document(db, recording_id)? {
+        // As with a transcript: indexed but unstored is usable here and absent
+        // from a backup, which the startup sweep repairs rather than paying for
+        // the summary a second time.
+        let key = prefix.summary(document.revision);
+        match serde_json::to_vec_pretty(&document) {
+            Ok(bytes) => {
+                if let Err(e) = store.put(&key, &bytes) {
+                    tracing::warn!(
+                        %recording_id,
+                        error = %format!("{e:#}"),
+                        "the summary is indexed but not yet stored; it will be written again later"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(%recording_id, error = %e, "could not encode the summary"),
+        }
+        crate::derived::mark_dirty(db, recording_id)?;
+    }
     Ok(())
 }
 

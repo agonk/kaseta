@@ -39,6 +39,13 @@ its steady-state cost zero.
 layout and an S3/R2 bucket layout are byte-identical, so moving between them is
 a copy rather than a translation.
 
+**Derived work lives beside what it came from.** A transcript, a summary and a
+title someone typed are written as objects under the recording's own prefix,
+not only into the index. The index is rebuildable from storage — delete the
+database and it comes back — which is only true if everything worth keeping is
+in storage. It is also what makes a backup a backup: a bucket holding audio and
+nothing made from it would mean transcribing every meeting again.
+
 **Timing is measured, not assumed.** A microphone and a sink monitor run on
 independent hardware clocks and drift apart over a long meeting. Every chunk
 records the canonical clock (`CLOCK_BOOTTIME`, which unlike `CLOCK_MONOTONIC`

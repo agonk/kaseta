@@ -90,6 +90,7 @@ pub fn reconcile(store: &dyn BlobStore, db: &Db) -> Result<usize> {
         .collect();
 
     let mut indexed = 0usize;
+    let mut restored = 0usize;
     let mut seen: HashSet<String> = HashSet::new();
 
     for key in manifests {
@@ -126,8 +127,26 @@ pub fn reconcile(store: &dyn BlobStore, db: &Db) -> Result<usize> {
         seen.insert(manifest.recording_id.to_string());
         index_recording(store, db, &manifest)?;
         indexed += 1;
+
+        // Whatever was derived from this recording is beside it in the store.
+        // Reading it back is what makes a restored bucket a working library
+        // rather than a pile of audio: only gaps are filled, so nothing the
+        // index has maintained since is overwritten by an older copy.
+        let prefix = prefix_for(manifest.recording_id, manifest.started_at);
+        match crate::derived::reindex_from_store(store, db, manifest.recording_id, &prefix) {
+            Ok(true) => restored += 1,
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                id = %manifest.recording_id,
+                error = %format!("{e:#}"),
+                "could not read back what was derived from this recording"
+            ),
+        }
     }
 
+    if restored > 0 {
+        tracing::info!(restored, "rebuilt transcripts, summaries or titles from storage");
+    }
     tracing::info!(indexed, "library reconciled with storage");
     Ok(indexed)
 }
@@ -577,7 +596,18 @@ pub fn search(db: &Db, query: &str) -> Result<Vec<Ulid>> {
 }
 
 /// Renames a recording without touching its capture record.
-pub fn set_title(db: &Db, id: Ulid, title: Option<&str>) -> Result<bool> {
+///
+/// The name is stored beside the recording as well as indexed, so a bucket
+/// holds objects someone can recognise rather than a wall of timestamps. The
+/// object keys themselves never change: they are the recording's identity, and
+/// renaming them would break every reference to it, in the index and in
+/// whatever else has already copied them.
+pub fn set_title(
+    store: &dyn BlobStore,
+    db: &Db,
+    id: Ulid,
+    title: Option<&str>,
+) -> Result<bool> {
     // An empty title clears the override rather than storing blankness, so the
     // recording falls back to its captured or generated name.
     let cleaned = title.map(str::trim).filter(|t| !t.is_empty());
@@ -586,7 +616,38 @@ pub fn set_title(db: &Db, id: Ulid, title: Option<&str>) -> Result<bool> {
          WHERE id = ?2 AND deleted_at IS NULL",
         params![cleaned, id.to_string()],
     )?;
-    Ok(changed > 0)
+    if changed == 0 {
+        return Ok(false);
+    }
+
+    if let Some(started_at) = started_at(db, id)? {
+        let prefix = kaseta_contracts::RecordingPrefix::new(id, started_at);
+        let metadata = kaseta_contracts::LibraryMetadata {
+            version: kaseta_contracts::DERIVED_VERSION.to_string(),
+            title_override: cleaned.map(str::to_string),
+        };
+        if let Err(e) = crate::derived::publish_library_metadata(store, &prefix, &metadata) {
+            tracing::warn!(%id, error = %format!("{e:#}"), "could not store the new title");
+        }
+        // Whether or not the write landed, the stored copy is now behind the
+        // index, and a backup taken before the rename still carries the old
+        // name. Marking it is what gets both put right.
+        crate::derived::mark_dirty(db, id)?;
+    }
+    Ok(true)
+}
+
+/// When a recording started, which its object keys are derived from.
+fn started_at(db: &Db, id: Ulid) -> Result<Option<time::OffsetDateTime>> {
+    let seconds: Option<i64> = db
+        .conn()
+        .query_row(
+            "SELECT started_at FROM recordings WHERE id = ?1",
+            params![id.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(seconds.and_then(|s| time::OffsetDateTime::from_unix_timestamp(s).ok()))
 }
 
 /// Marks a recording deleted and removes its stored objects.

@@ -37,6 +37,14 @@ const IDLE_POLL: Duration = Duration::from_secs(1);
 /// burn wakeups.
 const RETENTION_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 
+/// How often changed recordings are re-queued for backup.
+///
+/// The delay is the point, not a compromise. Renaming a recording marks it as
+/// needing re-upload, and someone correcting a title three times in a row
+/// should cost one upload rather than three. A minute is long enough to absorb
+/// that and short enough that nobody waits on it.
+const DIRTY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
 pub struct Scheduler {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -82,8 +90,22 @@ fn run(
     stop: Arc<AtomicBool>,
 ) {
     let mut next_sweep = std::time::Instant::now() + RETENTION_INTERVAL;
+    let mut next_dirty_sweep = std::time::Instant::now() + DIRTY_SWEEP_INTERVAL;
 
     while !stop.load(Ordering::SeqCst) {
+        if std::time::Instant::now() >= next_dirty_sweep {
+            next_dirty_sweep = std::time::Instant::now() + DIRTY_SWEEP_INTERVAL;
+            let settings = crate::config::Settings::load().unwrap_or_default();
+            match db.lock() {
+                Ok(guard) => {
+                    if let Err(e) = crate::derived::requeue_dirty(&guard, &settings) {
+                        tracing::warn!(error = %format!("{e:#}"), "could not queue changed backups");
+                    }
+                }
+                Err(_) => tracing::error!("database lock poisoned"),
+            }
+        }
+
         if std::time::Instant::now() >= next_sweep {
             next_sweep = std::time::Instant::now() + RETENTION_INTERVAL;
             let settings = crate::config::Settings::load().unwrap_or_default();
@@ -190,8 +212,17 @@ fn execute(
             let transcription = crate::transcribe::transcribe(store, storage_root, &manifest)?;
 
             let guard = db.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
-            let segments =
-                crate::transcribe::store_transcript(&guard, recording_id, &transcription)?;
+            let prefix = kaseta_contracts::RecordingPrefix::new(
+                manifest.recording_id,
+                manifest.started_at,
+            );
+            let segments = crate::transcribe::store_transcript(
+                store,
+                &prefix,
+                &guard,
+                recording_id,
+                &transcription,
+            )?;
             tracing::info!(%recording_id, segments, "transcribed");
             Ok(())
         }
@@ -248,7 +279,18 @@ fn execute(
             let summary = crate::summarize::summarize(&config, &transcript)?;
 
             let guard = db.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
-            crate::summarize::store(&guard, recording_id, &config.model, &summary)?;
+            let prefix = kaseta_contracts::RecordingPrefix::new(
+                manifest.recording_id,
+                manifest.started_at,
+            );
+            crate::summarize::store(
+                store,
+                &prefix,
+                &guard,
+                recording_id,
+                &config.model,
+                &summary,
+            )?;
             tracing::info!(%recording_id, "summarised");
             Ok(())
         }
@@ -269,9 +311,34 @@ fn execute(
                 manifest.started_at,
             );
 
+            // Anything derived that has not reached the store yet is written
+            // first, so this uploads a complete recording rather than one
+            // missing whatever happened to fail earlier.
+            let store_complete = {
+                let guard = db.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+                match crate::derived::store_for(store, &guard, recording_id, &prefix) {
+                    Ok(_) => {
+                        // The store is current, whatever happens to the upload
+                        // next. Leaving this set would have the startup sweep
+                        // rewrite blobs it had already written.
+                        let _ = crate::derived::clear_store_dirty(&guard, recording_id);
+                        true
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            %recording_id,
+                            error = %format!("{e:#}"),
+                            "some derived artefacts could not be stored before backup"
+                        );
+                        false
+                    }
+                }
+            };
+
             // Everything under the recording's prefix: audio, metadata,
-            // exports. Uploading only the exports would leave a copy that
-            // cannot be rebuilt if the local chunks are removed.
+            // exports, transcript, summary, title. Uploading only the exports
+            // would leave a copy that cannot be rebuilt if the local chunks are
+            // removed.
             let keys = store.list_prefix(prefix.root().as_str())?;
             let client = crate::remote::client()?;
 
@@ -289,6 +356,18 @@ fn execute(
             // Recorded so the interface can say where a recording's audio
             // actually lives, which matters once local copies are removed.
             if let Ok(guard) = db.lock() {
+                // Only when the store was complete before the upload started.
+                // Clearing it regardless would call a backup finished while an
+                // artefact that failed to be written locally is missing from
+                // the bucket, and nothing would ever go back for it.
+                if store_complete {
+                    let _ = crate::derived::clear_remote_dirty(&guard, recording_id);
+                } else {
+                    tracing::warn!(
+                        %recording_id,
+                        "backed up, but something derived is missing; it stays queued for another pass"
+                    );
+                }
                 let _ = guard.conn().execute(
                     "UPDATE recordings SET uploaded_at = strftime('%s','now') WHERE id = ?1",
                     rusqlite::params![recording_id.to_string()],
@@ -299,9 +378,12 @@ fn execute(
             // partial upload would destroy the only complete copy.
             if settings.remote_storage.delete_local_after_upload {
                 for key in &keys {
-                    // Exports are derived and can be rebuilt; the chunks and
-                    // manifest are the recording itself and are what the remote
-                    // copy now holds.
+                    // Chunks only. The mixed export stays, and it is what the
+                    // player reads — there is no path that streams audio back
+                    // out of the bucket, so removing it would leave a recording
+                    // that is backed up and unplayable. That makes this reclaim
+                    // roughly half of what a recording occupies rather than all
+                    // of it, which the setting's wording should not overstate.
                     if key.as_str().contains("/tracks/") {
                         if let Err(e) = store.delete(key) {
                             tracing::warn!(%key, error = %format!("{e:#}"), "could not remove local copy");

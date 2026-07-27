@@ -10,11 +10,16 @@
 //! single-user assumption.
 
 pub mod blob;
+pub mod derived;
 pub mod jobs;
 pub mod manifest;
 pub mod worker;
 
 pub use blob::{BlobKey, BlobKeyError, RecordingPrefix, TrackId};
+pub use derived::{
+    ActionItem, LibraryMetadata, SummaryBody, SummaryDocument, TranscriptDocument, TranscriptLine,
+    DERIVED_VERSION,
+};
 pub use jobs::{IllegalTransition, Job, JobState, JobType};
 pub use manifest::{
     CanonicalClock, Chunk, ClockKind, Drift, FormatEpoch, MediaType, RecordingHeader,

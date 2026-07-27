@@ -127,11 +127,33 @@ pub struct Transcription {
 
 /// Stores a transcript. Fast, and the only part needing the database.
 pub fn store_transcript(
+    store: &dyn crate::blobstore::BlobStore,
+    prefix: &kaseta_contracts::RecordingPrefix,
     db: &Db,
     recording_id: Ulid,
     transcription: &Transcription,
 ) -> Result<usize> {
     write_transcript(db, recording_id, transcription)?;
+
+    // The document is assembled from what was just indexed rather than from
+    // the segments in hand, because rebasing onto the recording's own timeline
+    // needs the clock origin, which lives in the index. Deriving it twice from
+    // two sources is how the copy and the original start to disagree.
+    if let Some(document) = crate::derived::transcript_document(db, recording_id)? {
+        // A transcript that reached the index but not the store is complete
+        // for someone using this machine and absent from their backup. Not
+        // worth failing the job and re-running the model over: it is marked
+        // instead, and the sweep at startup writes what is missing.
+        if let Err(e) = crate::derived::publish_transcript(store, prefix, &document) {
+            tracing::warn!(
+                %recording_id,
+                error = %format!("{e:#}"),
+                "the transcript is indexed but not yet stored; it will be written again later"
+            );
+        }
+        crate::derived::mark_dirty(db, recording_id)?;
+    }
+
     Ok(transcription.segments.len())
 }
 

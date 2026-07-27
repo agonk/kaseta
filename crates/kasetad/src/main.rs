@@ -7,6 +7,7 @@ mod capture;
 mod config;
 mod clock;
 mod db;
+mod derived;
 mod export;
 mod http;
 mod library;
@@ -514,6 +515,24 @@ fn cmd_serve(port: u16) -> Result<()> {
         Err(e) => tracing::error!(error = %format!("{e:#}"), "could not index existing recordings"),
     }
 
+    // Recordings made before transcripts and summaries were stored have them
+    // only in the index, and so have backups that silently omit them. Working
+    // through that backlog once, here, is what stops those backups staying
+    // incomplete until each recording next happens to be touched.
+    match derived::heal(&*store, &db) {
+        Ok(healed) if healed.written > 0 => {
+            tracing::info!(
+                recordings = healed.written,
+                "stored transcripts and summaries that were only indexed"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::error!(
+            error = %format!("{e:#}"),
+            "could not store previously indexed transcripts"
+        ),
+    }
+
     // A purge interrupted by a crash left objects behind and a tombstone hiding
     // them; finish the job before anything indexes them again.
     match library::purge_pending(&*store, &db) {
@@ -593,7 +612,15 @@ fn cmd_transcribe(id: Option<String>) -> Result<()> {
 
     let root = store.root().display().to_string();
     let transcription = transcribe::transcribe(&store, &root, &manifest)?;
-    let segments = transcribe::store_transcript(&db, manifest.recording_id, &transcription)?;
+    let prefix =
+        kaseta_contracts::RecordingPrefix::new(manifest.recording_id, manifest.started_at);
+    let segments = transcribe::store_transcript(
+        &store,
+        &prefix,
+        &db,
+        manifest.recording_id,
+        &transcription,
+    )?;
 
     if segments == 0 {
         println!("No speech was found.");
