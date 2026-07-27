@@ -197,6 +197,20 @@ fn cmd_doctor() -> Result<()> {
         }
     }
 
+    // Reported regardless of whether capture works: a worker that cannot start
+    // fails every transcription in the background, and the only sign is a
+    // recording that never gains a transcript.
+    println!();
+    match transcribe::worker_status() {
+        Ok(python) => println!("  transcription     ready ({python})"),
+        Err(e) => {
+            println!("  transcription     unavailable");
+            println!("                    {e:#}");
+            println!("\nRecordings will be captured but not transcribed. Set it up with:");
+            println!("  cd worker && python -m venv .venv && .venv/bin/pip install -e .");
+        }
+    }
+
     Ok(())
 }
 

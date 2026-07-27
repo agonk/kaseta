@@ -145,25 +145,45 @@ fn hint_for(role: TrackRole) -> SpeakerHint {
 }
 
 /// Locates the interpreter that has the worker installed.
-fn worker_python() -> String {
+pub fn worker_python() -> String {
     let candidate = std::env::var("KASETA_WORKER_PYTHON")
         .map(std::path::PathBuf::from)
-        // The layout the worker's README sets up, so the common case needs no
-        // configuration.
+        // The layout the worker's README sets up, for running from the
+        // repository. An installed daemon is told where it is instead, since
+        // its working directory is the home, not the checkout.
         .unwrap_or_else(|_| std::path::PathBuf::from("worker/.venv/bin/python"));
 
     if !candidate.is_file() {
-        // Fall back to whatever `python3` resolves to and let the spawn fail
-        // with a message naming what was tried.
+        // Falls back to whatever `python3` resolves to, so the failure names
+        // what was tried rather than being a bare file-not-found.
         return "python3".to_string();
     }
 
-    // Must be absolute: the child runs with a different working directory, and
-    // a relative program path would be resolved against *that* instead.
     candidate
         .canonicalize()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| candidate.display().to_string())
+}
+
+/// Whether the transcription worker can actually be run.
+///
+/// Checked by `doctor`: a worker that cannot start fails every transcription
+/// job in the background, where the only sign is a recording that never gains
+/// a transcript.
+pub fn worker_status() -> Result<String> {
+    let python = worker_python();
+    let output = Command::new(&python)
+        .args(["-c", "import kaseta_worker, onnx_asr; print(onnx_asr.__name__)"])
+        .output()
+        .with_context(|| format!("running {python}"))?;
+
+    if output.status.success() {
+        Ok(python)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let reason: String = stderr.lines().last().unwrap_or("unknown error").into();
+        bail!("{python}: {reason}")
+    }
 }
 
 /// Spawns the worker, feeds it the spec, and reads back its result.
@@ -171,9 +191,13 @@ fn run_worker(spec: &TranscribeSpec) -> Result<WorkerResult> {
     let python = worker_python();
     let spec_json = serde_json::to_vec(spec).context("serialising the job spec")?;
 
+    // No working directory is set. It was `worker/`, relative — which resolved
+    // against the repository when run by hand and against the home directory
+    // when run as a service, where it does not exist, so the spawn failed
+    // before Python started. The worker is installed into its interpreter's
+    // environment, so `-m kaseta_worker` resolves from anywhere.
     let mut child = Command::new(&python)
         .args(["-m", "kaseta_worker"])
-        .current_dir("worker")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
