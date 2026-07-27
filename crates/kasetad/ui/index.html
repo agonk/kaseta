@@ -400,7 +400,8 @@
     <div class="grid2">
       <div class="field">
         <label for="sum-model">Model</label>
-        <input type="text" id="sum-model" placeholder="anthropic/claude-haiku-4.5">
+        <input type="text" id="sum-model" autocomplete="off">
+        <div class="hint" id="sum-model-hint"></div>
       </div>
       <div class="field">
         <label for="sum-key">API key</label>
@@ -988,9 +989,12 @@ async function loadSummary(pane, item) {
       return;
     }
 
+    // No guess at why. The reasons are several — no key, the switch off, the
+    // transcript gone — and the server answers precisely when the button is
+    // pressed, so inventing one here could only contradict it.
     pane.append(el("p", "hint", st?.state === "failed"
       ? "Summarising failed."
-      : "Not summarised. Needs an API key in Settings."));
+      : "Not summarised yet."));
 
     const run = el("button", "btn", st?.state === "failed" ? "Try again" : "Summarise now");
     run.onclick = () => runStage(item, "summarize", run);
@@ -1081,7 +1085,15 @@ $("open-settings").onclick = async () => {
     const s = await api("/api/v1/settings");
 
     $("sum-enabled").checked = s.summaries.enabled;
+    // The value is only ever an explicit choice; the fallback is a prompt. A
+    // default shown as a value would be saved back as one, outliving the
+    // default it came from.
     $("sum-model").value = s.summaries.model || "";
+    $("sum-model").placeholder = s.summaries.default_model;
+    $("sum-model").disabled = s.summaries.model_from_environment;
+    $("sum-model-hint").textContent = s.summaries.model_from_environment
+      ? "Set in the environment, which takes precedence over this."
+      : "Leave blank to use the default.";
     $("sum-key").value = "";
     $("sum-key").disabled = s.summaries.from_environment;
     $("sum-key-hint").textContent = s.summaries.from_environment

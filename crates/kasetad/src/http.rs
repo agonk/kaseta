@@ -505,6 +505,18 @@ async fn run_stage(
             return Err(ApiError::not_found("no such recording"));
         }
 
+        // Pressing a button is a different question from the chain reaching a
+        // stage on its own. The chain skips quietly; a person who asked for
+        // this deserves the reason rather than a job that reports success
+        // having done nothing.
+        let settings = crate::config::Settings::load().unwrap_or_default();
+        if let Some(reason) =
+            crate::scheduler::why_not_runnable(db, &settings, id, job_type)
+                .map_err(ApiError::from_anyhow)?
+        {
+            return Err(ApiError::bad_request(reason));
+        }
+
         // Any earlier attempt is cleared first, so asking again after a failure
         // actually re-runs rather than being refused as already-attempted.
         db.conn()

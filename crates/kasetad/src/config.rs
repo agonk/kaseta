@@ -52,7 +52,15 @@ pub struct RetentionSettings {
 pub struct SummarySettings {
     pub api_key: Option<String>,
     pub model: Option<String>,
-    /// Whether to summarise automatically after transcription.
+    /// Whether transcript text may be sent to a summary provider at all.
+    ///
+    /// Not merely "summarise automatically": nothing overrides this, including
+    /// an explicit request and a key found in the environment. It is the one
+    /// switch the interface's privacy summary reports on, and a control that
+    /// something else can quietly overrule is not a control.
+    ///
+    /// Off by default, so a key alone does not start sending transcripts
+    /// anywhere.
     pub enabled: bool,
 }
 
@@ -167,7 +175,20 @@ pub struct RedactedSettings {
 #[derive(Clone, Debug, Serialize)]
 pub struct RedactedSummary {
     pub enabled: bool,
-    pub model: String,
+    /// Only a model the person actually chose.
+    ///
+    /// Emphatically not the fallback: the interface puts this in an editable
+    /// field and posts it back on save, so a default rendered here would be
+    /// written to disk the first time anyone saved anything, and would then
+    /// outlive the default it came from. A model that stops existing — as
+    /// retired ones do — would be frozen in place with no way to tell it was
+    /// never a choice.
+    pub model: Option<String>,
+    /// What runs when no model is chosen. Shown as a prompt, never as a value.
+    pub default_model: String,
+    /// Set when the environment names the model, in which case what is saved
+    /// here has no effect.
+    pub model_from_environment: bool,
     pub api_key_set: bool,
     pub api_key_hint: Option<String>,
     /// Set when the environment provides the key, in which case editing it here
@@ -210,11 +231,10 @@ impl Settings {
         RedactedSettings {
             summaries: RedactedSummary {
                 enabled: self.summaries.enabled,
-                model: self
-                    .summaries
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| crate::summarize::DEFAULT_MODEL.to_string()),
+                model: self.summaries.model.clone(),
+                default_model: crate::summarize::DEFAULT_MODEL.to_string(),
+                model_from_environment: std::env::var("KASETA_OPENROUTER_MODEL")
+                    .is_ok_and(|m| !m.trim().is_empty()),
                 api_key_set: env_key.is_some() || self.summaries.api_key.is_some(),
                 api_key_hint: env_key
                     .as_deref()

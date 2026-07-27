@@ -85,6 +85,14 @@ Open **Settings** in the application to configure everything: an
 backup, and how long recordings are kept. Without a key, meetings are still
 recorded and transcribed — only the summary is skipped.
 
+Summaries are off until you switch them on, and **only that switch decides**.
+Supplying a key through the environment does not turn them on, because that
+switch is what the privacy note in the window reports on, and a control
+something else can overrule is not a control. It is the only path by which
+transcript text reaches a third party; transcription itself is local either
+way, and cloud backup — the other thing that leaves the machine — has a switch
+of its own.
+
 Recording can also be started without opening the window. Bind
 `kaseta-tray toggle` to a key in your desktop's shortcut settings, or use the
 **Kaseta — Start or stop recording** entry your launcher now has.
@@ -197,7 +205,7 @@ transcript depends on.
 | `KASETA_LOG` | `kasetad=info` | Log filter, e.g. `kasetad=debug` |
 | `KASETA_PORT` | `7777` | Port the interface is served on |
 | `KASETA_WORKER_PYTHON` | `worker/.venv/bin/python` | Interpreter with the transcription worker |
-| `KASETA_OPENROUTER_KEY` | — | Enables summaries; without it they are skipped |
+| `KASETA_OPENROUTER_KEY` | — | Key for summaries; a key alone does not switch them on |
 | `KASETA_OPENROUTER_MODEL` | `anthropic/claude-haiku-4.5` | Model used for summaries |
 
 Most of these are better set in **Settings**, which writes them to

@@ -122,6 +122,57 @@ fn claim(db: &Arc<Mutex<Db>>) -> Result<Option<kaseta_contracts::Job>> {
     db.claim_next_job(std::process::id())
 }
 
+/// Why a stage can do nothing right now, phrased for a person to read.
+///
+/// Two callers need the same answer for opposite reasons. The scheduler skips
+/// and logs: a recording that is simply complete without a summary must not
+/// wear a permanent failure because the automatic chain reached a stage that
+/// was switched off. The API refuses: someone who pressed a button asked for a
+/// specific thing, and a job that reports success having done nothing is
+/// indistinguishable from a button that does not work.
+///
+/// Deliberately advisory rather than authoritative. A transcript can be deleted
+/// by retention between the button and the job, so the worker keeps its own
+/// guards instead of trusting a check made earlier.
+pub fn why_not_runnable(
+    db: &Db,
+    settings: &crate::config::Settings,
+    recording_id: Ulid,
+    job_type: JobType,
+) -> Result<Option<String>> {
+    Ok(match job_type {
+        JobType::Summarize => {
+            if !settings.summaries.enabled {
+                Some("summaries are switched off in Settings".into())
+            } else if crate::summarize::SummarizeConfig::resolve(settings).is_err() {
+                Some("summaries need an API key, which is not set in Settings".into())
+            } else if crate::library::transcript(db, recording_id)?.is_none() {
+                Some("there is no transcript to summarise yet".into())
+            } else {
+                None
+            }
+        }
+        JobType::UploadRemote => {
+            if !settings.remote_storage.enabled {
+                Some("cloud backup is switched off in Settings".into())
+            } else {
+                // The validator's own words. Summarising them here as a missing
+                // bucket would misdirect anyone whose actual problem was a
+                // plain-http endpoint, which it also rejects.
+                crate::remote::RemoteTarget::from_settings(&settings.remote_storage)
+                    .err()
+                    .map(|e| format!("cloud backup is not usable: {e}"))
+            }
+        }
+        // Listed rather than defaulted: a stage added later becomes a
+        // compilation error here, which is the only reliable way to notice that
+        // it needs preconditions of its own.
+        JobType::Transcribe
+        | JobType::FinalizeRecording
+        | JobType::MergeTranscript => None,
+    })
+}
+
 fn execute(
     store: &dyn BlobStore,
     db: &Arc<Mutex<Db>>,
@@ -146,25 +197,47 @@ fn execute(
         }
         JobType::Summarize => {
             let settings = crate::config::Settings::load().unwrap_or_default();
-            if !settings.summaries.enabled && std::env::var(crate::summarize::API_KEY_ENV).is_err() {
-                tracing::info!("summaries are turned off");
-                return Ok(());
-            }
 
             // Absent configuration is not a failure: summaries are optional and
             // a recording without one is still complete.
-            let config = match crate::summarize::SummarizeConfig::resolve(&settings) {
-                Ok(config) => config,
-                Err(e) => {
-                    tracing::info!(reason = %e, "skipping summary");
-                    return Ok(());
-                }
+            //
+            // The switch alone decides, with no exception for a key found in
+            // the environment. Letting an exported key override it would mean
+            // transcripts leaving a machine whose interface says they do not,
+            // and a privacy control that something else can quietly overrule is
+            // not a control.
+            let skip = {
+                let guard = db.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+                why_not_runnable(&guard, &settings, recording_id, job_type)?
             };
+            if let Some(reason) = skip {
+                // A key in the environment with the switch off used to mean
+                // "summarise anyway". Someone who set it up that way and never
+                // opened Settings would otherwise just stop getting summaries
+                // with nothing said, so that specific combination is called
+                // out rather than logged at the usual level.
+                if !settings.summaries.enabled
+                    && std::env::var(crate::summarize::API_KEY_ENV)
+                        .is_ok_and(|k| !k.trim().is_empty())
+                {
+                    tracing::warn!(
+                        "a summary key is set in the environment but summaries are switched \
+                         off, so nothing was sent; switch them on in Settings to use it"
+                    );
+                } else {
+                    tracing::info!(%reason, "skipping summary");
+                }
+                return Ok(());
+            }
+
+            let config = crate::summarize::SummarizeConfig::resolve(&settings)?;
 
             let transcript = {
                 let guard = db.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
                 crate::library::transcript(&guard, recording_id)?
             };
+            // Checked a moment ago, so its absence now means retention or a
+            // delete landed in between. Still not a failure.
             let Some(transcript) = transcript else {
                 return Ok(());
             };
@@ -181,8 +254,12 @@ fn execute(
         }
         JobType::UploadRemote => {
             let settings = crate::config::Settings::load().unwrap_or_default();
-            if !settings.remote_storage.enabled {
-                tracing::debug!("cloud backup is turned off");
+            let skip = {
+                let guard = db.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+                why_not_runnable(&guard, &settings, recording_id, job_type)?
+            };
+            if let Some(reason) = skip {
+                tracing::debug!(%reason, "skipping backup");
                 return Ok(());
             }
 
@@ -444,5 +521,109 @@ mod tests {
     fn an_empty_queue_yields_no_work() {
         let (db, _) = db_with_recording();
         assert!(claim(&db).unwrap().is_none());
+    }
+
+    /// Summaries configured every way that should stop them, checked one at a
+    /// time so a passing case cannot mask a failing one.
+    fn summaries_on_with_key() -> crate::config::Settings {
+        let mut s = crate::config::Settings::default();
+        s.summaries.enabled = true;
+        s.summaries.api_key = Some("sk-or-test".into());
+        s
+    }
+
+    #[test]
+    fn summarising_is_refused_while_the_switch_is_off() {
+        let (db, rec) = db_with_recording();
+        let mut settings = summaries_on_with_key();
+        settings.summaries.enabled = false;
+
+        let guard = db.lock().unwrap();
+        let reason = why_not_runnable(&guard, &settings, rec, JobType::Summarize).unwrap();
+        assert!(reason.unwrap().contains("switched off"));
+    }
+
+    /// The switch governs whether transcript text leaves the machine, so an
+    /// available key must not reopen it. Asserting the *reason* rather than
+    /// merely that there is one is what makes this meaningful: the switch is
+    /// tested before anything looks for a key, so reaching this answer with a
+    /// key present proves the key was never consulted.
+    #[test]
+    fn a_key_does_not_reopen_a_closed_switch() {
+        let (db, rec) = db_with_recording();
+        let mut settings = summaries_on_with_key();
+        settings.summaries.enabled = false;
+
+        let guard = db.lock().unwrap();
+        let reason = why_not_runnable(&guard, &settings, rec, JobType::Summarize)
+            .unwrap()
+            .expect("a switched-off summary must stay off");
+        assert!(
+            reason.contains("switched off"),
+            "the switch must be the reason even with a key available, got: {reason}"
+        );
+    }
+
+    /// Unconditional: a key in the environment would also satisfy the key
+    /// check, so the transcript branch is reached either way.
+    #[test]
+    fn summarising_is_refused_before_there_is_a_transcript() {
+        let (db, rec) = db_with_recording();
+        let settings = summaries_on_with_key();
+
+        let guard = db.lock().unwrap();
+        let reason = why_not_runnable(&guard, &settings, rec, JobType::Summarize).unwrap();
+        assert!(reason.unwrap().contains("no transcript"));
+    }
+
+    #[test]
+    fn backup_is_refused_until_it_is_configured() {
+        let (db, rec) = db_with_recording();
+        let mut settings = crate::config::Settings::default();
+
+        let guard = db.lock().unwrap();
+        let off = why_not_runnable(&guard, &settings, rec, JobType::UploadRemote).unwrap();
+        assert!(off.unwrap().contains("switched off"));
+
+        // Switched on but with nothing to upload to is a different complaint,
+        // and saying "switched off" there would send someone to the wrong knob.
+        settings.remote_storage.enabled = true;
+        let bare = why_not_runnable(&guard, &settings, rec, JobType::UploadRemote).unwrap();
+        assert!(bare.unwrap().contains("missing"));
+    }
+
+    /// A fully configured backup can still be rejected for a reason that has
+    /// nothing to do with missing fields. Summarising every rejection as an
+    /// incomplete form would send this person to check a bucket name that was
+    /// never the problem.
+    #[test]
+    fn a_backup_refusal_says_what_was_actually_wrong() {
+        let (db, rec) = db_with_recording();
+        let mut settings = crate::config::Settings::default();
+        settings.remote_storage.enabled = true;
+        settings.remote_storage.bucket = Some("meetings".into());
+        settings.remote_storage.region = Some("auto".into());
+        settings.remote_storage.access_key_id = Some("key".into());
+        settings.remote_storage.secret_access_key = Some("secret".into());
+        settings.remote_storage.endpoint = Some("http://example.com".into());
+
+        let guard = db.lock().unwrap();
+        let reason = why_not_runnable(&guard, &settings, rec, JobType::UploadRemote)
+            .unwrap()
+            .expect("a plain-http endpoint is not usable");
+        assert!(reason.contains("https"), "got: {reason}");
+    }
+
+    /// Transcription depends on nothing that can be configured wrongly, so it
+    /// must never be refused — the guard exists to explain, not to gate.
+    #[test]
+    fn transcription_is_never_refused() {
+        let (db, rec) = db_with_recording();
+        let settings = crate::config::Settings::default();
+
+        let guard = db.lock().unwrap();
+        assert!(why_not_runnable(&guard, &settings, rec, JobType::Transcribe)
+            .unwrap()
+            .is_none());
     }
 }
