@@ -138,7 +138,7 @@
   .panes { flex: 1; display: grid; grid-template-columns: 264px 1fr; min-height: 0; }
   .library {
     border-right: 1px solid var(--outline-variant); background: var(--surface-lowest);
-    display: flex; flex-direction: column; min-height: 0;
+    display: flex; flex-direction: column; min-height: 0; min-width: 0;
   }
   .pane-head {
     padding: 9px var(--gutter) 7px; display: flex; justify-content: space-between;
@@ -157,7 +157,7 @@
   .item .name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .item .sub { display: flex; gap: 10px; margin-top: 1px; font: 500 12px/16px var(--mono); color: var(--on-surface-variant); }
 
-  .detail { display: flex; flex-direction: column; min-height: 0; overflow-y: auto; }
+  .detail { display: flex; flex-direction: column; min-height: 0; min-width: 0; overflow-y: auto; }
   .placeholder { margin: auto; text-align: center; color: var(--on-surface-variant); max-width: 340px; padding: 40px 20px; }
   .placeholder svg { opacity: .3; margin-bottom: 10px; }
 
@@ -165,7 +165,7 @@
 
   .detail-head { padding: 15px var(--gutter) 12px; border-bottom: 1px solid var(--outline-variant); }
   .detail-head h2 { margin: 0; font: 600 24px/32px var(--sans); letter-spacing: -.02em; }
-  .head-row { display: flex; align-items: flex-start; gap: 10px; }
+  .head-row { display: flex; align-items: flex-start; gap: 10px; flex-wrap: wrap; }
   .head-row .grow { flex: 1; min-width: 0; }
 
   .seg { display: inline-flex; border: 1px solid var(--outline-variant); border-radius: var(--r); overflow: hidden; }
@@ -194,7 +194,8 @@
 
   .split { display: grid; grid-template-columns: 1fr 336px; flex: 1; min-height: 0; }
   .transcript-pane { padding: 14px var(--gutter); border-right: 1px solid var(--outline-variant); min-width: 0; }
-  .summary-pane { padding: 14px var(--gutter); background: var(--surface-lowest); }
+  .summary-pane { padding: 14px var(--gutter); background: var(--surface-lowest); min-width: 0; }
+  .split { min-width: 0; }
 
   .sec-head {
     font: 500 12px/16px var(--mono); letter-spacing: .05em; text-transform: uppercase;
@@ -655,6 +656,22 @@ function select(id) {
 // ---- detail ----------------------------------------------------------------
 
 function renderDetail(item) {
+  try {
+    renderDetailInner(item);
+  } catch (e) {
+    // An empty pane with no explanation is the worst possible outcome: the
+    // recording exists and looks lost.
+    const pane = $("detail");
+    pane.replaceChildren();
+    const box = el("div", "placeholder");
+    box.append(el("p", null, "Could not display this recording."));
+    box.append(el("p", "hint", e.message));
+    pane.append(box);
+    console.error(e);
+  }
+}
+
+function renderDetailInner(item) {
   const pane = $("detail");
   // Stopped explicitly: dropping the reference leaves the element playing
   // detached from the page, audible with nothing on screen controlling it.
@@ -817,7 +834,9 @@ function stageChips(item) {
       chip.textContent = `${stage.name} — retrying`;
     } else {
       const failed = st?.state === "failed";
-      chip.classList.add(failed ? "bad" : "");
+      // `classList.add("")` throws, which aborted the whole detail pane for any
+      // stage that had simply not run yet — the common case.
+      if (failed) chip.classList.add("bad");
       chip.append(document.createTextNode(failed ? `${stage.name} failed ` : `${stage.name} `));
 
       const act = el("button", null, failed ? "retry" : "run");
