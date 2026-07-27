@@ -75,7 +75,13 @@ gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || tr
 # -e` would abort with a raw bus error after everything was already installed.
 if systemctl --user show-environment >/dev/null 2>&1; then
     systemctl --user daemon-reload
-    systemctl --user enable --now kaseta.service
+    systemctl --user enable kaseta.service
+    # Restart rather than `enable --now`: that starts a stopped service but
+    # leaves a running one on the old binary, so reinstalling would appear to
+    # do nothing. The interface is compiled into the executable, which makes a
+    # stale process particularly confusing — the repository is up to date and
+    # the window is not.
+    systemctl --user restart kaseta.service
     ACTIVATED=1
 else
     ACTIVATED=0
