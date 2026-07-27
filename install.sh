@@ -56,6 +56,17 @@ fi
 
 # The transcription worker lives in its own virtual environment: it needs
 # Python, and mixing it into the system site-packages would be antisocial.
+#
+# A virtual environment is built against one interpreter and stops working when
+# that interpreter goes away — a rolling distribution moving from 3.13 to 3.14
+# is enough. The symptom is a spawn failure naming a Python that is not
+# installed, far from the cause, so a broken environment is discarded and built
+# again rather than repaired in place: its packages were compiled against the
+# interpreter that just left.
+if [ ! -x "$ROOT/worker/.venv/bin/python" ] && [ -e "$ROOT/worker/.venv" ]; then
+    say "The transcription worker's Python is gone; building it again…"
+    rm -rf "$ROOT/worker/.venv"
+fi
 if [ ! -x "$ROOT/worker/.venv/bin/python" ]; then
     say "Setting up the transcription worker…"
     python3 -m venv "$ROOT/worker/.venv"
