@@ -455,19 +455,6 @@ pub fn transcript(db: &Db, id: Ulid) -> Result<Option<Transcript>> {
     }))
 }
 
-/// Whether a recording has a transcript, for the listing.
-pub fn has_transcript(db: &Db, id: Ulid) -> Result<bool> {
-    Ok(db
-        .conn()
-        .query_row(
-            "SELECT 1 FROM transcripts WHERE recording_id = ?1 LIMIT 1",
-            params![id.to_string()],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some())
-}
-
 /// Finds recordings whose transcript contains `query`.
 ///
 /// Uses the full-text index rather than scanning, so search stays instant as
