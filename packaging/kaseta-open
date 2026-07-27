@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Opens Kaseta in its own application window.
+#
+# The interface is served by the daemon, so this needs a window pointing at it
+# rather than a second copy of a browser engine. Application mode gives a
+# dedicated window with its own icon and no browser chrome, and reuses the
+# engine already installed rather than shipping another ~150 MB of one.
+set -euo pipefail
+
+PORT="${KASETA_PORT:-7777}"
+URL="http://127.0.0.1:${PORT}/"
+
+# The daemon may not be running yet — starting it here means the icon works
+# whether or not the service is enabled.
+if ! curl -sf --max-time 1 "${URL}api/v1/status" >/dev/null 2>&1; then
+    systemctl --user start kaseta.service 2>/dev/null || true
+    for _ in $(seq 1 40); do
+        curl -sf --max-time 1 "${URL}api/v1/status" >/dev/null 2>&1 && break
+        sleep 0.25
+    done
+fi
+
+for browser in chromium google-chrome-stable google-chrome brave microsoft-edge vivaldi; do
+    if command -v "$browser" >/dev/null 2>&1; then
+        exec "$browser" --app="$URL" --class=kaseta
+    fi
+done
+
+# Firefox has no application mode; a dedicated window is the closest it offers.
+if command -v firefox >/dev/null 2>&1; then
+    exec firefox --new-window "$URL"
+fi
+
+exec xdg-open "$URL"

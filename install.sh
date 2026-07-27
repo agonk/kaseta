@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Installs Kaseta for the current user.
+#
+# Everything goes under $HOME: no root, no system directories. Recording is a
+# per-user activity that needs the user's own audio session, so installing it
+# system-wide would be both unnecessary and wrong.
+set -euo pipefail
+
+BIN_DIR="$HOME/.local/bin"
+APP_DIR="$HOME/.local/share/applications"
+ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
+UNIT_DIR="$HOME/.config/systemd/user"
+CONF_DIR="$HOME/.config/kaseta"
+DATA_DIR="$HOME/.local/share/kaseta"
+
+here() { cd "$(dirname "${BASH_SOURCE[0]}")" && pwd; }
+ROOT="$(here)"
+
+say() { printf '\033[1m%s\033[0m\n' "$*"; }
+warn() { printf '\033[33m%s\033[0m\n' "$*"; }
+
+say "Building…"
+cargo build --release -p kasetad
+
+mkdir -p "$BIN_DIR" "$APP_DIR" "$ICON_DIR" "$UNIT_DIR" "$CONF_DIR" "$DATA_DIR"
+
+install -m755 "$ROOT/target/release/kasetad" "$BIN_DIR/kasetad"
+install -m755 "$ROOT/packaging/kaseta-open" "$BIN_DIR/kaseta-open"
+install -m644 "$ROOT/packaging/kaseta.desktop" "$APP_DIR/kaseta.desktop"
+install -m644 "$ROOT/packaging/kaseta.svg" "$ICON_DIR/kaseta.svg"
+install -m644 "$ROOT/packaging/kaseta.service" "$UNIT_DIR/kaseta.service"
+
+# Created empty rather than overwritten: it holds the summariser key, and
+# reinstalling must not discard it.
+if [ ! -f "$CONF_DIR/env" ]; then
+    cat > "$CONF_DIR/env" <<'ENV'
+# Summaries are produced through OpenRouter. Without a key, recordings are still
+# captured and transcribed — only the summary is skipped.
+# KASETA_OPENROUTER_KEY=sk-or-...
+# KASETA_OPENROUTER_MODEL=anthropic/claude-3.5-haiku
+ENV
+    chmod 600 "$CONF_DIR/env"
+fi
+
+# The transcription worker lives in its own virtual environment: it needs
+# Python, and mixing it into the system site-packages would be antisocial.
+if [ ! -x "$ROOT/worker/.venv/bin/python" ]; then
+    say "Setting up the transcription worker…"
+    python3 -m venv "$ROOT/worker/.venv"
+    "$ROOT/worker/.venv/bin/pip" install -q -e "$ROOT/worker"
+fi
+grep -q KASETA_WORKER_PYTHON "$CONF_DIR/env" 2>/dev/null || \
+    echo "KASETA_WORKER_PYTHON=$ROOT/worker/.venv/bin/python" >> "$CONF_DIR/env"
+
+update-desktop-database "$APP_DIR" 2>/dev/null || true
+gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+
+systemctl --user daemon-reload
+systemctl --user enable --now kaseta.service
+
+say ""
+say "Kaseta is installed."
+printf '  %-22s %s\n' "Application:" "in your launcher, as “Kaseta”"
+printf '  %-22s %s\n' "Recordings:" "$DATA_DIR"
+printf '  %-22s %s\n' "Summaries:" "add a key to $CONF_DIR/env"
+say ""
+
+if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
+    warn "Note: $BIN_DIR is not on your PATH."
+    warn "The launcher works regardless; only the kasetad command needs it."
+fi
+
+systemctl --user is-active --quiet kaseta.service \
+    && say "The recorder is running." \
+    || warn "The service did not start; see: journalctl --user -u kaseta -n 30"

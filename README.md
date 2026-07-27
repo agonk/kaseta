@@ -53,6 +53,45 @@ docs/
 
 ## Install
 
+```bash
+git clone git@github.com:agonk/kaseta.git
+cd kaseta
+./install.sh
+```
+
+That builds Kaseta, installs it under `~/.local`, sets up the transcription
+worker, and enables the recorder as a user service so it starts with your
+session. **Kaseta** then appears in your launcher as an ordinary application,
+with its own window and icon. Nothing runs as root and nothing is written
+outside your home directory.
+
+To enable summaries, add an OpenRouter key to `~/.config/kaseta/env`. Without
+one, meetings are still recorded and transcribed — only the summary is skipped.
+
+### What it installs
+
+| | |
+|---|---|
+| `~/.local/bin/kasetad` | the recorder |
+| `~/.local/share/applications/kaseta.desktop` | launcher entry |
+| `~/.config/systemd/user/kaseta.service` | starts it with your session |
+| `~/.local/share/kaseta/` | recordings, transcripts, database |
+| `~/.config/kaseta/env` | API key, kept out of the repo and the database |
+
+### Uninstall
+
+```bash
+systemctl --user disable --now kaseta.service
+rm -f ~/.local/bin/kasetad ~/.local/bin/kaseta-open \
+      ~/.local/share/applications/kaseta.desktop \
+      ~/.config/systemd/user/kaseta.service
+```
+
+Recordings in `~/.local/share/kaseta/` are left alone; delete that directory
+too if you want them gone.
+
+## Build prerequisites
+
 Kaseta needs a Rust toolchain, a C compiler toolchain for the PipeWire bindings,
 and PipeWire itself.
 
@@ -98,13 +137,18 @@ cargo --version
 Nothing else is vendored in: SQLite is compiled from source by `rusqlite`, so the
 first build is slow and later ones are incremental.
 
-## Run
+## Command line
+
+Everything the application does is also available directly, which is useful for
+diagnosing a machine that cannot record.
 
 ```bash
 cargo run -p kasetad -- doctor     # can this machine record?
 cargo run -p kasetad -- devices    # what can it record from?
 cargo run -p kasetad -- record 60  # record both sides for 60 seconds
-cargo test                         # 70 tests, no audio hardware needed
+cargo run -p kasetad -- transcribe # transcribe the most recent recording
+cargo run -p kasetad -- serve      # run the daemon and its interface
+cargo test                         # no audio hardware needed
 ```
 
 `doctor` reports whether both a microphone and a playback monitor are present —

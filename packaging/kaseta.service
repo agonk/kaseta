@@ -1,0 +1,35 @@
+# Kaseta recording daemon, as a user service.
+#
+# A user service rather than a system one: it needs the user's PipeWire session,
+# which does not exist for a system daemon, and it records that user's audio —
+# running it with wider privileges would be wrong regardless.
+
+[Unit]
+Description=Kaseta meeting recorder
+Documentation=https://github.com/agonk/kaseta
+# PipeWire must exist before capture can open anything.
+After=pipewire.service pipewire-pulse.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/kasetad serve
+Restart=on-failure
+RestartSec=3
+
+# Recordings live under the user's data directory rather than a working
+# directory, so they survive wherever the service is started from.
+Environment=KASETA_DATA=%h/.local/share/kaseta
+Environment=KASETA_LOG=kasetad=info
+
+# The transcription worker and the summariser key are read from here if present.
+# A separate file so a credential is not baked into the unit, which is
+# world-readable.
+EnvironmentFile=-%h/.config/kaseta/env
+
+# Recording is not latency-critical, but it should not be starved by a compile
+# running in the background either.
+Nice=-5
+
+[Install]
+WantedBy=default.target

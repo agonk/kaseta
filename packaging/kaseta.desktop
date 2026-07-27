@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Kaseta
+GenericName=Meeting Recorder
+Comment=Record, transcribe and summarise meetings
+# Opens the daemon's interface in its own window rather than a browser tab:
+# no address bar, its own icon, and its own entry when switching windows.
+Exec=kaseta-open
+Icon=kaseta
+Terminal=false
+Categories=AudioVideo;Audio;Recorder;
+Keywords=meeting;record;transcribe;summary;
+StartupWMClass=kaseta
