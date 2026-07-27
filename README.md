@@ -198,7 +198,7 @@ transcript depends on.
 | `KASETA_PORT` | `7777` | Port the interface is served on |
 | `KASETA_WORKER_PYTHON` | `worker/.venv/bin/python` | Interpreter with the transcription worker |
 | `KASETA_OPENROUTER_KEY` | — | Enables summaries; without it they are skipped |
-| `KASETA_OPENROUTER_MODEL` | `anthropic/claude-3.5-haiku` | Model used for summaries |
+| `KASETA_OPENROUTER_MODEL` | `anthropic/claude-haiku-4.5` | Model used for summaries |
 
 Most of these are better set in **Settings**, which writes them to
 `~/.config/kaseta/settings.json` with owner-only permissions. Credentials are

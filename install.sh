@@ -49,7 +49,7 @@ if [ ! -f "$CONF_DIR/env" ]; then
 # Summaries are produced through OpenRouter. Without a key, recordings are still
 # captured and transcribed — only the summary is skipped.
 # KASETA_OPENROUTER_KEY=sk-or-...
-# KASETA_OPENROUTER_MODEL=anthropic/claude-3.5-haiku
+# KASETA_OPENROUTER_MODEL=anthropic/claude-haiku-4.5
 ENV
     chmod 600 "$CONF_DIR/env"
 fi

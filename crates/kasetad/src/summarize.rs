@@ -31,7 +31,12 @@ const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 /// Default model. Chosen for being cheap and fast enough to run after every
 /// meeting without thinking about cost, while still following instructions
 /// reliably enough to produce structured output.
-pub const DEFAULT_MODEL: &str = "anthropic/claude-3.5-haiku";
+///
+/// A transcript is a low-quality input — recognition errors, no punctuation
+/// from the speaker, crosstalk — so the model's job is as much not inventing
+/// detail as it is condensing. That argues for instruction-following over raw
+/// capability, which is what puts a small model here rather than a large one.
+pub const DEFAULT_MODEL: &str = "anthropic/claude-haiku-4.5";
 
 /// Roughly how many characters of transcript go into one request.
 ///
