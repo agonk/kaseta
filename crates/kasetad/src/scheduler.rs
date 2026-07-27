@@ -374,9 +374,27 @@ fn execute(
                 );
             }
 
+            // Chunks are also what transcription reads: the model's input is
+            // rebuilt from them, not from the exports. Backup no longer waits
+            // for transcription, so an upload can now arrive first — and
+            // removing the chunks then would leave the recording safely in the
+            // bucket and permanently untranscribable here.
+            //
+            // Waiting for the transcript costs one more pass; the flag stays
+            // set, and the next sweep deletes them once there is one.
+            let transcribed = {
+                let guard = db.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+                crate::library::transcript(&guard, recording_id)?.is_some()
+            };
+
             // Only after every object is confirmed present: deleting on a
             // partial upload would destroy the only complete copy.
-            if settings.remote_storage.delete_local_after_upload {
+            if settings.remote_storage.delete_local_after_upload && !transcribed {
+                tracing::info!(
+                    %recording_id,
+                    "keeping local audio until it has been transcribed"
+                );
+            } else if may_delete_local(&settings, transcribed) {
                 for key in &keys {
                     // Chunks only. The mixed export stays, and it is what the
                     // player reads — there is no path that streams audio back
@@ -433,6 +451,19 @@ fn load_manifest(
 
 /// Records how a job ended, and queues the next stage when it succeeded.
 /// What follows a finished stage, if anything.
+/// Whether a backed-up recording's local chunks may now be removed.
+///
+/// The chunks are two things at once: the recording, and transcription's input.
+/// Backup no longer waits for transcription, so "it is in the bucket" is no
+/// longer sufficient — removing them before a transcript exists leaves the
+/// recording safe remotely and permanently unprocessable here.
+///
+/// Deferring costs nothing. Writing a transcript marks the recording as
+/// changed, which brings it round for another upload, and the chunks go then.
+fn may_delete_local(settings: &crate::config::Settings, transcribed: bool) -> bool {
+    settings.remote_storage.delete_local_after_upload && transcribed
+}
+
 fn next_stage(job_type: JobType) -> Option<JobType> {
     match job_type {
         JobType::Transcribe => Some(JobType::Summarize),
@@ -694,6 +725,29 @@ mod tests {
             .unwrap()
             .expect("a plain-http endpoint is not usable");
         assert!(reason.contains("https"), "got: {reason}");
+    }
+
+    /// Backup used to run only after transcription, so a transcript always
+    /// existed by the time local audio was removed. It no longer does, and the
+    /// chunks are transcription's input — deleting them first would leave a
+    /// recording that is backed up and can never be processed here again.
+    #[test]
+    fn local_audio_is_kept_until_there_is_a_transcript() {
+        let mut settings = crate::config::Settings::default();
+        settings.remote_storage.delete_local_after_upload = true;
+
+        assert!(
+            !may_delete_local(&settings, false),
+            "an untranscribed recording must keep the audio transcription needs"
+        );
+        assert!(may_delete_local(&settings, true));
+    }
+
+    #[test]
+    fn local_audio_is_never_removed_unless_asked_for() {
+        let settings = crate::config::Settings::default();
+        assert!(!may_delete_local(&settings, true));
+        assert!(!may_delete_local(&settings, false));
     }
 
     /// Transcription depends on nothing that can be configured wrongly, so it
