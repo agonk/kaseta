@@ -9,7 +9,12 @@ call, or audio leaving the machine.
 ## What it does
 
 Records a meeting, transcribes it locally, and summarises it. Start and stop
-from the application window; the transcript and summary appear on their own.
+from the window or a keyboard shortcut; the transcript and summary appear on
+their own.
+
+Optionally backs recordings up to S3-compatible storage — Cloudflare R2,
+Backblaze, MinIO — and expires old ones on a policy you set, either deleting
+them outright or keeping the transcript and discarding the audio.
 
 Records your microphone and your system playback as **two separate tracks**.
 That separation is the design's centre of gravity: everything on the microphone
@@ -44,6 +49,10 @@ computed from measured time. Drift stays correctable rather than baked in.
 captured. A daemon killed mid-recording loses at most the chunk in flight, and
 jobs orphaned by the crash are swept back onto the queue at startup.
 
+**Devices can come and go.** Unplugging a headset mid-meeting reattaches capture
+rather than ending that track. The gap is recorded as a discontinuity and padded,
+so everything afterwards keeps its true position on the timeline.
+
 ## Layout
 
 ```
@@ -71,10 +80,14 @@ session. **Kaseta** then appears in your launcher as an ordinary application,
 with its own window and icon. Nothing runs as root and nothing is written
 outside your home directory.
 
-To enable summaries, open **Settings** in the application and paste an
-[OpenRouter](https://openrouter.ai/keys) key. Without one, meetings are still
-recorded and transcribed — only the summary is skipped. Cloud backup is
-configured in the same place.
+Open **Settings** in the application to configure everything: an
+[OpenRouter](https://openrouter.ai/keys) key for summaries, S3-compatible cloud
+backup, and how long recordings are kept. Without a key, meetings are still
+recorded and transcribed — only the summary is skipped.
+
+Recording can also be started without opening the window. Bind
+`kaseta-tray toggle` to a key in your desktop's shortcut settings, or use the
+**Kaseta — Start or stop recording** entry your launcher now has.
 
 Credentials are written to `~/.config/kaseta/settings.json`, readable only by
 you, and deliberately **not** in the data directory — that is the directory
@@ -186,6 +199,11 @@ transcript depends on.
 | `KASETA_WORKER_PYTHON` | `worker/.venv/bin/python` | Interpreter with the transcription worker |
 | `KASETA_OPENROUTER_KEY` | — | Enables summaries; without it they are skipped |
 | `KASETA_OPENROUTER_MODEL` | `anthropic/claude-3.5-haiku` | Model used for summaries |
+
+Most of these are better set in **Settings**, which writes them to
+`~/.config/kaseta/settings.json` with owner-only permissions. Credentials are
+deliberately kept out of the data directory, since that is what cloud backup
+uploads.
 
 Installed setups read these from `~/.config/kaseta/env`. The environment wins
 over anything saved in Settings, so a key exported for a one-off run is not
