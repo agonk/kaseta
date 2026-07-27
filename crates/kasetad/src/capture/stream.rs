@@ -17,7 +17,7 @@ use std::thread::JoinHandle;
 
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use pipewire::spa;
 use pipewire::spa::pod::Pod;
 
@@ -192,8 +192,11 @@ fn run_with_reconnect(
 }
 
 /// Per-stream state shared between the PipeWire callbacks.
+///
+/// Named to avoid colliding with PipeWire's own `StreamState`, which describes
+/// the connection rather than what has been captured.
 #[derive(Default)]
-struct StreamState {
+struct StreamCapture {
     format: spa::param::audio::AudioInfoRaw,
     negotiated: bool,
 }
@@ -236,8 +239,31 @@ fn run_capture_loop(
     let events_for_format = events.clone();
     let events_for_process = events.clone();
 
+    let ended = Arc::new(AtomicBool::new(false));
+    let ended_flag = Arc::clone(&ended);
+    let state_quit = mainloop.clone();
+
     let _listener = stream
-        .add_local_listener_with_user_data(StreamState::default())
+        .add_local_listener_with_user_data(StreamCapture::default())
+        .state_changed(move |_, _, _old, new| {
+            // A device disappearing moves the stream out of Streaming without
+            // anything else noticing. Nothing else exits the loop on that path,
+            // so without this the track would stay silently dead for the rest
+            // of the meeting instead of being reattached.
+            match new {
+                pipewire::stream::StreamState::Error(ref reason) => {
+                    tracing::warn!(%reason, "capture stream errored");
+                    ended_flag.store(true, Ordering::SeqCst);
+                    state_quit.quit();
+                }
+                pipewire::stream::StreamState::Unconnected => {
+                    tracing::warn!("capture stream disconnected");
+                    ended_flag.store(true, Ordering::SeqCst);
+                    state_quit.quit();
+                }
+                _ => {}
+            }
+        })
         .param_changed(move |_, state, id, param| {
             let Some(param) = param else { return };
             if id != spa::param::ParamType::Format.as_raw() {
@@ -375,6 +401,11 @@ fn run_capture_loop(
     let _ = stream.flush(true);
     let _ = stream.disconnect();
 
+    // Distinguishes "the device went away" from "we were asked to stop", which
+    // is what decides whether to reattach.
+    if ended.load(Ordering::SeqCst) && !stopping.load(Ordering::SeqCst) {
+        bail!("the capture device stopped providing audio");
+    }
     Ok(())
 }
 

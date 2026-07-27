@@ -26,7 +26,10 @@ mkdir -p "$BIN_DIR" "$APP_DIR" "$ICON_DIR" "$UNIT_DIR" "$CONF_DIR" "$DATA_DIR"
 
 install -m755 "$ROOT/target/release/kasetad" "$BIN_DIR/kasetad"
 install -m755 "$ROOT/packaging/kaseta-open" "$BIN_DIR/kaseta-open"
-install -m644 "$ROOT/packaging/kaseta.desktop" "$APP_DIR/kaseta.desktop"
+# The desktop session's PATH may not include ~/.local/bin, so the entry points
+# at the launcher absolutely rather than by name.
+sed "s|__BIN_DIR__|$BIN_DIR|" "$ROOT/packaging/kaseta.desktop" > "$APP_DIR/kaseta.desktop"
+chmod 644 "$APP_DIR/kaseta.desktop"
 install -m644 "$ROOT/packaging/kaseta.svg" "$ICON_DIR/kaseta.svg"
 install -m644 "$ROOT/packaging/kaseta.service" "$UNIT_DIR/kaseta.service"
 
@@ -49,14 +52,25 @@ if [ ! -x "$ROOT/worker/.venv/bin/python" ]; then
     python3 -m venv "$ROOT/worker/.venv"
     "$ROOT/worker/.venv/bin/pip" install -q -e "$ROOT/worker"
 fi
-grep -q KASETA_WORKER_PYTHON "$CONF_DIR/env" 2>/dev/null || \
-    echo "KASETA_WORKER_PYTHON=$ROOT/worker/.venv/bin/python" >> "$CONF_DIR/env"
+# Replaced rather than only appended when missing: moving or recloning the repo
+# would otherwise leave this pointing at a virtual environment that no longer
+# exists, and transcription would fail much later with a confusing error.
+sed -i '/^KASETA_WORKER_PYTHON=/d' "$CONF_DIR/env"
+echo "KASETA_WORKER_PYTHON=$ROOT/worker/.venv/bin/python" >> "$CONF_DIR/env"
 
 update-desktop-database "$APP_DIR" 2>/dev/null || true
 gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
 
-systemctl --user daemon-reload
-systemctl --user enable --now kaseta.service
+# Activation needs a reachable user manager. Under sudo, over SSH without a user
+# bus, or on a non-systemd session there is none, and running these under `set
+# -e` would abort with a raw bus error after everything was already installed.
+if systemctl --user show-environment >/dev/null 2>&1; then
+    systemctl --user daemon-reload
+    systemctl --user enable --now kaseta.service
+    ACTIVATED=1
+else
+    ACTIVATED=0
+fi
 
 say ""
 say "Kaseta is installed."
@@ -70,6 +84,12 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
     warn "The launcher works regardless; only the kasetad command needs it."
 fi
 
-systemctl --user is-active --quiet kaseta.service \
-    && say "The recorder is running." \
-    || warn "The service did not start; see: journalctl --user -u kaseta -n 30"
+if [ "$ACTIVATED" -eq 0 ]; then
+    warn "No systemd user session was reachable, so the recorder was not started."
+    warn "Run this from your desktop session, or start it yourself:"
+    warn "  systemctl --user enable --now kaseta.service"
+elif systemctl --user is-active --quiet kaseta.service; then
+    say "The recorder is running."
+else
+    warn "The service did not start; see: journalctl --user -u kaseta -n 30"
+fi

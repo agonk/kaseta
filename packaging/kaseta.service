@@ -27,9 +27,5 @@ Environment=KASETA_LOG=kasetad=info
 # world-readable.
 EnvironmentFile=-%h/.config/kaseta/env
 
-# Recording is not latency-critical, but it should not be starved by a compile
-# running in the background either.
-Nice=-5
-
 [Install]
 WantedBy=default.target

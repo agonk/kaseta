@@ -427,6 +427,12 @@ fn spawn_collector(
                             channels,
                             "capture format negotiated"
                         );
+                        // Negotiating again means the stream came back, so the
+                        // track is no longer waiting on a device.
+                        if let Ok(mut h) = health.lock() {
+                            h.reconnecting.remove(&spec.track_id);
+                        }
+
                         acc.sample_rate_hz = Some(sample_rate_hz);
                         acc.channels = Some(channels);
 
