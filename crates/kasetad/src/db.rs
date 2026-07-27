@@ -18,7 +18,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use ulid::Ulid;
 
 /// Bumped whenever the schema changes. Migrations run in order at startup.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// The single local user. Present so every query is already scoped by owner and
 /// adding real accounts does not mean rewriting them.
@@ -87,6 +87,11 @@ impl Db {
                 .execute_batch(include_str!("migrations/003_exports.sql"))
                 .context("applying migration 003_exports")?;
         }
+        if current < 4 {
+            self.conn
+                .execute_batch(include_str!("migrations/004_backoff.sql"))
+                .context("applying migration 004_backoff")?;
+        }
 
         self.conn
             .pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -131,7 +136,10 @@ impl Db {
 
         let candidate: Option<String> = tx
             .query_row(
-                "SELECT id FROM jobs WHERE state = ?1 ORDER BY enqueue_seq ASC LIMIT 1",
+                "SELECT id FROM jobs
+                 WHERE state = ?1
+                   AND (next_attempt_at IS NULL OR next_attempt_at <= strftime('%s','now'))
+                 ORDER BY enqueue_seq ASC LIMIT 1",
                 params![JobState::Queued.as_str()],
                 |r| r.get(0),
             )
@@ -199,22 +207,59 @@ impl Db {
         };
         job.transition(next)?;
 
+        // Back off so a permanently broken job does not consume its whole
+        // budget in the time it takes to notice. Doubling from a minute gives
+        // 1, 2, 4 — long enough to fix a missing worker, short enough that a
+        // transient error still clears on its own.
+        let delay_s = 60i64 * (1 << job.attempt.min(6));
+
         tx.execute(
-            "UPDATE jobs SET state = ?1, worker_pid = NULL, error_code = ?2, error_message = ?3
-             WHERE id = ?4",
-            params![next.as_str(), code, message, id.to_string()],
+            "UPDATE jobs SET state = ?1, worker_pid = NULL, error_code = ?2, error_message = ?3,
+                    next_attempt_at = strftime('%s','now') + ?4
+             WHERE id = ?5",
+            params![next.as_str(), code, message, delay_s, id.to_string()],
         )?;
         tx.commit()?;
         Ok(next)
     }
 
     /// Returns retryable failures to the queue.
+    /// Returns retryable failures to the queue once their backoff has elapsed.
     pub fn requeue_retryable(&self) -> Result<usize> {
         Ok(self.conn.execute(
             "UPDATE jobs SET state = ?1, error_code = NULL, error_message = NULL
-             WHERE state = ?2 AND attempt < max_attempts",
+             WHERE state = ?2 AND attempt < max_attempts
+               AND (next_attempt_at IS NULL OR next_attempt_at <= strftime('%s','now'))",
             params![JobState::Queued.as_str(), JobState::FailedRetryable.as_str()],
         )?)
+    }
+
+    /// Queues a job only if an equivalent one is not already pending.
+    ///
+    /// Stage chaining and crash recovery can otherwise both queue the same
+    /// follow-up work, which for a paid API means paying twice.
+    pub fn enqueue_once(
+        &self,
+        recording_id: Ulid,
+        job_type: JobType,
+        revision: u32,
+    ) -> Result<Option<Ulid>> {
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM jobs
+                 WHERE recording_id = ?1 AND job_type = ?2 AND revision = ?3
+                   AND state IN ('queued','running','failed_retryable','succeeded')
+                 LIMIT 1",
+                params![recording_id.to_string(), job_type.as_str(), revision],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        if existing.is_some() {
+            return Ok(None);
+        }
+        self.enqueue(recording_id, job_type, revision).map(Some)
     }
 
     /// Recovers jobs orphaned by a daemon that died mid-flight.
@@ -339,6 +384,17 @@ fn parse_job_state(s: &str) -> Result<JobState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Simulates the backoff having elapsed, so retry behaviour is testable
+    /// without waiting minutes.
+    fn elapse_backoff(db: &Db, id: Ulid) {
+        db.conn
+            .execute(
+                "UPDATE jobs SET next_attempt_at = NULL WHERE id = ?1",
+                params![id.to_string()],
+            )
+            .unwrap();
+    }
 
     fn db_with_recording() -> (Db, Ulid) {
         let db = Db::open_in_memory().unwrap();
@@ -478,11 +534,87 @@ mod tests {
             db.fail_job(id, "net", "connection reset", true).unwrap(),
             JobState::FailedRetryable
         );
+
+        // Backed off: retrying instantly would burn the whole budget in the
+        // time it takes anyone to notice the failure.
+        assert_eq!(
+            db.requeue_retryable().unwrap(),
+            0,
+            "a just-failed job must wait before being retried"
+        );
+
+        elapse_backoff(&db, id);
         assert_eq!(db.requeue_retryable().unwrap(), 1);
 
         let job = Db::load_job(&db.conn, &id.to_string()).unwrap().unwrap();
         assert_eq!(job.state, JobState::Queued);
         assert_eq!(job.error_code, None, "requeue must clear the stale error");
+    }
+
+    #[test]
+    fn a_failed_job_is_not_reclaimable_until_its_backoff_elapses() {
+        let (db, rec) = db_with_recording();
+        let id = db.enqueue(rec, JobType::Transcribe, 1).unwrap();
+
+        db.claim_next_job(1).unwrap();
+        db.fail_job(id, "net", "connection reset", true).unwrap();
+        db.requeue_retryable().unwrap();
+
+        assert!(
+            db.claim_next_job(2).unwrap().is_none(),
+            "a backed-off job must not be claimed immediately"
+        );
+
+        elapse_backoff(&db, id);
+        db.requeue_retryable().unwrap();
+        assert!(db.claim_next_job(3).unwrap().is_some());
+    }
+
+    #[test]
+    fn backoff_grows_with_each_attempt() {
+        let (db, rec) = db_with_recording();
+        let id = db.enqueue(rec, JobType::Transcribe, 1).unwrap();
+
+        let mut delays = Vec::new();
+        for _ in 0..2 {
+            db.claim_next_job(1).unwrap();
+            db.fail_job(id, "net", "again", true).unwrap();
+            let at: i64 = db
+                .conn
+                .query_row(
+                    "SELECT next_attempt_at - strftime('%s','now') FROM jobs WHERE id = ?1",
+                    params![id.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            delays.push(at);
+            elapse_backoff(&db, id);
+            db.requeue_retryable().unwrap();
+        }
+
+        assert!(
+            delays[1] > delays[0],
+            "each failure should wait longer: {delays:?}"
+        );
+    }
+
+    #[test]
+    fn queueing_the_same_stage_twice_does_nothing() {
+        // Stage chaining and crash recovery can both try to queue the same
+        // follow-up, which for a paid API means paying twice.
+        let (db, rec) = db_with_recording();
+        assert!(db.enqueue_once(rec, JobType::Summarize, 1).unwrap().is_some());
+        assert!(db.enqueue_once(rec, JobType::Summarize, 1).unwrap().is_none());
+
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE recording_id = ?1 AND job_type = 'summarize'",
+                params![rec.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]

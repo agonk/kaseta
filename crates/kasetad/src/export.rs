@@ -66,6 +66,12 @@ struct TrackReader<'a> {
     channels: u16,
     /// Decoded samples not yet consumed by the caller.
     buffer: std::collections::VecDeque<i16>,
+    /// Silence still owed before the next chunk's audio.
+    ///
+    /// Held as a count rather than expanded into the buffer: a long dropout
+    /// would otherwise allocate minutes of zeroes at once, which is exactly the
+    /// unbounded allocation streaming exists to avoid.
+    pending_silence: usize,
     padded_frames: u64,
 }
 
@@ -88,6 +94,7 @@ impl<'a> TrackReader<'a> {
             sample_rate,
             channels: track.format.channels.unwrap_or(1).max(1),
             buffer: std::collections::VecDeque::new(),
+            pending_silence: 0,
             padded_frames: 0,
         })
     }
@@ -115,11 +122,11 @@ impl<'a> TrackReader<'a> {
         self.next += 1;
 
         // Silence stands in for audio that never reached us, so everything
-        // after a dropout keeps its true position on the timeline.
+        // after a dropout keeps its true position on the timeline. Recorded as
+        // a count and emitted as the caller asks for it.
         if chunk.gap_before_ns > 0 {
             let missing = ns_to_frames(chunk.gap_before_ns, self.sample_rate);
-            self.buffer
-                .extend(std::iter::repeat_n(0i16, missing as usize * self.channels as usize));
+            self.pending_silence += missing as usize * self.channels as usize;
             self.padded_frames += missing;
         }
 
@@ -134,14 +141,33 @@ impl<'a> TrackReader<'a> {
     }
 
     /// Takes up to `want` interleaved samples, decoding more as needed.
+    ///
+    /// Never returns more than asked for, and never holds more than one chunk
+    /// plus the remainder of the current request.
     fn take(&mut self, want: usize) -> Result<Vec<i16>> {
-        while self.buffer.len() < want {
+        let mut out = Vec::with_capacity(want);
+
+        while out.len() < want {
+            // Owed silence is produced a request at a time, so a long dropout
+            // costs no memory beyond what was asked for.
+            if self.pending_silence > 0 {
+                let n = (want - out.len()).min(self.pending_silence);
+                out.extend(std::iter::repeat_n(0i16, n));
+                self.pending_silence -= n;
+                continue;
+            }
+
+            if !self.buffer.is_empty() {
+                let n = (want - out.len()).min(self.buffer.len());
+                out.extend(self.buffer.drain(..n));
+                continue;
+            }
+
             if !self.pull_chunk()? {
                 break;
             }
         }
-        let n = want.min(self.buffer.len());
-        Ok(self.buffer.drain(..n).collect())
+        Ok(out)
     }
 }
 
@@ -431,6 +457,16 @@ pub fn write_asr_audio(
     track: &Track,
     prefix: &kaseta_contracts::RecordingPrefix,
 ) -> Result<BlobKey> {
+    let key = prefix
+        .export(&format!("{}.asr.wav", track.track_id))
+        .context("building transcription audio key")?;
+
+    // Rebuilding this decodes and resamples the whole track, and a retry would
+    // repeat that work for no gain: the chunks it derives from are immutable.
+    if store.exists(&key).unwrap_or(false) {
+        return Ok(key);
+    }
+
     let mut reader = TrackReader::new(store, track)?;
     let source_rate = reader.sample_rate;
     let channels = reader.channels;
@@ -450,10 +486,6 @@ pub fn write_asr_audio(
     }
 
     let wav = encode_wav(&resampled, ASR_SAMPLE_RATE_HZ);
-
-    let key = prefix
-        .export(&format!("{}.asr.wav", track.track_id))
-        .context("building transcription audio key")?;
     store
         .put(&key, &wav)
         .with_context(|| format!("writing transcription audio for {}", track.track_id))?;

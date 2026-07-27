@@ -79,7 +79,7 @@ fn run(
         match claim(&db) {
             Ok(Some(job)) => {
                 let outcome = execute(&*store, &db, &storage_root, job.job_type, job.recording_id);
-                finish(&db, job.id, job.job_type, outcome);
+                finish(&db, job.id, job.job_type, job.recording_id, outcome);
             }
             Ok(None) => std::thread::sleep(IDLE_POLL),
             Err(e) => {
@@ -109,17 +109,15 @@ fn execute(
 
     match job_type {
         JobType::Transcribe => {
+            // Deliberately outside any lock: this spawns a child process and can
+            // run as long as the meeting did. Holding the database meanwhile
+            // would stall every request and every other job behind it.
+            let transcription = crate::transcribe::transcribe(store, storage_root, &manifest)?;
+
             let guard = db.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
             let segments =
-                crate::transcribe::transcribe_recording(store, &guard, storage_root, &manifest)?;
+                crate::transcribe::store_transcript(&guard, recording_id, &transcription)?;
             tracing::info!(%recording_id, segments, "transcribed");
-
-            // Summarising is queued rather than called directly so a provider
-            // outage retries on its own schedule instead of failing the
-            // transcription that already succeeded.
-            if segments > 0 {
-                guard.enqueue(recording_id, JobType::Summarize, 1)?;
-            }
             Ok(())
         }
         JobType::Summarize => {
@@ -189,7 +187,21 @@ fn load_manifest(
 }
 
 /// Records how a job ended, and queues the next stage when it succeeded.
-fn finish(db: &Arc<Mutex<Db>>, job_id: Ulid, job_type: JobType, outcome: Result<()>) {
+/// What follows a finished stage, if anything.
+fn next_stage(job_type: JobType) -> Option<JobType> {
+    match job_type {
+        JobType::Transcribe => Some(JobType::Summarize),
+        _ => None,
+    }
+}
+
+fn finish(
+    db: &Arc<Mutex<Db>>,
+    job_id: Ulid,
+    job_type: JobType,
+    recording_id: Ulid,
+    outcome: Result<()>,
+) {
     let Ok(guard) = db.lock() else {
         tracing::error!("database lock poisoned; job state not recorded");
         return;
@@ -199,6 +211,18 @@ fn finish(db: &Arc<Mutex<Db>>, job_id: Ulid, job_type: JobType, outcome: Result<
         Ok(()) => {
             if let Err(e) = guard.transition_job(job_id, JobState::Succeeded) {
                 tracing::error!(error = %format!("{e:#}"), "could not record success");
+                return;
+            }
+            // Chained only after the current stage is durably successful, and
+            // only once. Enqueueing from inside the stage let a crash in the
+            // gap leave the follow-up queued while the stage itself was
+            // requeued, doubling paid work on restart.
+            if let Some(next) = next_stage(job_type) {
+                match guard.enqueue_once(recording_id, next, 1) {
+                    Ok(Some(_)) => tracing::debug!(?next, "queued next stage"),
+                    Ok(None) => tracing::debug!(?next, "next stage already queued"),
+                    Err(e) => tracing::error!(error = %format!("{e:#}"), "could not queue next stage"),
+                }
             }
         }
         Err(e) => {
@@ -253,11 +277,17 @@ mod tests {
             enqueue_for_recording(&guard, rec).unwrap();
         }
 
-        // Fail it as many times as the budget allows.
+        // Fail it as many times as the budget allows. Backoff is skipped so the
+        // test does not have to wait minutes for what it is actually checking.
         let mut attempts = 0;
         while let Some(job) = claim(&db).unwrap() {
-            finish(&db, job.id, job.job_type, Err(anyhow::anyhow!("worker missing")));
+            finish(&db, job.id, job.job_type, rec, Err(anyhow::anyhow!("worker missing")));
             attempts += 1;
+            db.lock()
+                .unwrap()
+                .conn()
+                .execute("UPDATE jobs SET next_attempt_at = NULL", [])
+                .unwrap();
             if attempts > 10 {
                 panic!("a permanently failing job must stop being retried");
             }
@@ -271,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn a_successful_job_is_not_claimed_again() {
+    fn a_successful_stage_queues_the_next_one_exactly_once() {
         let (db, rec) = db_with_recording();
         {
             let guard = db.lock().unwrap();
@@ -279,12 +309,44 @@ mod tests {
         }
 
         let job = claim(&db).unwrap().unwrap();
-        finish(&db, job.id, job.job_type, Ok(()));
+        assert_eq!(job.job_type, JobType::Transcribe);
+        finish(&db, job.id, job.job_type, rec, Ok(()));
 
+        let next = claim(&db).unwrap().expect("transcription should queue a summary");
+        assert_eq!(next.job_type, JobType::Summarize);
+        assert_ne!(next.id, job.id, "the finished job must not be reclaimed");
+
+        finish(&db, next.id, next.job_type, rec, Ok(()));
         assert!(
             claim(&db).unwrap().is_none(),
-            "finished work must not be picked up a second time"
+            "nothing follows the last stage"
         );
+    }
+
+    #[test]
+    fn a_failed_stage_does_not_queue_the_next_one() {
+        // Summarising a transcript that was never produced would fail anyway,
+        // and would burn a paid request finding that out.
+        let (db, rec) = db_with_recording();
+        {
+            let guard = db.lock().unwrap();
+            enqueue_for_recording(&guard, rec).unwrap();
+        }
+
+        let job = claim(&db).unwrap().unwrap();
+        finish(&db, job.id, job.job_type, rec, Err(anyhow::anyhow!("no worker")));
+
+        let queued: i64 = db
+            .lock()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE job_type = 'summarize'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(queued, 0);
     }
 
     #[test]

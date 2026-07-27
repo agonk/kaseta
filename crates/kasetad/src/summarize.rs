@@ -40,6 +40,14 @@ pub const DEFAULT_MODEL: &str = "anthropic/claude-3.5-haiku";
 /// extra pass, not a failure.
 const SECTION_CHARS: usize = 24_000;
 
+/// Most sections one recording may be summarised in.
+///
+/// Each section is a paid request, so an unbounded meeting is an unbounded
+/// bill. Forty sections is roughly a day of continuous speech — far past any
+/// real meeting — so hitting this means something is wrong, and the summary is
+/// produced from what fits rather than silently costing more.
+const MAX_SECTIONS: usize = 40;
+
 /// What a summary contains.
 ///
 /// Structured rather than prose so the interface can show decisions and actions
@@ -129,18 +137,64 @@ pub fn split_into_sections(rendered: &str, section_chars: usize) -> Vec<String> 
     let mut current = String::new();
 
     for line in rendered.lines() {
-        if !current.is_empty() && current.len() + line.len() + 1 > section_chars {
-            sections.push(std::mem::take(&mut current));
+        // A single line can exceed the limit on its own — the recogniser
+        // collapses a whole track into one segment when it cannot produce
+        // timings. Splitting only between lines would send that oversized line
+        // as one request anyway, so long lines are cut too.
+        for piece in split_long_line(line, section_chars) {
+            if !current.is_empty() && current.len() + piece.len() + 1 > section_chars {
+                sections.push(std::mem::take(&mut current));
+            }
+            if !current.is_empty() {
+                current.push('\n');
+            }
+            current.push_str(&piece);
         }
-        if !current.is_empty() {
-            current.push('\n');
-        }
-        current.push_str(line);
     }
     if !current.is_empty() {
         sections.push(current);
     }
     sections
+}
+
+/// Cuts an oversized line, preferring a sentence boundary.
+///
+/// Splitting mid-word would corrupt the text the model reads; splitting at a
+/// sentence keeps each piece independently readable.
+fn split_long_line(line: &str, limit: usize) -> Vec<String> {
+    if line.len() <= limit {
+        return vec![line.to_string()];
+    }
+
+    let mut pieces = Vec::new();
+    let mut rest = line;
+
+    while rest.len() > limit {
+        // Slicing at an arbitrary byte index panics on multi-byte text, so walk
+        // back to a character boundary before looking at the window at all.
+        let mut edge = limit.min(rest.len());
+        while edge > 0 && !rest.is_char_boundary(edge) {
+            edge -= 1;
+        }
+        if edge == 0 {
+            break;
+        }
+        // Search backwards from there for somewhere sensible to cut.
+        let window = &rest[..edge];
+        let cut = window
+            .rfind(". ")
+            .map(|i| i + 2)
+            .or_else(|| window.rfind(' ').map(|i| i + 1))
+            .unwrap_or(edge);
+
+        let (head, tail) = rest.split_at(cut);
+        pieces.push(head.trim().to_string());
+        rest = tail;
+    }
+    if !rest.trim().is_empty() {
+        pieces.push(rest.trim().to_string());
+    }
+    pieces
 }
 
 const SYSTEM_PROMPT: &str = "\
@@ -165,10 +219,19 @@ pub fn summarize(config: &SummarizeConfig, transcript: &Transcript) -> Result<Su
     }
 
     let rendered = render(&transcript.lines);
-    let sections = split_into_sections(&rendered, SECTION_CHARS);
+    let mut sections = split_into_sections(&rendered, SECTION_CHARS);
+
+    if sections.len() > MAX_SECTIONS {
+        tracing::warn!(
+            sections = sections.len(),
+            kept = MAX_SECTIONS,
+            "transcript exceeds the summarisation budget; summarising the earlier part"
+        );
+        sections.truncate(MAX_SECTIONS);
+    }
 
     if sections.len() <= 1 {
-        return request(config, &rendered, false);
+        return request(config, sections.first().map(String::as_str).unwrap_or(&rendered), false);
     }
 
     // Condense each section, then summarise the condensations together. The
@@ -422,6 +485,71 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_oversized_single_line_is_split_rather_than_sent_whole() {
+        // The recogniser collapses a track into one segment when it cannot
+        // produce timings, which would otherwise bypass sectioning entirely.
+        let huge = format!("[00:00] Me: {}", "word ".repeat(8_000));
+        let sections = split_into_sections(&huge, 2_000);
+
+        assert!(sections.len() > 1);
+        for section in &sections {
+            assert!(
+                section.len() <= 2_000,
+                "a section of {} exceeds the limit",
+                section.len()
+            );
+        }
+    }
+
+    #[test]
+    fn splitting_a_long_line_does_not_cut_a_word_in_half() {
+        let line = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+        for piece in split_long_line(line, 20) {
+            for word in piece.split_whitespace() {
+                assert!(
+                    line.contains(word),
+                    "{word:?} is not a whole word from the original"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn splitting_prefers_a_sentence_boundary() {
+        let line = "First sentence here. Second sentence follows. Third one too.";
+        let pieces = split_long_line(line, 30);
+        assert!(
+            pieces[0].ends_with('.'),
+            "expected a cut at a sentence end, got {:?}",
+            pieces[0]
+        );
+    }
+
+    #[test]
+    fn splitting_handles_text_with_no_spaces_at_all() {
+        // Must terminate rather than loop, and must not panic on a char
+        // boundary in multi-byte text.
+        let line = "é".repeat(500);
+        let pieces = split_long_line(&line, 40);
+        assert!(pieces.len() > 1);
+        assert_eq!(pieces.concat().chars().count(), 500);
+    }
+
+    #[test]
+    fn splitting_never_slices_a_character_in_half() {
+        // Three-byte characters against an even limit put the cut squarely
+        // inside a character, which slicing by byte index would panic on.
+        let line = "→".repeat(400);
+        let pieces = split_long_line(&line, 50);
+        assert!(pieces.len() > 1);
+        assert_eq!(
+            pieces.concat().chars().count(),
+            400,
+            "no character may be lost or corrupted"
+        );
     }
 
     #[test]

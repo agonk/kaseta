@@ -560,7 +560,8 @@ fn cmd_transcribe(id: Option<String>) -> Result<()> {
     println!("This runs a model on CPU; expect it to take a fraction of the recording's length.\n");
 
     let root = store.root().display().to_string();
-    let segments = transcribe::transcribe_recording(&store, &db, &root, &manifest)?;
+    let transcription = transcribe::transcribe(&store, &root, &manifest)?;
+    let segments = transcribe::store_transcript(&db, manifest.recording_id, &transcription)?;
 
     if segments == 0 {
         println!("No speech was found.");

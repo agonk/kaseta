@@ -48,13 +48,16 @@ pub struct PlacedSegment {
     pub text: String,
 }
 
-/// Transcribes a recording and stores the result.
-pub fn transcribe_recording(
+/// Transcribes a recording, touching no database.
+///
+/// Split from storing so a caller can run this — which spawns a child process
+/// and can take as long as the meeting itself — without holding a lock that
+/// every request and every other job needs.
+pub fn transcribe(
     store: &dyn BlobStore,
-    db: &Db,
     storage_root: &str,
     manifest: &RecordingManifest,
-) -> Result<usize> {
+) -> Result<Transcription> {
     let prefix = kaseta_contracts::RecordingPrefix::new(manifest.recording_id, manifest.started_at);
 
     let mut tracks = Vec::new();
@@ -86,7 +89,11 @@ pub fn transcribe_recording(
     }
 
     if tracks.is_empty() {
-        return Ok(0);
+        return Ok(Transcription {
+            segments: Vec::new(),
+            engine: None,
+            language: None,
+        });
     }
 
     let spec = TranscribeSpec::new(
@@ -101,9 +108,31 @@ pub fn transcribe_recording(
     );
 
     let result = run_worker(&spec)?;
-    let placed = place_on_timeline(manifest, &result)?;
-    store_transcript(db, manifest.recording_id, &result, &placed)?;
-    Ok(placed.len())
+    let segments = place_on_timeline(manifest, &result)?;
+
+    Ok(Transcription {
+        segments,
+        engine: result.engine,
+        language: result.tracks.first().and_then(|t| t.language.clone()),
+    })
+}
+
+/// A finished transcription, before it is stored.
+#[derive(Debug)]
+pub struct Transcription {
+    pub segments: Vec<PlacedSegment>,
+    pub engine: Option<kaseta_contracts::worker::EngineInfo>,
+    pub language: Option<String>,
+}
+
+/// Stores a transcript. Fast, and the only part needing the database.
+pub fn store_transcript(
+    db: &Db,
+    recording_id: Ulid,
+    transcription: &Transcription,
+) -> Result<usize> {
+    write_transcript(db, recording_id, transcription)?;
+    Ok(transcription.segments.len())
 }
 
 /// What a track's role implies about who is speaking on it.
@@ -261,14 +290,14 @@ pub fn place_on_timeline(
     Ok(placed)
 }
 
-fn store_transcript(
+fn write_transcript(
     db: &Db,
     recording_id: Ulid,
-    result: &WorkerResult,
-    placed: &[PlacedSegment],
+    transcription: &Transcription,
 ) -> Result<()> {
     let transcript_id = Ulid::new();
-    let engine = result.engine.as_ref();
+    let engine = transcription.engine.as_ref();
+    let placed = &transcription.segments;
 
     let tx = db.conn().unchecked_transaction()?;
 
@@ -287,7 +316,7 @@ fn store_transcript(
             recording_id.to_string(),
             engine.map(|e| e.name.as_str()),
             engine.map(|e| e.model.as_str()),
-            result.tracks.first().and_then(|t| t.language.as_deref()),
+            transcription.language.as_deref(),
         ],
     )?;
 
