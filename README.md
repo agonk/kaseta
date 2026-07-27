@@ -4,15 +4,19 @@ A Linux meeting recorder that captures both sides of a conversation, transcribes
 it locally, and summarises it — without a browser extension, a bot joining your
 call, or audio leaving the machine.
 
-> Working name. Status: **in development, not yet usable end to end.**
+> Working name.
 
 ## What it does
+
+Records a meeting, transcribes it locally, and summarises it. Start and stop
+from the application window; the transcript and summary appear on their own.
 
 Records your microphone and your system playback as **two separate tracks**.
 That separation is the design's centre of gravity: everything on the microphone
 track was said by you, everything on the playback track was said by the far end,
-so a transcript is attributed without any speaker model. It also means the two
-sides can be re-mixed, re-transcribed, or diarized later without re-recording.
+so **every line of the transcript already knows who said it** — no diarization,
+no speaker model. It also means the two sides can be re-mixed, re-transcribed,
+or diarized later without re-recording.
 
 Works with anything that makes sound — Zoom, Meet, Teams, a native desktop app,
 a browser tab — because it captures at the audio-server level rather than
@@ -45,7 +49,9 @@ jobs orphaned by the crash are swept back onto the queue at startup.
 ```
 crates/
   kaseta-contracts/   Types crossing a process or storage boundary. No I/O.
-  kasetad/            The daemon: capture, storage, jobs, local API.
+  kasetad/            The daemon: capture, storage, jobs, local API, interface.
+worker/               Transcription worker. Short-lived, spawned per job.
+packaging/            Desktop entry, user service, icon.
 docs/
   PLAN.md             Architecture and milestones.
   CONTRACTS-DRAFT.md  Schemas and protocols.
@@ -169,6 +175,12 @@ transcript depends on.
 |---|---|---|
 | `KASETA_DATA` | `./data` | Where recordings are written |
 | `KASETA_LOG` | `kasetad=info` | Log filter, e.g. `kasetad=debug` |
+| `KASETA_PORT` | `7777` | Port the interface is served on |
+| `KASETA_WORKER_PYTHON` | `worker/.venv/bin/python` | Interpreter with the transcription worker |
+| `KASETA_OPENROUTER_KEY` | — | Enables summaries; without it they are skipped |
+| `KASETA_OPENROUTER_MODEL` | `anthropic/claude-3.5-haiku` | Model used for summaries |
+
+Installed setups read these from `~/.config/kaseta/env`.
 
 ### Headless machines
 
