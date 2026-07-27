@@ -10,6 +10,7 @@ mod export;
 mod http;
 mod library;
 mod scheduler;
+mod summarize;
 mod supervisor;
 mod transcribe;
 

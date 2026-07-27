@@ -91,6 +91,7 @@ pub fn router(
         .route("/api/v1/recordings/{id}", delete(delete_recording))
         .route("/api/v1/recordings/{id}/audio/{file}", get(audio))
         .route("/api/v1/recordings/{id}/transcript", get(transcript))
+        .route("/api/v1/recordings/{id}/summary", get(summary))
         .route("/api/v1/search", get(search))
         .with_state(state)
 }
@@ -341,6 +342,20 @@ async fn transcript(
         library::transcript(db, id)
             .map_err(ApiError::from_anyhow)?
             .ok_or_else(|| ApiError::not_found("this recording has not been transcribed"))
+    })
+    .await
+    .map(Json)
+}
+
+async fn summary(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::summarize::Summary>, ApiError> {
+    let id = parse_id(&id)?;
+    with_db(&state, move |db| {
+        crate::summarize::load(db, id)
+            .map_err(ApiError::from_anyhow)?
+            .ok_or_else(|| ApiError::not_found("this recording has not been summarised"))
     })
     .await
     .map(Json)

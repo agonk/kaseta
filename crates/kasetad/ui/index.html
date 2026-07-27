@@ -100,6 +100,20 @@
   .line.them .who { color: var(--muted); }
   .line mark { background: var(--accent-soft); color: inherit; font-weight: 600; }
 
+  .summary {
+    margin-top: 12px; padding: 12px 14px; border-radius: 8px;
+    background: var(--bg); border: 1px solid var(--line);
+  }
+  .summary h4 {
+    margin: 12px 0 4px; font-size: 12px; text-transform: uppercase;
+    letter-spacing: .05em; color: var(--muted);
+  }
+  .summary h4:first-child { margin-top: 0; }
+  .summary p { margin: 0; }
+  .summary ul { list-style: disc; padding-left: 18px; }
+  .summary li { background: none; border: none; padding: 1px 0; margin: 0; border-radius: 0; }
+  .owner { color: var(--muted); font-size: 12px; }
+
   .search { display: flex; gap: 8px; margin-bottom: 16px; }
   .search input { flex: 1; border-color: var(--line); }
   .badge {
@@ -256,6 +270,12 @@ function render(item) {
   li.append(row);
 
   if (item.has_transcript) {
+    const summary = document.createElement("button");
+    summary.className = "icon";
+    summary.textContent = "Summary";
+    summary.onclick = () => toggleSummary(li, item, summary);
+    row.insertBefore(summary, rename);
+
     const show = document.createElement("button");
     show.className = "icon";
     show.textContent = "Transcript";
@@ -289,6 +309,83 @@ function render(item) {
   }
 
   return li;
+}
+
+async function toggleSummary(li, item, button) {
+  const existing = li.querySelector(".summary");
+  if (existing) {
+    existing.remove();
+    button.textContent = "Summary";
+    return;
+  }
+
+  const box = document.createElement("div");
+  box.className = "summary";
+  li.append(box);
+  button.textContent = "Hide";
+
+  try {
+    const s = await api(`/api/v1/recordings/${item.id}/summary`);
+
+    const section = (title, build) => {
+      const h = document.createElement("h4");
+      h.textContent = title;
+      box.append(h, build());
+    };
+
+    if (s.overview) {
+      section("Overview", () => {
+        const p = document.createElement("p");
+        p.textContent = s.overview;
+        return p;
+      });
+    }
+
+    const bullets = (items, render) => () => {
+      const ul = document.createElement("ul");
+      for (const item of items) ul.append(render(item));
+      return ul;
+    };
+
+    if (s.decisions?.length) {
+      section("Decisions", bullets(s.decisions, (d) => {
+        const li = document.createElement("li");
+        li.textContent = d;
+        return li;
+      }));
+    }
+
+    if (s.action_items?.length) {
+      section("Action items", bullets(s.action_items, (a) => {
+        const li = document.createElement("li");
+        li.textContent = a.what;
+        // An unowned action is shown as such rather than silently attributed.
+        const owner = document.createElement("span");
+        owner.className = "owner";
+        owner.textContent = a.owner ? `  — ${a.owner}` : "  — unassigned";
+        li.append(owner);
+        return li;
+      }));
+    }
+
+    if (s.topics?.length) {
+      section("Topics", bullets(s.topics, (t) => {
+        const li = document.createElement("li");
+        li.textContent = t;
+        return li;
+      }));
+    }
+
+    if (!box.childElementCount) {
+      box.textContent = "The summary came back empty.";
+      box.style.color = "var(--muted)";
+    }
+  } catch (e) {
+    box.textContent = e.message.includes("not been summarised")
+      ? "Not summarised yet. Summaries need KASETA_OPENROUTER_KEY to be set."
+      : e.message;
+    box.style.color = "var(--muted)";
+  }
 }
 
 async function toggleTranscript(li, item, button) {

@@ -113,6 +113,42 @@ fn execute(
             let segments =
                 crate::transcribe::transcribe_recording(store, &guard, storage_root, &manifest)?;
             tracing::info!(%recording_id, segments, "transcribed");
+
+            // Summarising is queued rather than called directly so a provider
+            // outage retries on its own schedule instead of failing the
+            // transcription that already succeeded.
+            if segments > 0 {
+                guard.enqueue(recording_id, JobType::Summarize, 1)?;
+            }
+            Ok(())
+        }
+        JobType::Summarize => {
+            // Absent configuration is not a failure: summaries are optional and
+            // a recording without one is still complete.
+            let config = match crate::summarize::SummarizeConfig::from_env() {
+                Ok(config) => config,
+                Err(e) => {
+                    tracing::info!(reason = %e, "skipping summary");
+                    return Ok(());
+                }
+            };
+
+            let transcript = {
+                let guard = db.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+                crate::library::transcript(&guard, recording_id)?
+            };
+            let Some(transcript) = transcript else {
+                return Ok(());
+            };
+
+            // The call is made without the lock held: it reaches the network and
+            // can take minutes, and nothing else could touch the database
+            // meanwhile.
+            let summary = crate::summarize::summarize(&config, &transcript)?;
+
+            let guard = db.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            crate::summarize::store(&guard, recording_id, &config.model, &summary)?;
+            tracing::info!(%recording_id, "summarised");
             Ok(())
         }
         // Stages that exist in the model but have no implementation yet succeed
