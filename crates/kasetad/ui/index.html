@@ -362,8 +362,7 @@
 </div>
 
 <div class="statusbar">
-  <span>Local storage only</span><span>·</span>
-  <span>Audio and transcripts never leave this machine</span>
+  <span id="privacy">Local storage only · nothing leaves this machine</span>
   <span class="right" id="engine"></span>
 </div>
 
@@ -1018,8 +1017,27 @@ $("q").oninput = (e) => {
   searchTimer = setTimeout(refreshList, 200);
 };
 
+// The privacy line states what is actually configured rather than a slogan:
+// turning on summaries or backup changes what leaves the machine, and a status
+// bar that kept claiming otherwise would be lying.
+async function refreshPrivacy() {
+  try {
+    const s = await api("/api/v1/settings");
+    const leaves = [];
+    if (s.summaries.enabled && s.summaries.api_key_set) leaves.push("transcripts → summariser");
+    if (s.remote_storage.enabled) leaves.push("recordings → your bucket");
+
+    $("privacy").textContent = leaves.length
+      ? `Audio stays local · sent out: ${leaves.join(" · ")}`
+      : "Local storage only · nothing leaves this machine";
+  } catch { /* the status bar is not worth an error banner */ }
+}
+
+$("settings-save").addEventListener("click", () => setTimeout(refreshPrivacy, 300));
+
 refreshStatus();
 refreshList();
+refreshPrivacy();
 setInterval(refreshStatus, 1000);
 </script>
 </body>

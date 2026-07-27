@@ -387,11 +387,21 @@ fn spawn_exports(
                 tracing::error!(error = %format!("{e:#}"), "mixing recording failed");
             }
 
-            // Queued only once the audio transcription needs actually exists.
-            // Queueing earlier would have the scheduler fail on missing exports
-            // and burn retries waiting for work that had not finished.
             match db.lock() {
                 Ok(guard) => {
+                    // Re-indexed now the exports exist. Stopping indexes the
+                    // recording immediately so it appears in the library, but
+                    // that happens before this thread has produced any audio —
+                    // so without this the recording is listed with no player
+                    // until the daemon is next restarted.
+                    if let Err(e) = crate::library::index_recording(&*store, &guard, &manifest) {
+                        tracing::error!(error = %format!("{e:#}"), "could not index exports");
+                    }
+
+                    // Queued only once the audio transcription needs actually
+                    // exists. Queueing earlier would have the scheduler fail on
+                    // missing exports and burn retries waiting for work that had
+                    // not finished.
                     if let Err(e) =
                         crate::scheduler::enqueue_for_recording(&guard, manifest.recording_id)
                     {
@@ -494,6 +504,7 @@ mod tests {
             started_at: Some(time::OffsetDateTime::UNIX_EPOCH),
             elapsed_s: 42,
             degraded_tracks: vec!["a_local-mic_01".into()],
+            reconnecting: vec![],
             failure: None,
         };
         let json = serde_json::to_string(&status).unwrap();
