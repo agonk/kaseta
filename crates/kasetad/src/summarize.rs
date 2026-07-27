@@ -451,18 +451,12 @@ pub fn store(
         // As with a transcript: indexed but unstored is usable here and absent
         // from a backup, which the startup sweep repairs rather than paying for
         // the summary a second time.
-        let key = prefix.summary(document.revision);
-        match serde_json::to_vec_pretty(&document) {
-            Ok(bytes) => {
-                if let Err(e) = store.put(&key, &bytes) {
-                    tracing::warn!(
-                        %recording_id,
-                        error = %format!("{e:#}"),
-                        "the summary is indexed but not yet stored; it will be written again later"
-                    );
-                }
-            }
-            Err(e) => tracing::warn!(%recording_id, error = %e, "could not encode the summary"),
+        if let Err(e) = crate::derived::publish_summary(store, prefix, &document) {
+            tracing::warn!(
+                %recording_id,
+                error = %format!("{e:#}"),
+                "the summary is indexed but not yet stored; it will be written again later"
+            );
         }
         crate::derived::mark_dirty(db, recording_id)?;
     }

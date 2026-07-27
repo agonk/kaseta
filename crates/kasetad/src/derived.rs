@@ -121,22 +121,10 @@ pub fn publish_transcript(
 pub fn publish_summary(
     store: &dyn BlobStore,
     prefix: &RecordingPrefix,
-    revision: u32,
-    transcript_revision: u32,
-    provider: &str,
-    model: &str,
-    body: &SummaryBody,
+    document: &SummaryDocument,
 ) -> Result<()> {
-    let document = SummaryDocument {
-        version: DERIVED_VERSION.to_string(),
-        revision,
-        transcript_revision,
-        provider: provider.to_string(),
-        model: model.to_string(),
-        body: body.clone(),
-    };
-    let key = prefix.summary(revision);
-    let bytes = serde_json::to_vec_pretty(&document)?;
+    let key = prefix.summary(document.revision);
+    let bytes = serde_json::to_vec_pretty(document)?;
     store
         .put(&key, &bytes)
         .with_context(|| format!("writing {key}"))
@@ -245,6 +233,7 @@ pub fn clear_remote_dirty(db: &Db, recording_id: Ulid) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub fn is_dirty(db: &Db, recording_id: Ulid) -> Result<bool> {
     Ok(db
         .conn()
@@ -360,11 +349,7 @@ pub fn store_for(
     }
 
     if let Some(document) = summary_document(db, recording_id)? {
-        let key = prefix.summary(document.revision);
-        let bytes = serde_json::to_vec_pretty(&document)?;
-        store
-            .put(&key, &bytes)
-            .with_context(|| format!("writing {key}"))?;
+        publish_summary(store, prefix, &document)?;
         wrote = true;
     }
 
@@ -897,13 +882,16 @@ mod tests {
         publish_summary(
             &store,
             &prefix,
-            1,
-            1,
-            "openrouter",
-            "some/model",
-            &SummaryBody {
-                overview: "we agreed".into(),
-                ..Default::default()
+            &SummaryDocument {
+                version: DERIVED_VERSION.into(),
+                revision: 1,
+                transcript_revision: 1,
+                provider: "openrouter".into(),
+                model: "some/model".into(),
+                body: SummaryBody {
+                    overview: "we agreed".into(),
+                    ..Default::default()
+                },
             },
         )
         .unwrap();
@@ -933,8 +921,19 @@ mod tests {
             },
         )
         .unwrap();
-        publish_summary(&store, &prefix, 1, 1, "openrouter", "m", &SummaryBody::default())
-            .unwrap();
+        publish_summary(
+            &store,
+            &prefix,
+            &SummaryDocument {
+                version: DERIVED_VERSION.into(),
+                revision: 1,
+                transcript_revision: 1,
+                provider: "openrouter".into(),
+                model: "m".into(),
+                body: SummaryBody::default(),
+            },
+        )
+        .unwrap();
         publish_library_metadata(&store, &prefix, &LibraryMetadata::default()).unwrap();
 
         let keys = store.list_prefix(prefix.root().as_str()).unwrap();
