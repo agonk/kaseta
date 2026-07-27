@@ -159,10 +159,14 @@ pub fn worker_python() -> String {
         return "python3".to_string();
     }
 
-    candidate
-        .canonicalize()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| candidate.display().to_string())
+    // Made absolute without resolving symlinks. A virtual environment works by
+    // its interpreter being *at* that path — Python derives the environment
+    // from how it was invoked — so following the symlink to the system binary
+    // silently discards the environment and every package in it.
+    std::path::absolute(&candidate)
+        .unwrap_or(candidate)
+        .display()
+        .to_string()
 }
 
 /// Whether the transcription worker can actually be run.
@@ -183,6 +187,46 @@ pub fn worker_status() -> Result<String> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let reason: String = stderr.lines().last().unwrap_or("unknown error").into();
         bail!("{python}: {reason}")
+    }
+}
+
+#[cfg(test)]
+mod worker_path_tests {
+    use super::*;
+
+    #[test]
+    fn the_interpreter_path_is_not_resolved_through_symlinks() {
+        // A virtual environment's `python` is a symlink to the system binary.
+        // Following it yields an interpreter that cannot see any of the
+        // environment's packages, and the worker fails to import.
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join("python3-real");
+        std::fs::write(&real, "").unwrap();
+
+        let venv = dir.path().join("venv-python");
+        std::os::unix::fs::symlink(&real, &venv).unwrap();
+
+        std::env::set_var("KASETA_WORKER_PYTHON", &venv);
+        let resolved = worker_python();
+        std::env::remove_var("KASETA_WORKER_PYTHON");
+
+        assert_eq!(
+            resolved,
+            venv.display().to_string(),
+            "the environment's own path must be preserved"
+        );
+        assert!(!resolved.ends_with("python3-real"));
+    }
+
+    #[test]
+    fn a_relative_interpreter_path_is_made_absolute() {
+        // The daemon's working directory is the home when run as a service, so
+        // a relative path would resolve against the wrong place.
+        std::env::set_var("KASETA_WORKER_PYTHON", "definitely/not/here/python");
+        let resolved = worker_python();
+        std::env::remove_var("KASETA_WORKER_PYTHON");
+        // Absent, so it falls back rather than returning something unusable.
+        assert_eq!(resolved, "python3");
     }
 }
 

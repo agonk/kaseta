@@ -345,6 +345,9 @@ fn stages_by_recording(db: &Db) -> Result<std::collections::HashMap<String, Vec<
             "queued" => ("queued", false),
             "running" => ("running", false),
             "succeeded" => ("succeeded", false),
+            // Only genuinely coming back around. Once the budget is spent it is
+            // a failure, however it is stored — otherwise a dead job shows as
+            // "retrying" indefinitely with no way to act on it.
             "failed_retryable" if attempt < max_attempts => ("retrying", false),
             "failed_retryable" | "failed_terminal" => ("failed", true),
             "canceled" => ("failed", true),
