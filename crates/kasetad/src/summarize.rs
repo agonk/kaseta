@@ -282,6 +282,34 @@ struct ChatRequest<'a> {
     /// Asking for JSON explicitly rather than hoping prose parses.
     response_format: ResponseFormat,
     temperature: f32,
+    provider: ProviderPolicy,
+}
+
+/// Constraints on which host may serve the request.
+///
+/// An open-weight model is offered by many companies at once, and the router
+/// picks between them per request. Left unconstrained, consecutive meetings can
+/// go to different hosts in different jurisdictions, and the answer to "who has
+/// this transcript" becomes "whoever was cheapest that second". Naming the
+/// conditions is what makes that answer knowable.
+#[derive(Serialize)]
+struct ProviderPolicy {
+    /// Excludes hosts that retain or train on what they are sent.
+    data_collection: &'static str,
+    /// Excludes hosts that would silently drop `response_format`.
+    ///
+    /// Ignoring it is not an error — it returns prose, which parses into an
+    /// empty summary. Better to be routed elsewhere than to succeed emptily.
+    require_parameters: bool,
+}
+
+impl Default for ProviderPolicy {
+    fn default() -> Self {
+        Self {
+            data_collection: "deny",
+            require_parameters: true,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -337,6 +365,7 @@ fn request(config: &SummarizeConfig, transcript: &str, partial: bool) -> Result<
         // Low but not zero: summarising is not a task where creative variation
         // helps, and reproducibility makes a bad summary diagnosable.
         temperature: 0.2,
+        provider: ProviderPolicy::default(),
     };
 
     let client = reqwest::blocking::Client::builder()
@@ -655,5 +684,25 @@ mod tests {
         {
             assert_eq!(SummarizeConfig::resolve(&settings).unwrap().model, DEFAULT_MODEL);
         }
+    }
+
+    /// The transcript is the one thing that leaves the machine, so the terms it
+    /// leaves under are part of the request rather than a routing default that
+    /// could change underneath us.
+    #[test]
+    fn every_request_refuses_hosts_that_retain_what_they_are_sent() {
+        let body = ChatRequest {
+            model: "some/model",
+            messages: vec![ChatMessage { role: "user", content: "hello" }],
+            response_format: ResponseFormat { kind: "json_object" },
+            temperature: 0.2,
+            provider: ProviderPolicy::default(),
+        };
+
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
+
+        assert_eq!(json["provider"]["data_collection"], "deny");
+        assert_eq!(json["provider"]["require_parameters"], true);
     }
 }
