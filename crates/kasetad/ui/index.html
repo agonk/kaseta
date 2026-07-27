@@ -232,6 +232,25 @@
 
   /* ---- controls -------------------------------------------------------- */
 
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px;
+    border-radius: var(--r-full); border: 1px solid var(--outline-variant);
+    font: 500 12px/16px var(--mono); letter-spacing: .04em;
+    color: var(--on-surface-variant); white-space: nowrap;
+  }
+  .chip.ok { border-color: color-mix(in srgb, var(--ok) 50%, transparent); color: var(--ok); }
+  .chip.busy { border-color: color-mix(in srgb, var(--primary-container) 60%, transparent); color: var(--primary); }
+  .chip.bad { border-color: color-mix(in srgb, var(--error) 55%, transparent); color: var(--error); }
+  .chip button {
+    background: none; border: none; padding: 0; margin-left: 2px; cursor: pointer;
+    color: inherit; font: inherit; text-decoration: underline;
+  }
+  .stage-error {
+    margin-top: 6px; font: 500 12px/16px var(--mono); color: var(--error);
+    word-break: break-word;
+  }
+
   .btn { padding: 5px 11px; border-radius: var(--r); cursor: pointer;
          border: 1px solid var(--outline-variant); background: transparent; }
   .btn:hover { border-color: var(--outline); }
@@ -484,6 +503,21 @@ let query = "";
 let busy = false;
 let searchTimer = null;
 let audio = null;
+let stageTimer = null;
+
+/// What about a recording would change its detail pane.
+///
+/// Compared before redrawing so playback is not interrupted by a refresh that
+/// changed nothing.
+const signatureOf = (item) =>
+  item
+    ? JSON.stringify([
+        item.title, item.has_transcript, item.has_summary,
+        item.audio_local, item.audio_remote, item.mixed_audio_url,
+        item.tracks?.map((t) => t.track_id),
+        (item.stages || []).map((s) => [s.stage, s.state, s.error]),
+      ])
+    : "";
 
 const pad = (n) => String(n).padStart(2, "0");
 const clock = (s) => {
@@ -641,6 +675,7 @@ function renderDetail(item) {
   title.title = "Double-click to rename";
   title.ondblclick = () => renameInline(title, item);
   grow.append(title, el("div", "hint", `${when(item.started_at)} · ${clock(item.duration_ms / 1000)}`));
+  grow.append(stageChips(item));
   row.append(grow);
 
   // The mix, or either side alone. Keeping both sides separately is what makes
@@ -733,6 +768,92 @@ function renderDetail(item) {
   loadSummary(sm, item);
 }
 
+// What each stage is called, and what it means when it has not happened.
+const STAGES = [
+  { key: "transcribe", name: "Transcript", done: (i) => i.has_transcript },
+  { key: "summarize",  name: "Summary",    done: (i) => i.has_summary },
+  { key: "backup",     name: "Backup",     done: (i) => i.audio_remote },
+];
+
+/// Where each stage stands, with the action that makes sense for it.
+///
+/// A stage that failed looks nothing like one never attempted, which is the
+/// distinction the interface previously could not draw: both simply showed
+/// nothing.
+function stageChips(item) {
+  const box = el("div", "chips");
+  const stateOf = (key) =>
+    (item.stages || []).find((s) => s.stage === (key === "backup" ? "upload_remote" : key));
+
+  // Where the audio is, which changes once backup removes local copies.
+  const where = el("span", "chip");
+  where.textContent = item.audio_local && item.audio_remote ? "Local + remote"
+    : item.audio_remote ? "Remote only"
+    : item.audio_local ? "Local only"
+    : "No audio";
+  if (!item.audio_local && !item.audio_remote) where.classList.add("bad");
+  box.append(where);
+
+  for (const stage of STAGES) {
+    // Backup is only meaningful once it is switched on, and nothing reports
+    // that per-recording, so it is shown only when it has happened or failed.
+    const st = stateOf(stage.key);
+    const done = stage.done(item);
+    if (stage.key === "backup" && !done && !st) continue;
+
+    const chip = el("span", "chip");
+
+    if (done) {
+      chip.classList.add("ok");
+      chip.textContent = `${stage.name} ✓`;
+    } else if (st?.state === "running") {
+      chip.classList.add("busy");
+      chip.textContent = `${stage.name} — running`;
+    } else if (st?.state === "queued") {
+      chip.classList.add("busy");
+      chip.textContent = `${stage.name} — queued`;
+    } else if (st?.state === "retrying") {
+      chip.classList.add("busy");
+      chip.textContent = `${stage.name} — retrying`;
+    } else {
+      const failed = st?.state === "failed";
+      chip.classList.add(failed ? "bad" : "");
+      chip.append(document.createTextNode(failed ? `${stage.name} failed ` : `${stage.name} `));
+
+      const act = el("button", null, failed ? "retry" : "run");
+      act.type = "button";
+      act.title = failed && st?.error ? st.error : `Run ${stage.name.toLowerCase()}`;
+      act.onclick = () => runStage(item, stage.key, act);
+      chip.append(act);
+    }
+    box.append(chip);
+  }
+
+  // The reason a stage failed, rather than only that it did.
+  const failure = (item.stages || []).find((s) => s.state === "failed" && s.error);
+  if (failure) {
+    const why = el("div", "stage-error", failure.error);
+    const wrap = el("div");
+    wrap.append(box, why);
+    return wrap;
+  }
+  return box;
+}
+
+async function runStage(item, stage, button) {
+  button.disabled = true;
+  button.textContent = "…";
+  try {
+    await api(`/api/v1/recordings/${item.id}/stages/${stage}`, { method: "POST" });
+    // Work runs in the background; the list refresh reflects it as it moves.
+    setTimeout(refreshList, 400);
+  } catch (e) {
+    fail(e.message);
+    button.disabled = false;
+    button.textContent = "retry";
+  }
+}
+
 async function drawWaveform(canvas, id) {
   let peaks = [];
   try { peaks = await api(`/api/v1/recordings/${id}/waveform`); } catch { /* flat fallback */ }
@@ -765,9 +886,20 @@ async function loadTranscript(pane, item) {
   pane.append(el("div", "sec-head", "Transcript"));
 
   if (!item.has_transcript) {
-    // Absence cannot distinguish pending from disabled from failed, so the
-    // wording stays honest rather than guessing.
-    pane.append(el("p", "hint", "No transcript yet. One is produced automatically after a recording ends."));
+    const st = (item.stages || []).find((s) => s.stage === "transcribe");
+    const busy = ["queued", "running", "retrying"].includes(st?.state);
+
+    pane.append(el("p", "hint", busy
+      ? `Transcribing — ${st.state}.`
+      : st?.state === "failed"
+        ? "Transcription failed."
+        : "Not transcribed yet."));
+
+    if (!busy) {
+      const run = el("button", "btn", st?.state === "failed" ? "Try again" : "Transcribe now");
+      run.onclick = () => runStage(item, "transcribe", run);
+      pane.append(run);
+    }
     return;
   }
 
@@ -822,7 +954,28 @@ async function loadSummary(pane, item) {
     data = await api(`/api/v1/recordings/${item.id}/summary`);
   } catch {
     pane.append(el("div", "sec-head", "Summary"));
-    pane.append(el("p", "hint", "Not summarised. Summaries need an API key in Settings."));
+
+    const st = (item.stages || []).find((s) => s.stage === "summarize");
+    const busy = ["queued", "running", "retrying"].includes(st?.state);
+
+    if (busy) {
+      pane.append(el("p", "hint", `Summarising — ${st.state}.`));
+      return;
+    }
+    if (!item.has_transcript) {
+      // Summarising needs a transcript, so offering it first would only queue
+      // work that cannot succeed.
+      pane.append(el("p", "hint", "Needs a transcript first."));
+      return;
+    }
+
+    pane.append(el("p", "hint", st?.state === "failed"
+      ? "Summarising failed."
+      : "Not summarised. Needs an API key in Settings."));
+
+    const run = el("button", "btn", st?.state === "failed" ? "Try again" : "Summarise now");
+    run.onclick = () => runStage(item, "summarize", run);
+    pane.append(run);
     return;
   }
 
@@ -1000,8 +1153,23 @@ async function refreshList() {
   try {
     const path = query ? `/api/v1/search?q=${encodeURIComponent(query)}` : "/api/v1/recordings";
     const { items: next } = await api(path);
+    const previous = selectedId;
+    const before = signatureOf(items.find((i) => i.id === previous));
     renderList(next);
     $("stat-count").textContent = `${next.length} recording${next.length === 1 ? "" : "s"}`;
+
+    // Redrawn only when something about it actually changed. Re-rendering
+    // unconditionally would rebuild the audio element and stop playback every
+    // time the list refreshed.
+    const current = next.find((i) => i.id === previous);
+    if (current && signatureOf(current) !== before) renderDetail(current);
+
+    // Polled only while work is outstanding, so a stage finishing appears
+    // without the list being refreshed on a timer forever.
+    const busy = next.some((i) =>
+      (i.stages || []).some((s) => ["queued", "running", "retrying"].includes(s.state)));
+    clearTimeout(stageTimer);
+    if (busy) stageTimer = setTimeout(refreshList, 2000);
     if (selectedId && !next.some((i) => i.id === selectedId)) {
       selectedId = null;
       $("detail").replaceChildren($("placeholder"));

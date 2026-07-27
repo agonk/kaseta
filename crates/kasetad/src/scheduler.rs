@@ -209,6 +209,15 @@ fn execute(
             }
             tracing::info!(%recording_id, uploaded, skipped, "backed up");
 
+            // Recorded so the interface can say where a recording's audio
+            // actually lives, which matters once local copies are removed.
+            if let Ok(guard) = db.lock() {
+                let _ = guard.conn().execute(
+                    "UPDATE recordings SET uploaded_at = strftime('%s','now') WHERE id = ?1",
+                    rusqlite::params![recording_id.to_string()],
+                );
+            }
+
             // Only after every object is confirmed present: deleting on a
             // partial upload would destroy the only complete copy.
             if settings.remote_storage.delete_local_after_upload {

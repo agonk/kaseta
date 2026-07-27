@@ -94,6 +94,7 @@ pub fn router(
         .route("/api/v1/recordings/{id}/transcript", get(transcript))
         .route("/api/v1/recordings/{id}/summary", get(summary))
         .route("/api/v1/recordings/{id}/waveform", get(waveform))
+        .route("/api/v1/recordings/{id}/stages/{stage}", post(run_stage))
         .route("/api/v1/recordings/{id}/transcript.txt", get(transcript_text))
         .route("/api/v1/search", get(search))
         .route("/api/v1/settings", get(get_settings).put(put_settings))
@@ -468,6 +469,62 @@ async fn put_settings(
     .map_err(|e| ApiError::internal(format!("saving settings failed: {e}")))??;
 
     Ok(Json(updated))
+}
+
+#[derive(Debug, Serialize)]
+struct StageQueued {
+    stage: String,
+    queued: bool,
+}
+
+/// Runs a pipeline stage for a recording, or queues it again after a failure.
+///
+/// The same endpoint serves "this was never done" and "this failed, try again":
+/// both mean the same thing to the pipeline, and distinguishing them in the API
+/// would only make the interface decide something it does not need to know.
+async fn run_stage(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path((id, stage)): Path<(String, String)>,
+) -> Result<(StatusCode, Json<StageQueued>), ApiError> {
+    authorize(&state, &headers)?;
+    let id = parse_id(&id)?;
+
+    let job_type = match stage.as_str() {
+        "transcribe" => kaseta_contracts::JobType::Transcribe,
+        "summarize" => kaseta_contracts::JobType::Summarize,
+        "backup" => kaseta_contracts::JobType::UploadRemote,
+        other => return Err(ApiError::bad_request(format!("unknown stage: {other}"))),
+    };
+
+    let queued = with_db(&state, move |db| {
+        // A recording that no longer exists must not leave work queued against
+        // it: the job would fail on every attempt with nothing to act on.
+        let exists = library::get(db, id).map_err(ApiError::from_anyhow)?.is_some();
+        if !exists {
+            return Err(ApiError::not_found("no such recording"));
+        }
+
+        // Any earlier attempt is cleared first, so asking again after a failure
+        // actually re-runs rather than being refused as already-attempted.
+        db.conn()
+            .execute(
+                "DELETE FROM jobs WHERE recording_id = ?1 AND job_type = ?2
+                 AND state IN ('failed_terminal','failed_retryable','canceled')",
+                rusqlite::params![id.to_string(), job_type.as_str()],
+            )
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+
+        db.enqueue_once(id, job_type, 1)
+            .map_err(ApiError::from_anyhow)
+            .map(|queued| queued.is_some())
+    })
+    .await?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(StageQueued { stage, queued }),
+    ))
 }
 
 async fn transcript(

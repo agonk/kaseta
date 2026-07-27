@@ -38,9 +38,33 @@ pub struct LibraryItem {
     pub tracks: Vec<LibraryTrack>,
     /// Whether a transcript exists, so the interface can offer to show it.
     pub has_transcript: bool,
+    pub has_summary: bool,
+    /// Whether the audio is still on this machine, and whether a copy is in
+    /// remote storage. Both can be true, and after a retention sweep or an
+    /// upload-then-delete neither need be.
+    pub audio_local: bool,
+    pub audio_remote: bool,
+    /// What the pipeline is doing with this recording, if anything.
+    pub stages: Vec<StageState>,
     /// Present once a mixed export exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mixed_audio_url: Option<String>,
+}
+
+/// One pipeline stage's state for a recording.
+///
+/// Reported so a failure is visible and retryable rather than looking identical
+/// to a stage that was never attempted.
+#[derive(Clone, Debug, Serialize)]
+pub struct StageState {
+    /// `transcribe`, `summarize`, or `upload_remote`.
+    pub stage: String,
+    /// `queued`, `running`, `succeeded`, `failed`, or `retrying`.
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Whether asking again would achieve anything.
+    pub retryable: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -239,7 +263,7 @@ pub fn purge_pending(store: &dyn BlobStore, db: &Db) -> Result<usize> {
 pub fn list(db: &Db) -> Result<Vec<LibraryItem>> {
     let mut stmt = db.conn().prepare(
         "SELECT id, title, title_override, status, started_at, ended_at,
-                duration_ms, has_mixed, tracks_json
+                duration_ms, has_mixed, tracks_json, uploaded_at
          FROM recordings
          WHERE owner_id = ?1 AND deleted_at IS NULL
          ORDER BY started_at DESC",
@@ -256,6 +280,7 @@ pub fn list(db: &Db) -> Result<Vec<LibraryItem>> {
             duration_ms: r.get::<_, Option<i64>>(6)?.unwrap_or(0),
             has_mixed: r.get::<_, i64>(7)? != 0,
             tracks_json: r.get(8)?,
+            uploaded_at: r.get(9)?,
         })
     })?;
 
@@ -263,19 +288,77 @@ pub fn list(db: &Db) -> Result<Vec<LibraryItem>> {
         .map(|row| row.map_err(Into::into).and_then(into_item))
         .collect::<Result<_>>()?;
 
-    // One query for the whole page rather than one per row.
-    let with_transcripts: HashSet<String> = {
-        let mut stmt = db
-            .conn()
-            .prepare("SELECT DISTINCT recording_id FROM transcripts")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        rows.filter_map(|r| r.ok()).collect()
-    };
+    // One query each for the whole page rather than one per row.
+    let with_transcripts = ids_in(db, "SELECT DISTINCT recording_id FROM transcripts")?;
+    let with_summaries = ids_in(db, "SELECT DISTINCT recording_id FROM summaries")?;
+    let stages = stages_by_recording(db)?;
+
     for item in &mut items {
-        item.has_transcript = with_transcripts.contains(&item.id.to_string());
+        let id = item.id.to_string();
+        item.has_transcript = with_transcripts.contains(&id);
+        item.has_summary = with_summaries.contains(&id);
+        item.stages = stages.get(&id).cloned().unwrap_or_default();
     }
 
     Ok(items)
+}
+
+fn ids_in(db: &Db, sql: &str) -> Result<HashSet<String>> {
+    let mut stmt = db.conn().prepare(sql)?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// The latest state of each pipeline stage, per recording.
+///
+/// Only the newest attempt matters: an earlier failure that has since succeeded
+/// is history, not something to show or offer to retry.
+fn stages_by_recording(db: &Db) -> Result<std::collections::HashMap<String, Vec<StageState>>> {
+    let mut stmt = db.conn().prepare(
+        "SELECT recording_id, job_type, state, error_message, attempt, max_attempts
+         FROM jobs j
+         WHERE enqueue_seq = (
+             SELECT MAX(enqueue_seq) FROM jobs
+             WHERE recording_id = j.recording_id AND job_type = j.job_type
+         )",
+    )?;
+
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, i64>(4)?,
+            r.get::<_, i64>(5)?,
+        ))
+    })?;
+
+    let mut out: std::collections::HashMap<String, Vec<StageState>> = Default::default();
+    for row in rows {
+        let (recording_id, stage, state, error, attempt, max_attempts) = row?;
+
+        // `failed_retryable` with attempts left is waiting, not finished — the
+        // difference decides whether the interface offers a retry or says it is
+        // already coming back around.
+        let (state, retryable) = match state.as_str() {
+            "queued" => ("queued", false),
+            "running" => ("running", false),
+            "succeeded" => ("succeeded", false),
+            "failed_retryable" if attempt < max_attempts => ("retrying", false),
+            "failed_retryable" | "failed_terminal" => ("failed", true),
+            "canceled" => ("failed", true),
+            _ => ("succeeded", false),
+        };
+
+        out.entry(recording_id).or_default().push(StageState {
+            stage,
+            state: state.to_string(),
+            error: error.filter(|_| state == "failed"),
+            retryable,
+        });
+    }
+    Ok(out)
 }
 
 struct Row {
@@ -288,6 +371,7 @@ struct Row {
     duration_ms: i64,
     has_mixed: bool,
     tracks_json: Option<String>,
+    uploaded_at: Option<i64>,
 }
 
 fn into_item(row: Row) -> Result<LibraryItem> {
@@ -311,6 +395,10 @@ fn into_item(row: Row) -> Result<LibraryItem> {
             .and_then(|t| time::OffsetDateTime::from_unix_timestamp(t).ok()),
         duration_ms: row.duration_ms,
         has_transcript: false,
+        has_summary: false,
+        audio_local: row.has_mixed || !indexed.is_empty(),
+        audio_remote: row.uploaded_at.is_some(),
+        stages: Vec::new(),
         tracks: indexed
             .into_iter()
             .map(|t| LibraryTrack {
