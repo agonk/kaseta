@@ -1250,6 +1250,10 @@ $("settings-save").onclick = async () => {
   try {
     await api("/api/v1/settings", { method: "PUT", body: JSON.stringify(body) });
     sheet.close();
+    // Awaited rather than guessed at: what was just saved decides whether a
+    // recording offers a Send button, and a timer racing the write would
+    // sometimes read the settings as they were before it.
+    await refreshPrivacy();
   } catch (e) { fail(e.message); }
 };
 
@@ -1331,7 +1335,20 @@ let webhookOn = false;
 async function refreshPrivacy() {
   try {
     const s = await api("/api/v1/settings");
+    const wasOn = webhookOn;
     webhookOn = Boolean(s.webhook && s.webhook.configured);
+
+    // Whether Webhook is configured decides whether a recording offers a Send
+    // button, and it is the only thing on this screen that changes because of
+    // something typed on ANOTHER screen. The detail pane is otherwise redrawn
+    // only when a recording's own stages change, so without this the button
+    // stayed hidden until the pane happened to be rebuilt for an unrelated
+    // reason — which, for the manual mode whose whole point is pressing it,
+    // meant it never appeared at all.
+    if (webhookOn !== wasOn && selectedId) {
+      const current = items.find((i) => i.id === selectedId);
+      if (current) renderDetail(current);
+    }
     const leaves = [];
     if (s.summaries.enabled && s.summaries.api_key_set) leaves.push("transcripts → summariser");
     if (s.remote_storage.enabled) leaves.push("recordings → your bucket");
@@ -1346,7 +1363,6 @@ async function refreshPrivacy() {
   } catch { /* the status bar is not worth an error banner */ }
 }
 
-$("settings-save").addEventListener("click", () => setTimeout(refreshPrivacy, 300));
 
 refreshStatus();
 refreshList();
