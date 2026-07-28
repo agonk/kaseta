@@ -7,6 +7,11 @@ on summaries or cloud backup, and both are off until you do.
 
 > Working name. Alpha: it works, and it has not been through many hands yet.
 
+![The Kaseta window: a recording with its transcript and summary](assets/library.png)
+
+A recording, its transcript attributed line by line, and the summary drawn from
+it. The chips along the top say what has happened to it and what has not.
+
 ## What it does
 
 Records a meeting and, if you want, transcribes and summarises it. Start and
@@ -167,6 +172,17 @@ against has gone — which a rolling distribution does on a point-release upgrad
 Recording can also be started without opening the window. Bind
 `kaseta-tray toggle` to a key in your desktop's shortcut settings, or use the
 **Kaseta — Start or stop recording** entry in your launcher.
+
+### Configuring it
+
+Everything is set from the application — there is no configuration file to edit
+by hand.
+
+![Kaseta's settings: transcription, summaries, cloud backup and retention](assets/settings.png)
+
+Each switch governs one thing that would otherwise happen without being asked.
+Transcription runs locally and is on; summaries and cloud backup are off until
+you turn them on, because both send something off the machine.
 
 ### What it installs
 
