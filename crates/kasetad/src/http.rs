@@ -523,11 +523,14 @@ fn affects_finished_recordings(
     before: &crate::config::Settings,
     after: &crate::config::Settings,
 ) -> bool {
+    // Only when the *combination* becomes actionable. Switching transcription
+    // off on its own changes nothing about already-uploaded recordings, and
+    // treating it as though it did would re-upload a whole library to discover
+    // there was nothing to do.
     let cleanup_now_possible = |s: &crate::config::Settings| {
         s.remote_storage.delete_local_after_upload && !s.transcription.enabled
     };
-    (before.transcription.enabled && !after.transcription.enabled)
-        || (!cleanup_now_possible(before) && cleanup_now_possible(after))
+    !cleanup_now_possible(before) && cleanup_now_possible(after)
 }
 
 #[derive(Debug, Serialize)]

@@ -29,16 +29,19 @@ pub enum JobType {
 }
 
 impl JobType {
-    /// Stages in dependency order. A stage is only queued once its predecessor
-    /// has succeeded.
-    pub const PIPELINE: [JobType; 5] = [
-        JobType::FinalizeRecording,
-        JobType::Transcribe,
-        JobType::MergeTranscript,
-        JobType::Summarize,
-        JobType::UploadRemote,
-    ];
+    /// Stages that genuinely depend on the one before them.
+    ///
+    /// Only summarising does: it reads the transcript. Backup deliberately sits
+    /// outside this — it used to be the last link in a chain, which meant a
+    /// recording whose transcription failed was never copied anywhere, and that
+    /// is the recording a copy matters most for. It is queued when capture ends
+    /// and again whenever anything derived from the recording changes.
+    ///
+    /// Sealing and merging are performed where they happen rather than queued,
+    /// so they are absent here too.
+    pub const PIPELINE: [JobType; 2] = [JobType::Transcribe, JobType::Summarize];
 
+    /// The stage that should follow this one, if any.
     pub fn next(self) -> Option<JobType> {
         let idx = Self::PIPELINE.iter().position(|j| *j == self)?;
         Self::PIPELINE.get(idx + 1).copied()
@@ -193,10 +196,21 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_order_is_linear_and_terminates() {
-        assert_eq!(JobType::FinalizeRecording.next(), Some(JobType::Transcribe));
-        assert_eq!(JobType::Summarize.next(), Some(JobType::UploadRemote));
+    fn only_summarising_waits_on_the_stage_before_it() {
+        assert_eq!(JobType::Transcribe.next(), Some(JobType::Summarize));
+        assert_eq!(JobType::Summarize.next(), None);
+    }
+
+    /// Backup is not a link in the chain. Making it one meant a recording whose
+    /// transcription failed was never copied anywhere, which is exactly the
+    /// recording worth having a copy of.
+    #[test]
+    fn backup_does_not_wait_on_anything() {
         assert_eq!(JobType::UploadRemote.next(), None);
+        assert!(
+            !JobType::PIPELINE.contains(&JobType::UploadRemote),
+            "backup must not be reachable by following the chain"
+        );
     }
 
     #[test]

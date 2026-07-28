@@ -1,8 +1,9 @@
 # Kaseta
 
 A Linux meeting recorder that captures both sides of a conversation, transcribes
-it on your own machine, and summarises it — without a browser extension, a bot
-joining your call, or audio leaving the computer.
+it on your own machine, and summarises it — without a browser extension and
+without a bot joining your call. Nothing leaves the computer unless you switch
+on summaries or cloud backup, and both are off until you do.
 
 > Working name. Alpha: it works, and it has not been through many hands yet.
 

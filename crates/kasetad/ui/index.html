@@ -835,7 +835,14 @@ function stageChips(item) {
 
     const chip = el("span", "chip");
 
-    if (done) {
+    // What the stage is doing now outranks what it once produced. Backup is
+    // queued again whenever a recording changes, so a tick drawn from "a copy
+    // exists" would hide a refresh that is queued, running, or failed — and
+    // present a stale copy as a current one, with no way to act on it.
+    const busy = ["queued", "running", "retrying"].includes(st?.state);
+    const unfinished = busy || st?.state === "failed" || st?.state === "skipped";
+
+    if (done && !unfinished) {
       chip.classList.add("ok");
       chip.textContent = `${stage.name} ✓`;
     } else if (st?.state === "running") {
