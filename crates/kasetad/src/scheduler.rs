@@ -697,6 +697,37 @@ mod tests {
         );
     }
 
+    /// And the skip has to be legible afterwards, or the interface shows a
+    /// stage that looks done and refuses to run when the setting is corrected.
+    #[test]
+    fn a_skip_is_recorded_with_its_reason() {
+        let (db, rec) = db_with_recording();
+        {
+            let guard = db.lock().unwrap();
+            guard.enqueue(rec, JobType::Summarize, 1).unwrap();
+        }
+
+        let job = claim(&db).unwrap().unwrap();
+        finish(
+            &db,
+            job.id,
+            job.job_type,
+            rec,
+            Ok(StageOutcome::Skipped("summaries are switched off".into())),
+        );
+
+        let guard = db.lock().unwrap();
+        let stages = crate::library::stages_for(&guard, rec).unwrap();
+        let summarize = stages.iter().find(|s| s.stage == "summarize").unwrap();
+
+        assert_eq!(summarize.state, "skipped");
+        assert_eq!(summarize.error.as_deref(), Some("summaries are switched off"));
+        assert!(
+            summarize.retryable,
+            "correcting the setting must leave something to act on"
+        );
+    }
+
     #[test]
     fn a_failed_stage_does_not_queue_the_next_one() {
         // Summarising a transcript that was never produced would fail anyway,
