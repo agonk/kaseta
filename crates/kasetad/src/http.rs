@@ -556,6 +556,7 @@ async fn run_stage(
         "transcribe" => kaseta_contracts::JobType::Transcribe,
         "summarize" => kaseta_contracts::JobType::Summarize,
         "backup" => kaseta_contracts::JobType::UploadRemote,
+        "publish" => kaseta_contracts::JobType::PublishWebhook,
         other => return Err(ApiError::bad_request(format!("unknown stage: {other}"))),
     };
 
@@ -593,7 +594,27 @@ async fn run_stage(
             )
             .map_err(|e| ApiError::internal(e.to_string()))?;
 
-        db.enqueue_once(id, job_type, 1)
+        // Handing over is keyed on the transcript's content rather than on 1,
+        // so that asking twice for the same text is one job and asking after a
+        // re-transcription is a new one. A send that already succeeded is
+        // cleared too: pressing the button is a request to send it, and
+        // Webhook treats a repeat as the no-op it is.
+        let revision = if job_type == kaseta_contracts::JobType::PublishWebhook {
+            db.conn()
+                .execute(
+                    "DELETE FROM jobs WHERE recording_id = ?1 AND job_type = ?2",
+                    rusqlite::params![id.to_string(), job_type.as_str()],
+                )
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+            crate::derived::transcript_document(db, id)
+                .map_err(ApiError::from_anyhow)?
+                .map(|d| crate::webhook::revision_of(&crate::webhook::render_transcript(&d)))
+                .ok_or_else(|| ApiError::bad_request("there is no transcript to send yet"))?
+        } else {
+            1
+        };
+
+        db.enqueue_once(id, job_type, revision)
             .map_err(ApiError::from_anyhow)
             .map(|queued| queued.is_some())
     })

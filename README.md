@@ -32,6 +32,24 @@ hooking a specific application.
 Optionally copies recordings to S3-compatible storage — Cloudflare R2,
 Backblaze, MinIO — and expires old ones on a policy you set.
 
+## Webhook
+
+A finished recording can be handed to a URL of your choosing,
+a task console, which reads the transcript and extracts the work in it. Off
+until you switch it on, in **Settings**: an address, a token, and when to send —
+as soon as the transcript is ready, after the summary too, or only when you
+press **Send** on a recording.
+
+Put the client at the front of the meeting title — `Acme: weekly sync`, or
+`Acme - Website: redesign` — and it is filed there. Anything it cannot place
+confidently waits to be filed by hand rather than being guessed at.
+
+The token is an *intake* credential: it can deposit recordings and nothing else.
+It cannot read a task, change one, or see any other client's work, which is the
+right shape for something living on a laptop.
+
+Only the transcript and the summary are sent. The audio never is.
+
 ## What leaves your machine
 
 Nothing, until you switch something on. Each of these is a separate switch in
@@ -43,10 +61,12 @@ Nothing, until you switch something on. Each of these is a separate switch in
 | Transcription | This machine, in a local model | On |
 | Summaries | Sends **transcript text** to a provider you choose | **Off** |
 | Cloud backup | Sends audio, transcripts and summaries to your bucket | **Off** |
+| Webhook | Sends **transcript text** to your own task console | **Off** |
 
-Two of these send data off the machine, and they send different things.
+Three of these send data off the machine, and they send different things.
 **Summaries** send transcript text to a provider you choose. **Cloud backup**
-sends everything — audio included — to storage you control. Neither happens
+sends everything — audio included — to storage you control. **Webhook** sends
+transcript text to a console you run, which turns it into tasks. None happens
 unless you switch it on.
 
 For summaries, **only that switch decides**. Supplying an API key through the

@@ -31,6 +31,63 @@ pub struct Settings {
     pub retention: RetentionSettings,
     #[serde(default)]
     pub transcription: TranscriptionSettings,
+    #[serde(default)]
+    pub webhook: WebhookSettings,
+}
+
+/// When a finished recording is handed to Webhook.
+///
+/// Off by default, like everything else that leaves this machine. What it sends
+/// is transcript text — the same class of data as summaries, to a different
+/// destination — so it is its own switch rather than a mode of an existing one.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebhookSettings {
+    pub enabled: bool,
+    /// Base URL of the console, e.g. `https://webhook.example`.
+    pub endpoint: Option<String>,
+    /// An intake-purpose access token. It can deposit recordings and nothing
+    /// else — it cannot read or change a task — so losing it costs less than
+    /// losing a credential that could.
+    pub token: Option<String>,
+    pub send_when: SendWhen,
+}
+
+/// Which moment counts as "this recording is ready to hand over".
+///
+/// Three, because all three are wanted and none is a sensible default for the
+/// others. Summaries are off by default, so `Summary` would mean *never* for
+/// most setups; `Manual` is right for anyone who wants no background traffic at
+/// all; `Transcript` is what makes the thing automatic for everyone else.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendWhen {
+    /// As soon as there is a transcript, which is what Webhook extracts from.
+    #[default]
+    Transcript,
+    /// After the summary too, so the payload is always complete.
+    Summary,
+    /// Only when somebody presses Send.
+    Manual,
+}
+
+impl WebhookSettings {
+    /// Whether a send could actually be attempted. A switch with no endpoint or
+    /// no token is a switch that would queue work to fail.
+    pub fn is_configured(&self) -> bool {
+        self.enabled
+            && self.endpoint.as_deref().is_some_and(|e| !e.trim().is_empty())
+            && self.token.as_deref().is_some_and(|t| !t.trim().is_empty())
+    }
+
+    /// The URL a recording is posted to.
+    pub fn intake_url(&self) -> Option<String> {
+        let base = self.endpoint.as_deref()?.trim().trim_end_matches('/');
+        if base.is_empty() {
+            return None;
+        }
+        Some(format!("{base}/api/agent/intake"))
+    }
 }
 
 /// Whether meetings are transcribed at all.
@@ -191,6 +248,20 @@ pub struct RedactedSettings {
     pub summaries: RedactedSummary,
     pub remote_storage: RedactedRemoteStorage,
     pub retention: RetentionSettings,
+    pub webhook: RedactedWebhook,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RedactedWebhook {
+    pub enabled: bool,
+    pub endpoint: String,
+    pub send_when: SendWhen,
+    /// Never the token itself, only that one is set and enough to recognise it.
+    pub token_set: bool,
+    pub token_hint: Option<String>,
+    /// False when the switch is on but there is nothing to send to, which the
+    /// interface says out loud rather than leaving as a silent no-op.
+    pub configured: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -274,6 +345,14 @@ impl Settings {
                 delete_local_after_upload: self.remote_storage.delete_local_after_upload,
             },
             retention: self.retention.clone(),
+            webhook: RedactedWebhook {
+                enabled: self.webhook.enabled,
+                endpoint: self.webhook.endpoint.clone().unwrap_or_default(),
+                send_when: self.webhook.send_when,
+                token_set: self.webhook.token.is_some(),
+                token_hint: self.webhook.token.as_deref().and_then(hint),
+                configured: self.webhook.is_configured(),
+            },
         }
     }
 }
@@ -300,6 +379,10 @@ pub struct SettingsUpdate {
     pub retention_enabled: Option<bool>,
     pub retention_keep_days: Option<u32>,
     pub retention_audio_only: Option<bool>,
+    pub webhook_enabled: Option<bool>,
+    pub webhook_endpoint: Option<String>,
+    pub webhook_token: Option<String>,
+    pub webhook_send_when: Option<SendWhen>,
 }
 
 impl Settings {
@@ -351,6 +434,22 @@ impl Settings {
         }
         if let Some(v) = update.retention_audio_only {
             self.retention.audio_only = v;
+        }
+        if let Some(v) = update.webhook_enabled {
+            self.webhook.enabled = v;
+        }
+        if let Some(v) = update.webhook_endpoint {
+            self.webhook.endpoint = non_empty(v);
+        }
+        if let Some(v) = update.webhook_token {
+            // Same rule as the summary key: absent leaves it alone, explicitly
+            // empty clears it. The interface never receives the token, so it
+            // cannot send one back unchanged, and without the distinction
+            // saving any unrelated setting would erase it.
+            self.webhook.token = non_empty(v);
+        }
+        if let Some(v) = update.webhook_send_when {
+            self.webhook.send_when = v;
         }
     }
 }

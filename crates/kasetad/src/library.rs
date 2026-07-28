@@ -57,7 +57,7 @@ pub struct LibraryItem {
 /// to a stage that was never attempted.
 #[derive(Clone, Debug, Serialize)]
 pub struct StageState {
-    /// `transcribe`, `summarize`, or `upload_remote`.
+    /// `transcribe`, `summarize`, `upload_remote`, or `publish_webhook`.
     pub stage: String,
     /// `queued`, `running`, `succeeded`, `skipped`, `failed`, or `retrying`.
     pub state: String,

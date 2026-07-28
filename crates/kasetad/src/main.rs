@@ -16,6 +16,7 @@ mod retention;
 mod scheduler;
 mod summarize;
 mod supervisor;
+mod webhook;
 mod transcribe;
 
 const USAGE: &str = "\

@@ -434,6 +434,7 @@ fn parse_job_type(s: &str) -> Result<JobType> {
     Ok(match s {
         "finalize_recording" => JobType::FinalizeRecording,
         "transcribe" => JobType::Transcribe,
+        "publish_webhook" => JobType::PublishWebhook,
         "merge_transcript" => JobType::MergeTranscript,
         "summarize" => JobType::Summarize,
         "upload_remote" => JobType::UploadRemote,

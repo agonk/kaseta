@@ -476,10 +476,44 @@
 
     <div class="divider"></div>
 
+    <div class="row-between">
+      <div class="sec-head" style="margin:0">Webhook</div>
+      <label class="switch"><input type="checkbox" id="td-enabled" aria-label="Enable sending to Webhook"><span></span></label>
+    </div>
+    <p class="hint" style="margin:6px 0 12px">
+      Sends the transcript to your Webhook console, which files it against a client and extracts
+      tasks from it. Put the client at the front of the meeting title — <em>Acme: weekly sync</em>,
+      or <em>Acme - Website: redesign</em> — and it is filed there; anything it cannot place waits
+      to be filed by hand rather than being guessed at.
+    </p>
+    <div class="field">
+      <label for="td-endpoint">Address</label>
+      <input type="text" id="td-endpoint" placeholder="https://webhook.example">
+    </div>
+    <div class="grid2">
+      <div class="field">
+        <label for="td-token">Token</label>
+        <input type="password" id="td-token" autocomplete="off" placeholder="td_live_…">
+        <div class="hint" id="td-token-hint"></div>
+      </div>
+      <div class="field">
+        <label for="td-when">Send</label>
+        <select id="td-when">
+          <option value="transcript">when the transcript is ready</option>
+          <option value="summary">when the summary is ready</option>
+          <option value="manual">only when I press Send</option>
+        </select>
+      </div>
+    </div>
+    <div class="hint" id="td-status" style="margin-top:8px"></div>
+
+    <div class="divider"></div>
+
     <div class="privacy">
       <strong>Privacy.</strong> Recordings and transcripts are produced and kept on this machine.
-      Transcription runs locally. Only transcript text is sent to your chosen provider, and only
-      when summaries are switched on.
+      Transcription runs locally. Transcript text leaves it in two cases, each with its own switch
+      above and both off until you turn them on: to your chosen summary provider, and to your own
+      Webhook console.
     </div>
 
     <div class="divider"></div>
@@ -800,11 +834,23 @@ function renderDetailInner(item) {
   loadSummary(sm, item);
 }
 
+// The job each chip reports on, where the two are named differently.
+const STAGE_JOBS = {
+  transcribe: "transcribe",
+  summarize: "summarize",
+  backup: "upload_remote",
+  publish: "publish_webhook",
+};
+
 // What each stage is called, and what it means when it has not happened.
 const STAGES = [
   { key: "transcribe", name: "Transcript", done: (i) => i.has_transcript },
   { key: "summarize",  name: "Summary",    done: (i) => i.has_summary },
   { key: "backup",     name: "Backup",     done: (i) => i.audio_remote },
+  // Nothing local changes when a recording is handed over, so unlike the
+  // others this has no artefact to point at — the job's own state is the whole
+  // record, which is why `done` asks the stage rather than the recording.
+  { key: "publish",    name: "Webhook",   done: (i, st) => st?.state === "succeeded" },
 ];
 
 /// Where each stage stands, with the action that makes sense for it.
@@ -815,7 +861,7 @@ const STAGES = [
 function stageChips(item) {
   const box = el("div", "chips");
   const stateOf = (key) =>
-    (item.stages || []).find((s) => s.stage === (key === "backup" ? "upload_remote" : key));
+    (item.stages || []).find((s) => s.stage === STAGE_JOBS[key]);
 
   // Where the audio is, which changes once backup removes local copies.
   const where = el("span", "chip");
@@ -830,8 +876,14 @@ function stageChips(item) {
     // Backup is only meaningful once it is switched on, and nothing reports
     // that per-recording, so it is shown only when it has happened or failed.
     const st = stateOf(stage.key);
-    const done = stage.done(item);
+    const done = stage.done(item, st);
+    // Both of these are opt-in and neither reports itself per recording, so
+    // showing them before anything has happened would put two permanently
+    // unfinished chips on every row of a library that uses neither.
     if (stage.key === "backup" && !done && !st) continue;
+    // Manual mode queues nothing at all, so a chip that waited for a job to
+    // exist would hide the button whose entire purpose is starting one.
+    if (stage.key === "publish" && !webhookOn && !done && !st) continue;
 
     const chip = el("span", "chip");
 
@@ -1151,6 +1203,18 @@ $("open-settings").onclick = async () => {
     $("ret-days").value = s.retention.keep_days || "";
     $("ret-audio-only").checked = s.retention.audio_only;
 
+    $("td-enabled").checked = s.webhook.enabled;
+    $("td-endpoint").value = s.webhook.endpoint || "";
+    $("td-when").value = s.webhook.send_when || "transcript";
+    $("td-token").value = "";
+    $("td-token-hint").textContent = s.webhook.token_set
+      ? `Saved ${s.webhook.token_hint || ""} — leave blank to keep it` : "";
+    // A switch that is on but cannot reach anywhere would otherwise look
+    // identical to a working one, and nothing would arrive.
+    $("td-status").textContent = s.webhook.enabled && !s.webhook.configured
+      ? "Switched on, but it needs both an address and a token before anything is sent."
+      : "";
+
     sheet.showModal();
   } catch (e) { fail(e.message); }
 };
@@ -1173,11 +1237,15 @@ $("settings-save").onclick = async () => {
     remote_delete_local: $("r2-delete").checked,
     retention_enabled: $("ret-enabled").checked,
     retention_audio_only: $("ret-audio-only").checked,
+    webhook_enabled: $("td-enabled").checked,
+    webhook_endpoint: $("td-endpoint").value,
+    webhook_send_when: $("td-when").value,
   };
   const days = parseInt($("ret-days").value, 10);
   if (Number.isFinite(days) && days > 0) body.retention_keep_days = days;
   if ($("sum-key").value) body.summaries_api_key = $("sum-key").value;
   if ($("r2-secret").value) body.remote_secret_access_key = $("r2-secret").value;
+  if ($("td-token").value) body.webhook_token = $("td-token").value;
 
   try {
     await api("/api/v1/settings", { method: "PUT", body: JSON.stringify(body) });
@@ -1255,12 +1323,22 @@ $("q").oninput = (e) => {
 // The privacy line states what is actually configured rather than a slogan:
 // turning on summaries or backup changes what leaves the machine, and a status
 // bar that kept claiming otherwise would be lying.
+// Whether the Webhook chip is worth showing at all. Read from settings rather
+// than from the recording, because nothing about a recording says whether its
+// owner uses Webhook.
+let webhookOn = false;
+
 async function refreshPrivacy() {
   try {
     const s = await api("/api/v1/settings");
+    webhookOn = Boolean(s.webhook && s.webhook.configured);
     const leaves = [];
     if (s.summaries.enabled && s.summaries.api_key_set) leaves.push("transcripts → summariser");
     if (s.remote_storage.enabled) leaves.push("recordings → your bucket");
+    // Configured, not merely switched on: a destination that cannot be reached
+    // sends nothing, and saying it does would be the same lie in the other
+    // direction.
+    if (s.webhook.configured) leaves.push("transcripts → Webhook");
 
     $("privacy").textContent = leaves.length
       ? `Audio stays local · sent out: ${leaves.join(" · ")}`
