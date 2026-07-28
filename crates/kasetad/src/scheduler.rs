@@ -208,9 +208,9 @@ pub fn why_not_runnable(
         // it needs preconditions of its own.
         JobType::PublishWebhook => {
             if !settings.webhook.enabled {
-                Some("Webhook is switched off in Settings".into())
+                Some("sending is switched off in Settings".into())
             } else if !settings.webhook.is_configured() {
-                Some("Webhook needs an address and a token, which are not set in Settings".into())
+                Some("sending needs a URL and a token, which are not set in Settings".into())
             } else if crate::derived::transcript_document(db, recording_id)?.is_none() {
                 Some("there is no transcript to send yet".into())
             } else {
@@ -447,7 +447,7 @@ fn execute(
                 return Ok(StageOutcome::Skipped("the recording is gone".into()));
             };
 
-            let ack = crate::webhook::publish(
+            let status = crate::webhook::publish(
                 &settings.webhook,
                 &crate::webhook::Recording {
                     id: recording_id,
@@ -459,13 +459,7 @@ fn execute(
                         .then(|| item.duration_ms as f64 / 1000.0),
                 },
             )?;
-            tracing::info!(
-                %recording_id,
-                status = %ack.status,
-                client = %ack.client_id.clone().unwrap_or_else(|| "unfiled".into()),
-                filed = %ack.filed.clone().unwrap_or_default(),
-                "sent to Webhook"
-            );
+            tracing::info!(%recording_id, status, "sent to the webhook");
             Ok(StageOutcome::Done)
         }
         JobType::FinalizeRecording | JobType::MergeTranscript => Ok(StageOutcome::Skipped(
@@ -534,11 +528,11 @@ pub enum StageOutcome {
     Skipped(String),
 }
 
-/// Whether finishing this stage is the moment to hand the recording over.
+/// Whether finishing this stage is the moment to send the recording.
 ///
-/// Off unless Webhook is switched on AND has somewhere to send to: queueing a
-/// job that can only report "not configured" turns a setting nobody filled in
-/// into a failed stage on every recording.
+/// Off unless sending is switched on AND has somewhere to go: queueing a job
+/// that can only report "not configured" turns a setting nobody filled in into
+/// a failed stage on every recording.
 ///
 /// `Manual` queues nothing, which is the whole of what it means.
 fn publishes_after(webhook: &crate::config::WebhookSettings, job_type: JobType) -> bool {
@@ -601,9 +595,9 @@ fn finish(
             // only once. Enqueueing from inside the stage let a crash in the
             // gap leave the follow-up queued while the stage itself was
             // requeued, doubling paid work on restart.
-            // Handing a recording to Webhook is not a chained stage — nothing
-            // depends on it — but it does have a moment, and the moment is a
-            // setting. Read here rather than baked into next_stage() so that
+            // Sending a recording is not a chained stage — nothing depends on
+            // it — but it does have a moment, and the moment is a setting.
+            // Read here rather than baked into next_stage() so that
             // "after the transcript" and "after the summary" are one branch
             // instead of two shapes of the pipeline.
             let webhook = crate::config::Settings::load().unwrap_or_default().webhook;
@@ -617,16 +611,16 @@ fn finish(
                     .ok()
                     .flatten()
                     .map(|d| crate::webhook::revision_of(&crate::webhook::render_transcript(&d)));
-                // Nothing to hand over yet is not a reason to stop: the
+                // Nothing to send yet is not a reason to stop: the
                 // chaining below still has to run, and an early return here
                 // would leave a transcript without its summary.
                 match revision.map(|r| guard.enqueue_once(recording_id, JobType::PublishWebhook, r))
                 {
-                    None => tracing::debug!(%recording_id, "no transcript to hand over yet"),
-                    Some(Ok(Some(_))) => tracing::debug!("queued the hand-off to Webhook"),
-                    Some(Ok(None)) => tracing::debug!("hand-off to Webhook already queued"),
+                    None => tracing::debug!(%recording_id, "no transcript to send yet"),
+                    Some(Ok(Some(_))) => tracing::debug!("queued the send"),
+                    Some(Ok(None)) => tracing::debug!("send already queued"),
                     Some(Err(e)) => {
-                        tracing::error!(error = %format!("{e:#}"), "could not queue the hand-off")
+                        tracing::error!(error = %format!("{e:#}"), "could not queue the send")
                     }
                 }
             }
@@ -646,7 +640,7 @@ fn finish(
             // attempt can succeed at, and the attempt budget stops a
             // permanently broken job from looping. But some failures are
             // statements about the request rather than the moment — a payload
-            // Webhook rejected will be rejected identically every time — and
+            // the receiver rejected will be rejected identically every time — and
             // burying those behind an attempt budget hides the one thing the
             // person needs to read.
             let retryable = e.downcast_ref::<crate::webhook::Permanent>().is_none();
@@ -993,21 +987,21 @@ mod tests {
 }
 
 #[cfg(test)]
-mod webhook_trigger_tests {
+mod send_trigger_tests {
     use super::*;
     use crate::config::{SendWhen, WebhookSettings};
 
     fn configured(send_when: SendWhen) -> WebhookSettings {
         WebhookSettings {
             enabled: true,
-            endpoint: Some("https://webhook.example".into()),
-            token: Some("td_live_x".into()),
+            url: Some("https://example.test/api/agent/intake".into()),
+            token: Some("k_live_x".into()),
             send_when,
         }
     }
 
     #[test]
-    fn transcript_mode_hands_over_when_the_transcript_lands() {
+    fn transcript_mode_sends_when_the_transcript_lands() {
         let s = configured(SendWhen::Transcript);
         assert!(publishes_after(&s, JobType::Transcribe));
         assert!(!publishes_after(&s, JobType::Summarize));
@@ -1027,7 +1021,7 @@ mod webhook_trigger_tests {
     fn manual_mode_queues_nothing_at_all() {
         let s = configured(SendWhen::Manual);
         for job in [JobType::Transcribe, JobType::Summarize, JobType::UploadRemote] {
-            assert!(!publishes_after(&s, job), "{job:?} must not queue a hand-off");
+            assert!(!publishes_after(&s, job), "{job:?} must not queue a send");
         }
     }
 
@@ -1038,14 +1032,14 @@ mod webhook_trigger_tests {
         for s in [
             WebhookSettings { enabled: false, ..configured(SendWhen::Transcript) },
             WebhookSettings { token: None, ..configured(SendWhen::Transcript) },
-            WebhookSettings { endpoint: None, ..configured(SendWhen::Transcript) },
+            WebhookSettings { url: None, ..configured(SendWhen::Transcript) },
         ] {
             assert!(!publishes_after(&s, JobType::Transcribe));
         }
     }
 
     #[test]
-    fn the_hand_off_chains_to_nothing() {
+    fn the_send_chains_to_nothing() {
         assert_eq!(next_stage(JobType::PublishWebhook), None);
     }
 

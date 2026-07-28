@@ -1,33 +1,37 @@
-//! Handing a finished recording to Webhook.
+//! Posting a finished recording to a webhook.
 //!
-//! Webhook turns written material into tasks with a provenance trail. What it
-//! wants from here is the transcript — the raw material — not conclusions:
-//! Kaseta's own action items carry no source quote, no confidence and no
-//! commitment/aside distinction, so importing them as tasks would put rows
-//! beside extracted ones that look identical and are not. The summary travels
-//! as context and is filed against the source event.
+//! What travels is the transcript — the raw material — rather than Kaseta's own
+//! conclusions. Its action items carry no source quote, no confidence and no
+//! commitment/aside distinction, so a receiver that extracts tasks would end up
+//! with rows beside its own that look identical and are not. The summary goes
+//! too, as context for the transcript rather than as a substitute for it.
 //!
-//! The credential is an *intake* token: it may deposit recordings and nothing
-//! else. It cannot read a task, change one, or create the client it files
-//! against, which is the right shape for something living on a laptop.
+//! The URL is used exactly as configured and the response is not interpreted
+//! beyond its status. Both are deliberate: a recorder that appended a path or
+//! read a particular field would work with one receiver and silently fail with
+//! every other.
+//!
+//! The credential should be scoped to depositing recordings and nothing else,
+//! which is the right shape for something living on a laptop.
 
 use anyhow::{Context, Result};
 use kaseta_contracts::{SummaryDocument, TranscriptDocument};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use ulid::Ulid;
 
 use crate::config::WebhookSettings;
 
-/// Webhook refuses a transcript larger than this, matching its own Intake
-/// screen. Refusing here rather than sending it means the failure names the
-/// reason instead of arriving as a rejected request.
+/// Larger than this is refused before it is sent, so the failure names the
+/// reason instead of arriving as a rejected request. Receivers commonly cap
+/// request bodies, and a transcript this long is minutes of silence
+/// mis-transcribed far more often than it is a real meeting.
 const MAX_TRANSCRIPT_CHARS: usize = 500_000;
 
 /// A failure that retrying cannot fix.
 ///
 /// The scheduler treats every stage error as retryable, which is right for a
 /// missing worker or a transient read and wrong for an HTTP 4xx: a payload
-/// Webhook rejected will be rejected identically on every attempt until the
+/// the receiver rejected will be rejected identically on every attempt until the
 /// attempt budget runs out, and the failure somebody needs to see is buried
 /// until then.
 #[derive(Debug)]
@@ -45,7 +49,7 @@ impl std::error::Error for Permanent {}
 ///
 /// The obvious key was the transcript revision, and it does not work:
 /// re-transcribing deletes revision 1 and writes revision 1 again, so the number
-/// never moves and a better transcript would arrive at Webhook looking like a
+/// never moves and a better transcript would arrive at the receiver looking like a
 /// redelivery of the old one. A fingerprint of the text has the property the
 /// revision was supposed to have and needs no bookkeeping to keep it true —
 /// identical text is genuinely a retry, and different text is genuinely new
@@ -70,7 +74,7 @@ pub fn revision_of(transcript: &str) -> u32 {
 }
 
 #[derive(Debug, Serialize)]
-struct IntakePayload<'a> {
+struct Payload<'a> {
     recording_id: String,
     transcript_fingerprint: String,
     title: &'a str,
@@ -82,21 +86,12 @@ struct IntakePayload<'a> {
     summary: Option<&'a serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct IntakeAck {
-    pub status: String,
-    #[serde(default)]
-    pub client_id: Option<String>,
-    #[serde(default)]
-    pub filed: Option<String>,
-}
-
-/// The transcript as Webhook reads it: one attributed line per turn.
+/// The transcript as it is sent: one attributed line per turn.
 ///
 /// Attribution is the reason this is worth sending rather than the audio. Every
 /// line already knows who said it, because it is derived from which track
 /// carried it — so `you` is the person holding this machine and `them` is the
-/// far end, and Webhook can tell a commitment from a request without guessing.
+/// far end, and a receiver can tell a commitment from a request without guessing.
 pub fn render_transcript(doc: &TranscriptDocument) -> String {
     let mut out = String::new();
     for line in &doc.lines {
@@ -118,9 +113,9 @@ pub fn render_transcript(doc: &TranscriptDocument) -> String {
 pub struct Recording<'a> {
     pub id: Ulid,
     pub title: &'a str,
-    /// When the call happened, not when it is being sent. Webhook resolves
-    /// "by Friday" against this, so a recording handed over on Monday still
-    /// dates its deadlines from the call.
+    /// When the call happened, not when it is being sent. A receiver resolving
+    /// "by Friday" needs the former, so a recording sent on Monday still dates
+    /// its deadlines from the call.
     pub recorded_at: time::OffsetDateTime,
     pub transcript: &'a TranscriptDocument,
     pub summary: Option<&'a SummaryDocument>,
@@ -134,7 +129,7 @@ fn build(rec: &Recording<'_>) -> Result<(String, serde_json::Value)> {
     }
     if transcript.len() > MAX_TRANSCRIPT_CHARS {
         return Err(Permanent(format!(
-            "the transcript is {} characters; Webhook accepts {MAX_TRANSCRIPT_CHARS}",
+            "the transcript is {} characters; the limit for sending is {MAX_TRANSCRIPT_CHARS}",
             transcript.len()
         ))
         .into());
@@ -151,7 +146,7 @@ fn build(rec: &Recording<'_>) -> Result<(String, serde_json::Value)> {
         .format(&time::format_description::well_known::Rfc3339)
         .context("formatting the recording time")?;
 
-    let payload = IntakePayload {
+    let payload = Payload {
         recording_id: rec.id.to_string(),
         transcript_fingerprint: fingerprint(&transcript),
         title: rec.title,
@@ -166,15 +161,21 @@ fn build(rec: &Recording<'_>) -> Result<(String, serde_json::Value)> {
 }
 
 /// Posts one recording. Blocking, because it runs inside a stage worker.
-pub fn publish(settings: &WebhookSettings, rec: &Recording<'_>) -> Result<IntakeAck> {
+///
+/// Returns the status that was accepted, which is the only thing the response
+/// is read for. A receiver's own body — what it filed the recording as, which
+/// client it matched — belongs to that receiver's model, and interpreting it
+/// here would make this work with exactly one of them.
+pub fn publish(settings: &WebhookSettings, rec: &Recording<'_>) -> Result<u16> {
     let url = settings
-        .intake_url()
-        .ok_or_else(|| Permanent("Webhook has no endpoint set in Settings".into()))?;
+        .post_url()
+        .ok_or_else(|| Permanent("no webhook URL is set in Settings".into()))?;
     let token = settings
         .token
         .as_deref()
-        .filter(|t| !t.trim().is_empty())
-        .ok_or_else(|| Permanent("Webhook has no token set in Settings".into()))?;
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| Permanent("no webhook token is set in Settings".into()))?;
 
     let (_id, body) = build(rec)?;
 
@@ -184,33 +185,35 @@ pub fn publish(settings: &WebhookSettings, rec: &Recording<'_>) -> Result<Intake
         .context("building the HTTP client")?;
 
     let res = client
-        .post(&url)
-        .bearer_auth(token.trim())
+        .post(url)
+        .bearer_auth(token)
         .json(&body)
         .send()
-        .context("posting to Webhook")?;
+        .context("posting to the webhook")?;
 
     let status = res.status();
     if status.is_success() {
-        return res.json::<IntakeAck>().context("reading Webhook's answer");
+        return Ok(status.as_u16());
     }
 
     let detail = res.text().unwrap_or_default();
     let detail = detail.chars().take(400).collect::<String>();
 
     // 4xx is a statement about the request, and the request will not change on
-    // its own. 401 in particular is worth naming: a token that expired or was
-    // revoked reads as "nothing is arriving" otherwise.
+    // its own. 401 and 404 are worth naming: a revoked token and a URL missing
+    // its path both read as "nothing is arriving" otherwise, and the second is
+    // the likely mistake when a base URL is pasted where a full one is wanted.
     if status.is_client_error() {
         let hint = match status.as_u16() {
-            401 => "Webhook refused the token — it may have expired, been revoked, or be a work token rather than an intake one",
-            413 => "Webhook refused the recording as too large",
-            _ => "Webhook refused the recording",
+            401 | 403 => "the webhook refused the token — it may have expired or been revoked",
+            404 => "the webhook URL was not found — check it includes the full path, not just the host",
+            413 => "the webhook refused the recording as too large",
+            _ => "the webhook refused the recording",
         };
         return Err(Permanent(format!("{hint} ({status}): {detail}")).into());
     }
 
-    anyhow::bail!("Webhook answered {status}: {detail}")
+    anyhow::bail!("the webhook answered {status}: {detail}")
 }
 
 #[cfg(test)]
@@ -320,36 +323,64 @@ mod tests {
         assert!(err.downcast_ref::<Permanent>().is_some(), "must not retry");
     }
 
+    /// The whole point of taking a complete URL: whatever path a receiver uses
+    /// survives untouched, and no path is invented for one that uses none.
     #[test]
-    fn builds_the_intake_url_from_a_base_however_it_is_typed() {
-        for base in ["https://td.example", "https://td.example/", "https://td.example///"] {
+    fn posts_to_the_url_exactly_as_configured() {
+        for url in [
+            "https://example.test/api/agent/intake",
+            "https://example.test/hooks/kaseta?token=1",
+            "https://example.test",
+        ] {
             let s = WebhookSettings {
                 enabled: true,
-                endpoint: Some(base.into()),
-                token: Some("td_live_x".into()),
+                url: Some(url.into()),
+                token: Some("k_live_x".into()),
                 ..Default::default()
             };
-            assert_eq!(s.intake_url().unwrap(), "https://td.example/api/agent/intake");
+            assert_eq!(s.post_url().unwrap(), url);
             assert!(s.is_configured());
         }
     }
 
+    /// Surrounding whitespace comes free with pasting and means nothing, so it
+    /// is trimmed rather than posted to.
     #[test]
-    fn is_not_configured_without_an_endpoint_or_a_token() {
+    fn a_pasted_url_is_trimmed_but_otherwise_untouched() {
+        let s = WebhookSettings {
+            enabled: true,
+            url: Some("  https://example.test/intake/  ".into()),
+            token: Some("k".into()),
+            ..Default::default()
+        };
+        assert_eq!(s.post_url().unwrap(), "https://example.test/intake/");
+    }
+
+    #[test]
+    fn is_not_configured_without_a_url_or_a_token() {
         let on_but_empty = WebhookSettings {
             enabled: true,
-            endpoint: Some("  ".into()),
+            url: Some("  ".into()),
             token: Some("t".into()),
             ..Default::default()
         };
         assert!(!on_but_empty.is_configured());
+        assert!(on_but_empty.post_url().is_none(), "blank is not a URL");
 
         let no_token = WebhookSettings {
             enabled: true,
-            endpoint: Some("https://td.example".into()),
+            url: Some("https://example.test/intake".into()),
             token: None,
             ..Default::default()
         };
         assert!(!no_token.is_configured());
+
+        let switched_off = WebhookSettings {
+            enabled: false,
+            url: Some("https://example.test/intake".into()),
+            token: Some("t".into()),
+            ..Default::default()
+        };
+        assert!(!switched_off.is_configured(), "a switch off means off");
     }
 }

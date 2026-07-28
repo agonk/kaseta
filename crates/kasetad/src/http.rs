@@ -598,7 +598,7 @@ async fn run_stage(
         // so that asking twice for the same text is one job and asking after a
         // re-transcription is a new one. A send that already succeeded is
         // cleared too: pressing the button is a request to send it, and
-        // Webhook treats a repeat as the no-op it is.
+        // a receiver is expected to treat a repeat as the no-op it is.
         let revision = if job_type == kaseta_contracts::JobType::PublishWebhook {
             db.conn()
                 .execute(

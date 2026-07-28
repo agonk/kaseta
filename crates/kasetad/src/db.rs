@@ -18,7 +18,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use ulid::Ulid;
 
 /// Bumped whenever the schema changes. Migrations run in order at startup.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// The single local user. Present so every query is already scoped by owner and
 /// adding real accounts does not mean rewriting them.
@@ -72,6 +72,18 @@ impl Db {
             return Ok(());
         }
 
+        // All of it, or none of it, including the version stamp.
+        //
+        // Without this each statement commits on its own, so a migration that
+        // failed halfway would leave the schema changed and the version behind
+        // it — and the next startup would run the whole step again against a
+        // database it had already half-modified. That is survivable for a
+        // migration which only adds a column; migration 007 rebuilds a table,
+        // and a failure between DROP and RENAME would lose the jobs table
+        // outright. `user_version` lives in the database header and is written
+        // transactionally like anything else, so it rolls back with the rest.
+        let tx = self.conn.unchecked_transaction()?;
+
         if current < 1 {
             self.conn
                 .execute_batch(include_str!("migrations/001_initial.sql"))
@@ -102,9 +114,15 @@ impl Db {
                 .execute_batch(include_str!("migrations/006_derived_backup.sql"))
                 .context("applying migration 006_derived_backup")?;
         }
+        if current < 7 {
+            self.conn
+                .execute_batch(include_str!("migrations/007_publish_webhook.sql"))
+                .context("applying migration 007_publish_webhook")?;
+        }
 
         self.conn
             .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -481,6 +499,29 @@ mod tests {
             )
             .unwrap();
         (db, rec)
+    }
+
+    /// The regression this whole change started from.
+    ///
+    /// `job_type` carries a CHECK listing the stages by name, and sending was
+    /// added without extending it — so every attempt to queue one failed the
+    /// constraint before it reached the network, and the stage had never run
+    /// anywhere. Enumerated rather than spot-checked: the next stage added will
+    /// fail here rather than in production.
+    #[test]
+    fn every_stage_can_actually_be_queued() {
+        let (db, rec) = db_with_recording();
+        for job in [
+            JobType::FinalizeRecording,
+            JobType::Transcribe,
+            JobType::MergeTranscript,
+            JobType::Summarize,
+            JobType::UploadRemote,
+            JobType::PublishWebhook,
+        ] {
+            db.enqueue(rec, job, 1)
+                .unwrap_or_else(|e| panic!("{job:?} cannot be queued: {e:#}"));
+        }
     }
 
     #[test]

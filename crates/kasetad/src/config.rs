@@ -35,7 +35,7 @@ pub struct Settings {
     pub webhook: WebhookSettings,
 }
 
-/// When a finished recording is handed to Webhook.
+/// Where a finished recording is sent, if anywhere.
 ///
 /// Off by default, like everything else that leaves this machine. What it sends
 /// is transcript text — the same class of data as summaries, to a different
@@ -44,11 +44,15 @@ pub struct Settings {
 #[serde(default)]
 pub struct WebhookSettings {
     pub enabled: bool,
-    /// Base URL of the console, e.g. `https://webhook.example`.
-    pub endpoint: Option<String>,
-    /// An intake-purpose access token. It can deposit recordings and nothing
-    /// else — it cannot read or change a task — so losing it costs less than
-    /// losing a credential that could.
+    /// The complete URL to post to, path included.
+    ///
+    /// Complete rather than a base with a path appended: appending one would
+    /// encode a single receiver's API layout in a recorder that has no business
+    /// knowing it, and would leave anybody else's endpoint unreachable.
+    pub url: Option<String>,
+    /// A bearer token sent with each post. It should be scoped to depositing
+    /// recordings and nothing else, so that losing it costs less than losing a
+    /// credential which could read or change what it deposited.
     pub token: Option<String>,
     pub send_when: SendWhen,
 }
@@ -62,7 +66,7 @@ pub struct WebhookSettings {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SendWhen {
-    /// As soon as there is a transcript, which is what Webhook extracts from.
+    /// As soon as there is a transcript, which is the material worth sending.
     #[default]
     Transcript,
     /// After the summary too, so the payload is always complete.
@@ -72,21 +76,17 @@ pub enum SendWhen {
 }
 
 impl WebhookSettings {
-    /// Whether a send could actually be attempted. A switch with no endpoint or
-    /// no token is a switch that would queue work to fail.
+    /// Whether a send could actually be attempted. A switch with no URL or no
+    /// token is a switch that would queue work to fail.
     pub fn is_configured(&self) -> bool {
         self.enabled
-            && self.endpoint.as_deref().is_some_and(|e| !e.trim().is_empty())
+            && self.url.as_deref().is_some_and(|u| !u.trim().is_empty())
             && self.token.as_deref().is_some_and(|t| !t.trim().is_empty())
     }
 
-    /// The URL a recording is posted to.
-    pub fn intake_url(&self) -> Option<String> {
-        let base = self.endpoint.as_deref()?.trim().trim_end_matches('/');
-        if base.is_empty() {
-            return None;
-        }
-        Some(format!("{base}/api/agent/intake"))
+    /// The URL a recording is posted to, exactly as it was configured.
+    pub fn post_url(&self) -> Option<&str> {
+        self.url.as_deref().map(str::trim).filter(|u| !u.is_empty())
     }
 }
 
@@ -254,7 +254,7 @@ pub struct RedactedSettings {
 #[derive(Clone, Debug, Serialize)]
 pub struct RedactedWebhook {
     pub enabled: bool,
-    pub endpoint: String,
+    pub url: String,
     pub send_when: SendWhen,
     /// Never the token itself, only that one is set and enough to recognise it.
     pub token_set: bool,
@@ -347,7 +347,7 @@ impl Settings {
             retention: self.retention.clone(),
             webhook: RedactedWebhook {
                 enabled: self.webhook.enabled,
-                endpoint: self.webhook.endpoint.clone().unwrap_or_default(),
+                url: self.webhook.url.clone().unwrap_or_default(),
                 send_when: self.webhook.send_when,
                 token_set: self.webhook.token.is_some(),
                 token_hint: self.webhook.token.as_deref().and_then(hint),
@@ -380,7 +380,7 @@ pub struct SettingsUpdate {
     pub retention_keep_days: Option<u32>,
     pub retention_audio_only: Option<bool>,
     pub webhook_enabled: Option<bool>,
-    pub webhook_endpoint: Option<String>,
+    pub webhook_url: Option<String>,
     pub webhook_token: Option<String>,
     pub webhook_send_when: Option<SendWhen>,
 }
@@ -438,8 +438,8 @@ impl Settings {
         if let Some(v) = update.webhook_enabled {
             self.webhook.enabled = v;
         }
-        if let Some(v) = update.webhook_endpoint {
-            self.webhook.endpoint = non_empty(v);
+        if let Some(v) = update.webhook_url {
+            self.webhook.url = non_empty(v);
         }
         if let Some(v) = update.webhook_token {
             // Same rule as the summary key: absent leaves it alone, explicitly

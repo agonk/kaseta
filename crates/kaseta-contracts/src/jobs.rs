@@ -26,11 +26,11 @@ pub enum JobType {
     Summarize,
     /// Copy sealed blobs to configured remote object storage.
     UploadRemote,
-    /// Hand the finished transcript to Webhook, which extracts tasks from it.
+    /// Post the finished transcript to the webhook the user configured.
     ///
     /// Outside PIPELINE for the same reason backup is: nothing depends on it,
     /// and it fails for reasons that have nothing to do with the recording — a
-    /// console that is down, a token that expired. Both are worth retrying
+    /// receiver that is down, a token that expired. Both are worth retrying
     /// without redoing anything else.
     PublishWebhook,
 }

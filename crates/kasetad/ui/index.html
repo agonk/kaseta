@@ -478,42 +478,41 @@
 
     <div class="row-between">
       <div class="sec-head" style="margin:0">Webhook</div>
-      <label class="switch"><input type="checkbox" id="td-enabled" aria-label="Enable sending to Webhook"><span></span></label>
+      <label class="switch"><input type="checkbox" id="wh-enabled" aria-label="Enable sending to a webhook"><span></span></label>
     </div>
     <p class="hint" style="margin:6px 0 12px">
-      Sends the transcript to your Webhook console, which files it against a client and extracts
-      tasks from it. Put the client at the front of the meeting title — <em>Acme: weekly sync</em>,
-      or <em>Acme - Website: redesign</em> — and it is filed there; anything it cannot place waits
-      to be filed by hand rather than being guessed at.
+      Posts the transcript and summary to a URL you choose, as JSON, with your token as a bearer
+      credential. Anything that accepts a POST will do.
     </p>
     <div class="field">
-      <label for="td-endpoint">Address</label>
-      <input type="text" id="td-endpoint" placeholder="https://webhook.example">
+      <label for="wh-url">URL</label>
+      <input type="text" id="wh-url" placeholder="https://example.com/hooks/kaseta">
+      <div class="hint">The whole address, path included — it is posted to exactly as written.</div>
     </div>
     <div class="grid2">
       <div class="field">
-        <label for="td-token">Token</label>
-        <input type="password" id="td-token" autocomplete="off" placeholder="td_live_…">
-        <div class="hint" id="td-token-hint"></div>
+        <label for="wh-token">Token</label>
+        <input type="password" id="wh-token" autocomplete="off" placeholder="secret">
+        <div class="hint" id="wh-token-hint"></div>
       </div>
       <div class="field">
-        <label for="td-when">Send</label>
-        <select id="td-when">
+        <label for="wh-when">Send</label>
+        <select id="wh-when">
           <option value="transcript">when the transcript is ready</option>
           <option value="summary">when the summary is ready</option>
           <option value="manual">only when I press Send</option>
         </select>
       </div>
     </div>
-    <div class="hint" id="td-status" style="margin-top:8px"></div>
+    <div class="hint" id="wh-status" style="margin-top:8px"></div>
 
     <div class="divider"></div>
 
     <div class="privacy">
       <strong>Privacy.</strong> Recordings and transcripts are produced and kept on this machine.
       Transcription runs locally. Transcript text leaves it in two cases, each with its own switch
-      above and both off until you turn them on: to your chosen summary provider, and to your own
-      Webhook console.
+      above and both off until you turn them on: to your chosen summary provider, and to the
+      webhook you configured.
     </div>
 
     <div class="divider"></div>
@@ -779,6 +778,8 @@ function renderDetailInner(item) {
     row.append(dl);
   }
 
+  row.append(sendButton(item));
+
   const del = el("button", "icon-btn", "✕");
   del.title = "Delete recording";
   del.setAttribute("aria-label", "Delete recording");
@@ -847,11 +848,58 @@ const STAGES = [
   { key: "transcribe", name: "Transcript", done: (i) => i.has_transcript },
   { key: "summarize",  name: "Summary",    done: (i) => i.has_summary },
   { key: "backup",     name: "Backup",     done: (i) => i.audio_remote },
-  // Nothing local changes when a recording is handed over, so unlike the
-  // others this has no artefact to point at — the job's own state is the whole
-  // record, which is why `done` asks the stage rather than the recording.
-  { key: "publish",    name: "Webhook",   done: (i, st) => st?.state === "succeeded" },
+  // Nothing local changes when a recording is sent, so unlike the others this
+  // has no artefact to point at — the job's own state is the whole record,
+  // which is why `done` asks the stage rather than the recording.
+  { key: "publish",    name: "Webhook",    done: (i, st) => st?.state === "succeeded" },
 ];
+
+/// Why this recording cannot be sent right now, or null if it can.
+///
+/// The same question is answered authoritatively by the daemon, which refuses
+/// the request and says why. This copy exists so a disabled button can carry
+/// the reason without a round trip per recording. It is allowed to be shorter
+/// than the daemon's answer; it must never contradict it.
+function sendBlockedReason(item) {
+  if (!webhook.enabled) return "Sending is switched off in Settings";
+  if (!webhook.configured) return "Sending needs a URL and a token, set in Settings";
+  if (!item.has_transcript) return "There is no transcript to send yet";
+  return null;
+}
+
+/// The Send button, in every state it has.
+///
+/// Always returned, never omitted. A control that disappears when its
+/// preconditions are unmet teaches nothing and cannot be looked for; a disabled
+/// one carrying the reason is the difference between a mystery and an
+/// instruction. This is the whole point of the button existing.
+function sendButton(item) {
+  const st = (item.stages || []).find((s) => s.stage === STAGE_JOBS.publish);
+  const busy = ["queued", "running", "retrying"].includes(st?.state);
+  const again = st?.state === "succeeded" || st?.state === "failed";
+
+  const label = busy ? "Sending…" : again ? "Send again" : "Send";
+  const b = el("button", "btn", label);
+  b.type = "button";
+
+  // Asked before the blocked check so that a send already in flight reads as
+  // in flight, rather than as whatever would have prevented starting one.
+  const blocked = busy ? null : sendBlockedReason(item);
+  b.disabled = busy || Boolean(blocked);
+  // Nothing to explain while it is in flight: the label already says so, and a
+  // tooltip offering to do what is currently being done reads as a stuck button.
+  b.title = busy
+    ? ""
+    : blocked ?? (st?.state === "failed" && st.error ? st.error : "Send the transcript and summary");
+  if (blocked) b.setAttribute("aria-disabled", "true");
+
+  // Restored to whatever it already said, not to "Send again": a request the
+  // daemon refuses queues nothing, so a button that came back reading "Send
+  // again" would be claiming a send had happened. The refusal is shown as a
+  // banner; the button is only meant to become pressable once more.
+  b.onclick = () => runStage(item, "publish", b, "Sending…", label);
+  return b;
+}
 
 /// Where each stage stands, with the action that makes sense for it.
 ///
@@ -881,9 +929,11 @@ function stageChips(item) {
     // showing them before anything has happened would put two permanently
     // unfinished chips on every row of a library that uses neither.
     if (stage.key === "backup" && !done && !st) continue;
-    // Manual mode queues nothing at all, so a chip that waited for a job to
-    // exist would hide the button whose entire purpose is starting one.
-    if (stage.key === "publish" && !webhookOn && !done && !st) continue;
+    // Same rule as backup, and for the same reason: sending is opt-in and
+    // reports nothing per recording. Pressing Send is what makes this chip
+    // appear, and the Send button — which is always on screen — is what says
+    // so when there is nothing here yet.
+    if (stage.key === "publish" && !done && !st) continue;
 
     const chip = el("span", "chip");
 
@@ -939,9 +989,15 @@ function stageChips(item) {
   return box;
 }
 
-async function runStage(item, stage, button) {
+/// Asks for a stage to run, and says so on the control that was pressed.
+///
+/// The labels are passed in because the same request is made from two places
+/// that are not the same size: a `run` button inside a chip, and the Send
+/// button, which is a full control in the action row and would look broken
+/// collapsing to an ellipsis.
+async function runStage(item, stage, button, busyLabel = "…", failedLabel = "retry") {
   button.disabled = true;
-  button.textContent = "…";
+  button.textContent = busyLabel;
   try {
     await api(`/api/v1/recordings/${item.id}/stages/${stage}`, { method: "POST" });
     // Work runs in the background; the list refresh reflects it as it moves.
@@ -949,7 +1005,7 @@ async function runStage(item, stage, button) {
   } catch (e) {
     fail(e.message);
     button.disabled = false;
-    button.textContent = "retry";
+    button.textContent = failedLabel;
   }
 }
 
@@ -1203,16 +1259,16 @@ $("open-settings").onclick = async () => {
     $("ret-days").value = s.retention.keep_days || "";
     $("ret-audio-only").checked = s.retention.audio_only;
 
-    $("td-enabled").checked = s.webhook.enabled;
-    $("td-endpoint").value = s.webhook.endpoint || "";
-    $("td-when").value = s.webhook.send_when || "transcript";
-    $("td-token").value = "";
-    $("td-token-hint").textContent = s.webhook.token_set
+    $("wh-enabled").checked = s.webhook.enabled;
+    $("wh-url").value = s.webhook.url || "";
+    $("wh-when").value = s.webhook.send_when || "transcript";
+    $("wh-token").value = "";
+    $("wh-token-hint").textContent = s.webhook.token_set
       ? `Saved ${s.webhook.token_hint || ""} — leave blank to keep it` : "";
     // A switch that is on but cannot reach anywhere would otherwise look
     // identical to a working one, and nothing would arrive.
-    $("td-status").textContent = s.webhook.enabled && !s.webhook.configured
-      ? "Switched on, but it needs both an address and a token before anything is sent."
+    $("wh-status").textContent = s.webhook.enabled && !s.webhook.configured
+      ? "Switched on, but it needs both a URL and a token before anything is sent."
       : "";
 
     sheet.showModal();
@@ -1237,15 +1293,15 @@ $("settings-save").onclick = async () => {
     remote_delete_local: $("r2-delete").checked,
     retention_enabled: $("ret-enabled").checked,
     retention_audio_only: $("ret-audio-only").checked,
-    webhook_enabled: $("td-enabled").checked,
-    webhook_endpoint: $("td-endpoint").value,
-    webhook_send_when: $("td-when").value,
+    webhook_enabled: $("wh-enabled").checked,
+    webhook_url: $("wh-url").value,
+    webhook_send_when: $("wh-when").value,
   };
   const days = parseInt($("ret-days").value, 10);
   if (Number.isFinite(days) && days > 0) body.retention_keep_days = days;
   if ($("sum-key").value) body.summaries_api_key = $("sum-key").value;
   if ($("r2-secret").value) body.remote_secret_access_key = $("r2-secret").value;
-  if ($("td-token").value) body.webhook_token = $("td-token").value;
+  if ($("wh-token").value) body.webhook_token = $("wh-token").value;
 
   try {
     await api("/api/v1/settings", { method: "PUT", body: JSON.stringify(body) });
@@ -1327,25 +1383,25 @@ $("q").oninput = (e) => {
 // The privacy line states what is actually configured rather than a slogan:
 // turning on summaries or backup changes what leaves the machine, and a status
 // bar that kept claiming otherwise would be lying.
-// Whether the Webhook chip is worth showing at all. Read from settings rather
-// than from the recording, because nothing about a recording says whether its
-// owner uses Webhook.
-let webhookOn = false;
+// What the Send button says when it cannot act. Read from settings rather than
+// from the recording, because nothing about a recording says whether its owner
+// sends anything anywhere.
+let webhook = { enabled: false, configured: false };
 
 async function refreshPrivacy() {
   try {
     const s = await api("/api/v1/settings");
-    const wasOn = webhookOn;
-    webhookOn = Boolean(s.webhook && s.webhook.configured);
+    const was = `${webhook.enabled}/${webhook.configured}`;
+    webhook = {
+      enabled: Boolean(s.webhook && s.webhook.enabled),
+      configured: Boolean(s.webhook && s.webhook.configured),
+    };
 
-    // Whether Webhook is configured decides whether a recording offers a Send
-    // button, and it is the only thing on this screen that changes because of
-    // something typed on ANOTHER screen. The detail pane is otherwise redrawn
-    // only when a recording's own stages change, so without this the button
-    // stayed hidden until the pane happened to be rebuilt for an unrelated
-    // reason — which, for the manual mode whose whole point is pressing it,
-    // meant it never appeared at all.
-    if (webhookOn !== wasOn && selectedId) {
+    // What the Send button says is the only thing on this screen that changes
+    // because of something typed on ANOTHER one. The detail pane is otherwise
+    // redrawn only when a recording's own stages change, so without this the
+    // button would go on giving a reason that had already been dealt with.
+    if (`${webhook.enabled}/${webhook.configured}` !== was && selectedId) {
       const current = items.find((i) => i.id === selectedId);
       if (current) renderDetail(current);
     }
@@ -1355,7 +1411,7 @@ async function refreshPrivacy() {
     // Configured, not merely switched on: a destination that cannot be reached
     // sends nothing, and saying it does would be the same lie in the other
     // direction.
-    if (s.webhook.configured) leaves.push("transcripts → Webhook");
+    if (s.webhook.configured) leaves.push("transcripts → your webhook");
 
     $("privacy").textContent = leaves.length
       ? `Audio stays local · sent out: ${leaves.join(" · ")}`
