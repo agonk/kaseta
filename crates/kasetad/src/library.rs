@@ -333,17 +333,18 @@ fn ids_in(db: &Db, sql: &str) -> Result<HashSet<String>> {
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
-/// The latest state of each pipeline stage, per recording.
-///
-/// Only the newest attempt matters: an earlier failure that has since succeeded
-/// is history, not something to show or offer to retry.
-/// One recording's stages, for callers that do not want the whole library.
+/// One recording's stages, for tests that assert on a single pipeline.
+#[cfg(test)]
 pub fn stages_for(db: &Db, id: Ulid) -> Result<Vec<StageState>> {
     Ok(stages_by_recording(db)?
         .remove(&id.to_string())
         .unwrap_or_default())
 }
 
+/// The latest state of each pipeline stage, per recording.
+///
+/// Only the newest attempt matters: an earlier failure that has since succeeded
+/// is history, not something to show or offer to retry.
 fn stages_by_recording(db: &Db) -> Result<std::collections::HashMap<String, Vec<StageState>>> {
     let mut stmt = db.conn().prepare(
         "SELECT recording_id, job_type, state, error_message, attempt, max_attempts,

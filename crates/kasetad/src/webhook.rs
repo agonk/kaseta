@@ -273,7 +273,7 @@ mod tests {
         let at = |d: &TranscriptDocument| {
             let rec = Recording {
                 id: Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
-                title: "Acme: sync",
+                title: "Weekly sync",
                 recorded_at: time::OffsetDateTime::UNIX_EPOCH,
                 transcript: d,
                 summary: None,
@@ -285,7 +285,7 @@ mod tests {
         let a = at(&first);
         let b = at(&better);
         assert_eq!(a["recorded_at"], "1970-01-01T00:00:00Z");
-        assert_eq!(a["title"], "Acme: sync");
+        assert_eq!(a["title"], "Weekly sync");
         assert_ne!(
             a["transcript_fingerprint"], b["transcript_fingerprint"],
             "a better transcript must not arrive looking like a redelivery"

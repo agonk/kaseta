@@ -879,7 +879,7 @@ mod tests {
     #[test]
     fn the_schema_has_every_column_the_library_queries() {
         let db = Db::open_in_memory().unwrap();
-        let mut stmt = db.conn.prepare("SELECT * FROM recordings LIMIT 0").unwrap();
+        let stmt = db.conn.prepare("SELECT * FROM recordings LIMIT 0").unwrap();
         let columns: Vec<String> = stmt
             .column_names()
             .into_iter()
