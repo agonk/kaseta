@@ -925,9 +925,13 @@ async fn serve_file(
     headers: &HeaderMap,
     missing: &'static str,
 ) -> Result<Response, ApiError> {
+    // Several ranges at once would need a multipart body. Not serving one is
+    // allowed: such a request is answered as if it had asked for no range,
+    // with the whole file, rather than refused.
     let range = headers
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
+        .filter(|r| !is_multi_range(r))
         .map(str::to_string);
 
     let (file, total) = tokio::task::spawn_blocking(move || {
@@ -1184,10 +1188,19 @@ fn gigabytes(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / f64::from(1u32 << 30))
 }
 
+/// Whether a `Range` header asks for more than one range of bytes.
+fn is_multi_range(header: &str) -> bool {
+    header
+        .trim()
+        .strip_prefix("bytes=")
+        .is_some_and(|spec| spec.contains(','))
+}
+
 /// Parses a single-range `Range: bytes=…` header against a known total size.
 ///
-/// Returns inclusive start and end. Multi-range requests are not supported and
-/// yield `None`, which serves the whole file — a valid response.
+/// Returns inclusive start and end, or `None` for a range that cannot be
+/// satisfied. A multi-range request also yields `None`; [`serve_file`] never
+/// passes one here, answering it with the whole file instead.
 fn parse_range(header: &str, total: u64) -> Option<(u64, u64)> {
     if total == 0 {
         return None;
@@ -1332,8 +1345,12 @@ mod tests {
     }
 
     #[test]
-    fn multi_range_requests_fall_back_to_the_whole_file() {
+    fn multi_range_requests_are_recognised() {
         // Serving the entire body is a valid response to a multi-range request.
+        assert!(is_multi_range("bytes=0-10,20-30"));
+        assert!(is_multi_range(" bytes=0-0, -1"));
+        assert!(!is_multi_range("bytes=0-10"));
+        assert!(!is_multi_range("items=0-1,2-3"));
         assert_eq!(parse_range("bytes=0-10,20-30", 1000), None);
     }
 
@@ -1880,6 +1897,23 @@ mod tests {
         let (status, headers, _) = app.get(&uri, Some("bytes=1000-")).await;
         assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(headers[header::CONTENT_RANGE], "bytes */1000");
+    }
+
+    /// Several ranges at once are not served as a multipart body; the whole
+    /// file is, which is just as valid an answer, rather than a refusal.
+    #[tokio::test]
+    async fn a_multi_range_request_gets_the_whole_original() {
+        let app = app(ready());
+        let id = imported(&app, true, true);
+        let uri = format!("/api/v1/recordings/{id}/original");
+
+        for range in ["bytes=0-10,20-30", "bytes=0-0, -1", "bytes=5000-6000,0-1"] {
+            let (status, headers, body) = app.get(&uri, Some(range)).await;
+            assert_eq!(status, StatusCode::OK, "{range}");
+            assert_eq!(body, original_bytes(), "{range}");
+            assert_eq!(headers[header::CONTENT_LENGTH], "1000", "{range}");
+            assert!(headers.get(header::CONTENT_RANGE).is_none(), "{range}");
+        }
     }
 
     /// Saved under the name it had, exactly, with a plain fallback for
