@@ -32,6 +32,71 @@ hooking a specific application.
 Optionally copies recordings to S3-compatible storage — Cloudflare R2,
 Backblaze, MinIO — and expires old ones on a policy you set.
 
+Also takes an audio or video file you already have, a recorded talk, a
+voice memo, a meeting someone else recorded, and turns it into a recording like
+any other: transcribed, summarised, playable, backed up. See
+[Importing a file](#importing-a-file).
+
+## Importing a file
+
+Press **Import** next to the record button, or drop a file anywhere on the
+window. The dialog shows the file, a title to change if you like, and a **Keep
+original file** switch; the upload shows its progress and can be cancelled. The
+recording appears in the library straight away with an **Import** chip, which
+turns into the usual Transcript and Summary chips once the file is decoded. If
+decoding fails, the chip says why and offers to retry.
+
+From a terminal, with the daemon running:
+
+```bash
+kasetad import talk.mp4                       # title taken from the file name
+kasetad import interview.mkv --title "Interview with Ana" --keep-original
+```
+
+It sends the file to the daemon on `KASETA_PORT` (7777 unless set), prints the
+new recording's id, and waits until the file is decoded or fails, saying which.
+
+**Supported:** MP4/MOV/M4A/3GP, MKV/WebM, MP3, WAV/W64, FLAC, Ogg/Opus, AAC,
+WMA/ASF, AVI, MPEG-TS, MPEG-PS, CAF, AIFF, AMR, AC-3/E-AC-3 and AU. Other formats
+are rejected. What a file is gets decided by reading it, not by its extension,
+so an MP3 named `.mp4` imports and a text file named `.mp4` does not. A video
+contributes its default audio track (or its first, if none is marked default);
+the picture is not used.
+
+**An imported file is one track.** Kaseta's attribution comes from recording
+each side of a call separately, and a file has already mixed everyone together.
+Its transcript lines are therefore not attributed to anyone and read as
+**Speaker**, and its summary is written without a "me and them" framing. The
+lines are not split by voice.
+
+**Keep original file** is off by default. Without it, Kaseta keeps the audio it
+decoded and discards the file once the import succeeds. With it, the file is
+stored with the recording: a video plays in the recording's view, alongside its
+transcript, and **Download original** gives it back under its own name. A kept
+original is part of the recording, so cloud backup copies it, and removing local
+copies after upload or keeping transcripts only under retention removes it from
+this machine just as it removes the audio.
+
+**Limits.** An upload larger than 8 GB, or a file longer than 6 hours, is
+refused. Both are set in `~/.config/kaseta/settings.json`:
+
+```json
+{ "imports": { "max_upload_gb": 8, "max_duration_hours": 6 } }
+```
+
+The upload ceiling can be raised to 64 GB and the duration to 24 hours. An
+upload also needs its own size plus 1 GB free on the disk holding your
+recordings, and decoding checks for room as it goes, so a full disk fails the
+import with a message rather than filling up. One file uploads at a time.
+
+**Contained.** A file from elsewhere is untrusted input, and ffmpeg is a large
+parser. Kaseta runs `ffprobe` and `ffmpeg` inside a
+[bubblewrap](https://github.com/containers/bubblewrap) sandbox with no network,
+nothing of your home directory but a read-only view of the upload's own
+folder, and they read only the formats listed above. Importing is unavailable without
+bubblewrap rather than running unsandboxed, and the window and `kasetad doctor`
+say what to install.
+
 ## Webhook
 
 A finished recording can be posted to a URL of your choosing as JSON — a task
@@ -61,6 +126,23 @@ The request is a POST with your token as a bearer credential:
 Every line of the transcript is attributed, because each side is recorded on its
 own track — `You` is whoever is at this machine, `Them` is the far end.
 
+An imported file carries two more fields, and its lines read `Speaker`, since a
+file has every voice on one track:
+
+```json
+{
+  "source": "import",
+  "original_filename": "all-hands.mp4",
+  "recorded_at": "2026-07-01T16:00:00Z",
+  "transcript": "Speaker: Welcome, everyone.\n"
+}
+```
+
+`source` is `capture` for a recording made here and `import` for a file.
+`original_filename` is present only for imports. For an import, `recorded_at` is
+the date the file says it was made when it says one, and the time it was
+imported otherwise.
+
 The token should be scoped to depositing recordings and nothing else, which is
 the right shape for something living on a laptop.
 
@@ -74,14 +156,16 @@ Nothing, until you switch something on. Each of these is a separate switch in
 | | Where it runs | Default |
 |---|---|---|
 | Recording | This machine | — |
+| Importing a file | This machine; the file goes only to the local daemon | n/a |
 | Transcription | This machine, in a local model | On |
 | Summaries | Sends **transcript text** to a provider you choose | **Off** |
-| Cloud backup | Sends audio, transcripts and summaries to your bucket | **Off** |
+| Cloud backup | Sends audio, transcripts, summaries and kept originals to your bucket | **Off** |
 | Webhook | Sends **transcript text** to a URL you choose | **Off** |
 
 Three of these send data off the machine, and they send different things.
 **Summaries** send transcript text to a provider you choose. **Cloud backup**
-sends everything — audio included — to storage you control. **Webhook** sends
+sends everything to storage you control: audio, transcripts, summaries, and the
+original of an imported file you chose to keep. **Webhook** sends
 transcript text to a URL you choose. None happens unless you switch it on.
 
 For summaries, **only that switch decides**. Supplying an API key through the
@@ -136,6 +220,11 @@ not behind transcription — a recording whose transcription failed is the one
 most worth having a copy of. Whatever arrives later brings the recording round
 for another pass.
 
+**Large files never sit in memory.** An imported file is streamed to disk as it
+arrives, decoded in small pieces, and exported and backed up from disk, with
+anything over 64 MB sent to the bucket in parts. A three-hour video costs disk
+space, not memory.
+
 **A stage that does nothing says so.** Switching summaries off does not make the
 pipeline report a summary; it reports a skip, with the reason, and offers to run
 it once you change your mind.
@@ -155,11 +244,17 @@ box is fine for development — just not for capture.
 bindgen, which loads `libclang` at build time. Without it the build fails partway
 through the dependency tree with an error that does not mention clang.
 
+**Importing files** additionally needs **ffmpeg** (with `ffprobe`) and
+**bubblewrap**, both from your distribution's packages so they live under
+`/usr`. Recording works without them; `./install.sh` warns when they are missing
+and prints the command for your distribution.
+
 ### Arch / EndeavourOS
 
 ```bash
 sudo pacman -S --needed rustup clang pkgconf pipewire python base-devel
 rustup default stable
+sudo pacman -S --needed ffmpeg bubblewrap   # for importing files
 ```
 
 Arch ships C headers inside the main package rather than a separate `-dev` one,
@@ -171,6 +266,7 @@ so `pipewire` covers both the runtime and the headers.
 sudo apt install -y libpipewire-0.3-dev libclang-dev pkg-config build-essential \
                     python3 python3-venv
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+sudo apt install -y ffmpeg bubblewrap   # for importing files
 ```
 
 ### Fedora
@@ -178,6 +274,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ```bash
 sudo dnf install -y pipewire-devel clang-devel pkgconf-pkg-config python3
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+sudo dnf install -y ffmpeg bubblewrap   # for importing files; ffmpeg is in RPM Fusion
 ```
 
 ## Install
@@ -211,7 +308,8 @@ Recording can also be started without opening the window. Bind
 ### Configuring it
 
 Everything is set from the application — there is no configuration file to edit
-by hand.
+by hand, except for the two [import limits](#importing-a-file), which few people
+will need to change.
 
 ![Kaseta's settings: transcription, summaries, cloud backup and retention](assets/settings.png)
 
@@ -258,9 +356,10 @@ Everything the application does is also available directly, which is useful for
 diagnosing a machine that cannot record.
 
 ```bash
-kasetad doctor        # can this machine record?
+kasetad doctor        # can this machine record, and import?
 kasetad devices       # what can it record from?
 kasetad record 60     # record both sides for 60 seconds
+kasetad import FILE   # turn an audio or video file into a recording
 kasetad transcribe    # transcribe the most recent recording
 kasetad export        # write mixed and per-track audio files
 kasetad serve         # run the daemon and its interface
@@ -269,6 +368,11 @@ cargo test            # no audio hardware needed
 
 `doctor` reports whether both a microphone and a playback monitor are present —
 the two devices a meeting recording needs — and explains what is missing if not.
+It also reports where ffmpeg, ffprobe and bubblewrap were found, their versions,
+and whether importing works, or what to install if it does not.
+
+`import` takes `--title TEXT` and `--keep-original`; see
+[Importing a file](#importing-a-file).
 
 `record` writes FLAC chunks and a manifest under `./data` (override with
 `KASETA_DATA`), then reports per-track chunk counts, duration, and **measured
@@ -285,7 +389,7 @@ transcript depends on.
 |---|---|---|
 | `KASETA_DATA` | `./data` | Where recordings are written |
 | `KASETA_LOG` | `kasetad=info` | Log filter, e.g. `kasetad=debug` |
-| `KASETA_PORT` | `7777` | Port the interface is served on |
+| `KASETA_PORT` | `7777` | Port the interface is served on, and the one `kasetad import` sends to |
 | `KASETA_WORKER_PYTHON` | `worker/.venv/bin/python` | Interpreter with the transcription worker |
 | `KASETA_OPENROUTER_KEY` | — | Key for summaries; a key alone does not switch them on |
 | `KASETA_OPENROUTER_MODEL` | `anthropic/claude-haiku-4.5` | Model used for summaries |
@@ -309,10 +413,6 @@ install.sh            Build, install, enable.
 
 Roughly in the order they would be worth doing.
 
-- **Import an existing file.** Drop in an audio or video file and have it
-  transcribed and summarised. Needs `ffmpeg`, and comes with an honest caveat:
-  an imported file is a single track, so the two-track attribution does not
-  apply and every line would be marked unattributed.
 - **An index at the bucket root**, mapping object prefixes to titles and dates,
   so a bucket is navigable without opening every folder.
 - **A packaged install** — an AUR package, so upgrading does not mean keeping a

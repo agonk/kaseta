@@ -11,20 +11,26 @@
 //! recorder with no access control to the network.
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{Context, Result};
-use axum::extract::{Path, State};
-use axum::http::{header, StatusCode};
+use axum::body::{Body, Bytes};
+use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use kaseta_contracts::manifest::RecordingNotes;
+use kaseta_contracts::{BlobKey, ImportSource};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::blobstore::BlobStore;
 use crate::db::Db;
+use crate::import::upload::{self, UploadError, UploadRequest};
+use crate::import::ImportRuntime;
 use crate::library;
 use crate::supervisor::{DaemonStatus, Supervisor};
 
@@ -43,17 +49,55 @@ const TOKEN_HEADER: &str = "x-kaseta-token";
 /// site would let it start or stop recording. The same-origin policy stops that
 /// site reading the token out of our page, so requiring it on every mutation is
 /// what makes the difference.
-fn mint_token() -> String {
-    // Derived from process-unique, time-varying values rather than a CSPRNG
-    // dependency: this only needs to be unguessable by a page that cannot read
-    // it, not to resist offline attack.
-    let seed = format!(
-        "{}-{}-{:?}",
-        std::process::id(),
-        crate::clock::boottime_ns(),
-        std::time::SystemTime::now()
-    );
-    crate::blobstore::sha256_hex(seed.as_bytes())
+///
+/// Drawn from the operating system's generator. A token derived from the PID
+/// and the clock is guessable by anyone who can estimate when the daemon
+/// started, and it now guards uploads of arbitrary size as well as recording.
+fn mint_token() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| anyhow::anyhow!("reading the system random number generator: {e}"))?;
+    Ok(hex::encode(bytes))
+}
+
+/// Whether a request's `Host` names this daemon.
+///
+/// DNS rebinding is the attack the token cannot stop: a hostile page whose
+/// name is re-pointed at 127.0.0.1 becomes same-origin with itself while
+/// talking to us, so the browser lets it read our replies, the token
+/// included. Its requests still carry its own name in `Host`, which no page
+/// script can change. Only the loopback names, on our port, are accepted.
+fn host_allowed(host: Option<&str>, port: u16) -> bool {
+    let Some(host) = host else { return false };
+    let host = host.trim().to_ascii_lowercase();
+    ["127.0.0.1", "localhost", "[::1]"].iter().any(|name| {
+        host == format!("{name}:{port}") || (port == 80 && host == *name)
+    })
+}
+
+/// Refuses every request whose `Host` is not this daemon's own.
+fn guard_host(router: Router, port: u16) -> Router {
+    router.layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| async move {
+            // HTTP/2 carries the name in the URI rather than a header.
+            let host = request
+                .headers()
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+                .or_else(|| request.uri().authority().map(|a| a.to_string()));
+            if host_allowed(host.as_deref(), port) {
+                next.run(request).await
+            } else {
+                ApiError::with_status(
+                    StatusCode::MISDIRECTED_REQUEST,
+                    "this address does not name the Kaseta daemon; open it through \
+                     127.0.0.1 or localhost",
+                )
+                .into_response()
+            }
+        },
+    ))
 }
 
 #[derive(Clone)]
@@ -65,22 +109,27 @@ pub struct AppState {
     /// a runtime thread.
     db: Arc<Mutex<Db>>,
     token: Arc<String>,
+    /// Whether files can be imported, and the one upload slot.
+    imports: Arc<ImportRuntime>,
 }
 
 pub fn router(
     supervisor: Arc<Supervisor>,
     store: Arc<dyn BlobStore>,
     db: Arc<Mutex<Db>>,
+    imports: Arc<ImportRuntime>,
     token: Arc<String>,
+    port: u16,
 ) -> Router {
     let state = AppState {
         supervisor,
         store,
         db,
         token,
+        imports,
     };
 
-    Router::new()
+    let routes = Router::new()
         .route("/", get(index))
         .route("/api/v1/status", get(status))
         .route("/api/v1/token", get(session_token))
@@ -91,6 +140,13 @@ pub fn router(
         .route("/api/v1/recordings/{id}", patch(rename_recording))
         .route("/api/v1/recordings/{id}", delete(delete_recording))
         .route("/api/v1/recordings/{id}/audio/{file}", get(audio))
+        .route("/api/v1/recordings/{id}/original", get(original))
+        // A file to import may be gigabytes, and arrives as a stream that is
+        // written to disk as it comes; the size limit is the import's own.
+        .route(
+            "/api/v1/imports",
+            post(import_file).layer(DefaultBodyLimit::disable()),
+        )
         .route("/api/v1/recordings/{id}/transcript", get(transcript))
         .route("/api/v1/recordings/{id}/summary", get(summary))
         .route("/api/v1/recordings/{id}/waveform", get(waveform))
@@ -98,7 +154,9 @@ pub fn router(
         .route("/api/v1/recordings/{id}/transcript.txt", get(transcript_text))
         .route("/api/v1/search", get(search))
         .route("/api/v1/settings", get(get_settings).put(put_settings))
-        .with_state(state)
+        .with_state(state);
+
+    guard_host(routes, port)
 }
 
 /// Serves the interface on loopback.
@@ -106,9 +164,10 @@ pub async fn serve(
     supervisor: Arc<Supervisor>,
     store: Arc<dyn BlobStore>,
     db: Arc<Mutex<Db>>,
+    imports: Arc<ImportRuntime>,
     port: u16,
 ) -> Result<()> {
-    let token = Arc::new(mint_token());
+    let token = Arc::new(mint_token()?);
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -117,7 +176,7 @@ pub async fn serve(
     println!("Kaseta is running at http://{addr}");
     println!("Press Ctrl-C to stop.\n");
 
-    axum::serve(listener, router(supervisor, store, db, token))
+    axum::serve(listener, router(supervisor, store, db, imports, token, port))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("serving HTTP")?;
@@ -172,8 +231,32 @@ where
     .map_err(|e| ApiError::internal(format!("database task failed: {e}")))?
 }
 
-async fn status(State(state): State<AppState>) -> Json<DaemonStatus> {
-    Json(state.supervisor.status())
+/// What the daemon is doing, and what it can do.
+#[derive(Debug, Serialize)]
+struct StatusResponse {
+    #[serde(flatten)]
+    daemon: DaemonStatus,
+    import: ImportStatus,
+}
+
+/// Whether files can be imported. When they cannot, the reason names what to
+/// install, so the interface can say so before anyone picks a file.
+#[derive(Debug, Serialize)]
+struct ImportStatus {
+    available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
+    let tools = state.imports.toolchain();
+    Json(StatusResponse {
+        daemon: state.supervisor.status(),
+        import: ImportStatus {
+            available: tools.is_ok(),
+            reason: tools.err().map(str::to_string),
+        },
+    })
 }
 
 /// Hands the run's token to local tooling.
@@ -297,8 +380,27 @@ struct ListResponse {
     items: Vec<library::LibraryItem>,
 }
 
+/// Marks each failed import with whether its upload is still there.
+///
+/// This looks at storage, so it runs after the database lock is released:
+/// a slow disk here must not hold up the scheduler or every other request
+/// waiting on the same connection.
+async fn note_import_uploads(
+    state: &AppState,
+    mut items: Vec<library::LibraryItem>,
+) -> Result<Vec<library::LibraryItem>, ApiError> {
+    let store = Arc::clone(&state.store);
+    tokio::task::spawn_blocking(move || {
+        library::note_import_uploads(&*store, &mut items).map_err(ApiError::from_anyhow)?;
+        Ok(items)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("storage task failed: {e}")))?
+}
+
 async fn list_recordings(State(state): State<AppState>) -> Result<Json<ListResponse>, ApiError> {
     let items = with_db(&state, |db| library::list(db).map_err(ApiError::from_anyhow)).await?;
+    let items = note_import_uploads(&state, items).await?;
     Ok(Json(ListResponse { items }))
 }
 
@@ -307,13 +409,14 @@ async fn get_recording(
     Path(id): Path<String>,
 ) -> Result<Json<library::LibraryItem>, ApiError> {
     let id = parse_id(&id)?;
-    with_db(&state, move |db| {
+    let item = with_db(&state, move |db| {
         library::get(db, id)
             .map_err(ApiError::from_anyhow)?
             .ok_or_else(|| ApiError::not_found("no such recording"))
     })
-    .await
-    .map(Json)
+    .await?;
+    let mut items = note_import_uploads(&state, vec![item]).await?;
+    Ok(Json(items.remove(0)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -408,7 +511,7 @@ async fn transcript_text(
     })
     .await?;
 
-    let body = crate::summarize::render(&transcript.lines);
+    let body = library::plain_text(&transcript);
     let filename = sanitise_filename(&title);
 
     Ok((
@@ -557,8 +660,23 @@ async fn run_stage(
         "summarize" => kaseta_contracts::JobType::Summarize,
         "backup" => kaseta_contracts::JobType::UploadRemote,
         "publish" => kaseta_contracts::JobType::PublishWebhook,
+        "import" => kaseta_contracts::JobType::ImportMedia,
         other => return Err(ApiError::bad_request(format!("unknown stage: {other}"))),
     };
+
+    // Decoding again needs the upload, which lives in storage rather than in
+    // anything the database can vouch for. It is looked at before taking the
+    // database lock, so a slow disk does not hold up everything else.
+    if job_type == kaseta_contracts::JobType::ImportMedia {
+        let store = Arc::clone(&state.store);
+        let present = tokio::task::spawn_blocking(move || crate::import::upload_present(&*store, id))
+            .await
+            .map_err(|e| ApiError::internal(format!("storage task failed: {e}")))?
+            .map_err(ApiError::from_anyhow)?;
+        if !present {
+            return Err(ApiError::bad_request(crate::import::job::UPLOAD_GONE));
+        }
+    }
 
     let queued = with_db(&state, move |db| {
         // A recording that no longer exists must not leave work queued against
@@ -566,6 +684,16 @@ async fn run_stage(
         let exists = library::get(db, id).map_err(ApiError::from_anyhow)?.is_some();
         if !exists {
             return Err(ApiError::not_found("no such recording"));
+        }
+
+        // Only a failed import is waiting for another go: one still decoding
+        // already has its attempt.
+        if job_type == kaseta_contracts::JobType::ImportMedia {
+            return db
+                .reset_import_for_retry(id)
+                .map_err(ApiError::from_anyhow)?
+                .map(|_| true)
+                .ok_or_else(|| ApiError::bad_request("only an import that failed can be retried"));
         }
 
         // Pressing a button is a different question from the chain reaching a
@@ -606,9 +734,8 @@ async fn run_stage(
                     rusqlite::params![id.to_string(), job_type.as_str()],
                 )
                 .map_err(|e| ApiError::internal(e.to_string()))?;
-            crate::derived::transcript_document(db, id)
+            crate::webhook::transcript_revision(db, id)
                 .map_err(ApiError::from_anyhow)?
-                .map(|d| crate::webhook::revision_of(&crate::webhook::render_transcript(&d)))
                 .ok_or_else(|| ApiError::bad_request("there is no transcript to send yet"))?
         } else {
             1
@@ -678,6 +805,7 @@ async fn search(
             .collect::<Vec<_>>())
     })
     .await?;
+    let items = note_import_uploads(&state, items).await?;
     Ok(Json(SearchResponse { items }))
 }
 
@@ -688,7 +816,7 @@ async fn search(
 /// two-hour recording is hundreds of megabytes.
 async fn audio(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
     Path((id, file)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     let id = parse_id(&id)?;
@@ -712,63 +840,383 @@ async fn audio(
         .export(&file)
         .map_err(|_| ApiError::bad_request("not an audio file"))?;
 
+    let mut response = serve_file(
+        Arc::clone(&state.store),
+        key,
+        &headers,
+        "that audio has not been exported",
+    )
+    .await?;
+    let h = response.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/flac"));
+    // Exports are immutable once written, so a browser may keep them.
+    h.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=31536000, immutable"),
+    );
+    Ok(response)
+}
+
+#[derive(Debug, Deserialize)]
+struct OriginalQuery {
+    /// `1` to save the file rather than play it.
+    #[serde(default)]
+    download: Option<String>,
+}
+
+/// Serves an imported recording's kept original, honouring range requests,
+/// so a video can be played and sought in the page.
+///
+/// Served as the type decided from its content when it was imported, never
+/// from its extension, and offered under the name it had on the person's
+/// machine.
+async fn original(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<OriginalQuery>,
+) -> Result<Response, ApiError> {
+    let id = parse_id(&id)?;
+
+    let (source, local) = with_db(&state, move |db| {
+        use rusqlite::OptionalExtension;
+        let row: Option<(Option<String>, bool)> = db
+            .conn()
+            .query_row(
+                "SELECT source_json, original_local FROM recordings
+                 WHERE id = ?1 AND deleted_at IS NULL",
+                rusqlite::params![id.to_string()],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)),
+            )
+            .optional()
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        let (source_json, local) = row.ok_or_else(|| ApiError::not_found("no such recording"))?;
+        let source: ImportSource = source_json
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .ok_or_else(|| ApiError::not_found("this recording was not imported from a file"))?;
+        Ok((source, local))
+    })
+    .await?;
+
+    let key = source
+        .original_key
+        .clone()
+        .ok_or_else(|| ApiError::not_found("the original file was not kept"))?;
+    if !local {
+        return Err(ApiError::not_found(
+            "the original file is in your bucket, not on this machine",
+        ));
+    }
+
+    let mut response =
+        serve_file(Arc::clone(&state.store), key, &headers, "the original file is missing").await?;
+    let disposition = if query.download.as_deref() == Some("1") {
+        "attachment"
+    } else {
+        "inline"
+    };
+    let h = response.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&source.content_type)
+            .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+    );
+    h.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&content_disposition(disposition, &source.original_filename))
+            .map_err(|e| ApiError::internal(format!("naming the download: {e}")))?,
+    );
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-cache"));
+    Ok(response)
+}
+
+/// Streams one stored object, or the range of it a `Range` header asks for.
+///
+/// The bytes go from the file to the socket a block at a time. Reading the
+/// range into memory first, as this once did, made a seek in a multi-gigabyte
+/// video cost a buffer the size of the rest of the file.
+async fn serve_file(
+    store: Arc<dyn BlobStore>,
+    key: BlobKey,
+    headers: &HeaderMap,
+    missing: &'static str,
+) -> Result<Response, ApiError> {
+    // Several ranges at once would need a multipart body. Not serving one is
+    // allowed: such a request is answered as if it had asked for no range,
+    // with the whole file, rather than refused.
     let range = headers
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
+        .filter(|r| !is_multi_range(r))
         .map(str::to_string);
 
-    let store = Arc::clone(&state.store);
-    tokio::task::spawn_blocking(move || {
-        let total = store
-            .size(&key)
-            .map_err(|_| ApiError::not_found("that audio has not been exported"))?;
-
-        let (start, end) = match range.as_deref().and_then(|r| parse_range(r, total)) {
-            Some(r) => r,
-            None if range.is_some() => {
-                // A syntactically valid but unsatisfiable range must say so
-                // rather than silently returning the whole file.
-                return Err(ApiError::range_not_satisfiable(total));
-            }
-            None => (0, total.saturating_sub(1)),
-        };
-
-        let len = end.saturating_sub(start) + 1;
-        let bytes = store
-            .get_range(&key, start, len)
-            .map_err(|e| ApiError::internal(format!("{e:#}")))?;
-
-        let status = if range.is_some() {
-            StatusCode::PARTIAL_CONTENT
-        } else {
-            StatusCode::OK
-        };
-
-        let mut response = (status, bytes).into_response();
-        let h = response.headers_mut();
-        h.insert(header::CONTENT_TYPE, "audio/flac".parse().unwrap());
-        h.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
-        // Exports are immutable once written, so a browser may keep them.
-        h.insert(
-            header::CACHE_CONTROL,
-            "private, max-age=31536000, immutable".parse().unwrap(),
-        );
-        if range.is_some() {
-            h.insert(
-                header::CONTENT_RANGE,
-                format!("bytes {start}-{end}/{total}").parse().unwrap(),
-            );
+    let (file, total) = tokio::task::spawn_blocking(move || {
+        if !store.exists(&key).map_err(ApiError::from_anyhow)? {
+            return Err(ApiError::not_found(missing));
         }
-        Ok(response)
+        let file = store.open_file(&key).map_err(ApiError::from_anyhow)?;
+        let total = file
+            .metadata()
+            .map_err(|e| ApiError::internal(format!("reading {key}: {e}")))?
+            .len();
+        Ok((file, total))
     })
     .await
-    .map_err(|e| ApiError::internal(format!("reading audio failed: {e}")))?
+    .map_err(|e| ApiError::internal(format!("opening the file failed: {e}")))??;
+
+    let (start, end) = match range.as_deref().and_then(|r| parse_range(r, total)) {
+        Some(r) => r,
+        // A syntactically valid but unsatisfiable range must say so rather
+        // than silently returning the whole file.
+        None if range.is_some() => return Err(ApiError::range_not_satisfiable(total)),
+        None => (0, total.saturating_sub(1)),
+    };
+    let len = if total == 0 { 0 } else { end - start + 1 };
+
+    let mut file = tokio::fs::File::from_std(file);
+    if start > 0 {
+        use tokio::io::AsyncSeekExt;
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(|e| ApiError::internal(format!("seeking: {e}")))?;
+    }
+
+    let status = if range.is_some() {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    let mut response = (status, Body::new(FileBody::new(file, len))).into_response();
+    let h = response.headers_mut();
+    h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    h.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    if range.is_some() {
+        h.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_str(&format!("bytes {start}-{end}/{total}"))
+                .expect("digits and punctuation are a valid header"),
+        );
+    }
+    Ok(response)
+}
+
+/// A response body read from a file, `remaining` bytes from wherever the file
+/// is positioned, one block at a time.
+struct FileBody {
+    file: tokio::fs::File,
+    remaining: u64,
+    buf: Box<[u8]>,
+}
+
+impl FileBody {
+    /// Large enough that a video streams without a trip to the blocking pool
+    /// per network packet; small enough that many open players cost little.
+    const BLOCK_BYTES: usize = 64 * 1024;
+
+    fn new(file: tokio::fs::File, len: u64) -> Self {
+        Self {
+            file,
+            remaining: len,
+            buf: vec![0; Self::BLOCK_BYTES].into_boxed_slice(),
+        }
+    }
+}
+
+impl http_body::Body for FileBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<std::result::Result<http_body::Frame<Bytes>, std::io::Error>>> {
+        use tokio::io::AsyncRead;
+
+        let this = self.get_mut();
+        if this.remaining == 0 {
+            return Poll::Ready(None);
+        }
+        let want = this.buf.len().min(usize::try_from(this.remaining).unwrap_or(usize::MAX));
+        let mut read = tokio::io::ReadBuf::new(&mut this.buf[..want]);
+        match Pin::new(&mut this.file).poll_read(cx, &mut read) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(Ok(())) => {
+                let filled = read.filled();
+                if filled.is_empty() {
+                    // The file is shorter than it was a moment ago. Ending
+                    // quietly would hand the player a truncated body that
+                    // claims to be complete.
+                    return Poll::Ready(Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "the file ended before the range did",
+                    ))));
+                }
+                this.remaining -= filled.len() as u64;
+                Poll::Ready(Some(Ok(http_body::Frame::data(Bytes::copy_from_slice(filled)))))
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.remaining == 0
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.remaining)
+    }
+}
+
+/// A `Content-Disposition` naming `filename`, which may be anything a person
+/// called a file.
+///
+/// Two forms, as RFC 6266 recommends: a plain `filename` with everything
+/// outside printable ASCII (and the quote and backslash that would end or
+/// escape it) replaced, for clients that know only that; and `filename*`
+/// carrying the exact UTF-8 name, percent-encoded, which current browsers
+/// prefer.
+fn content_disposition(kind: &str, filename: &str) -> String {
+    let fallback: String = filename
+        .chars()
+        .map(|c| match c {
+            '"' | '\\' | '/' => '_',
+            c if c == ' ' || c.is_ascii_graphic() => c,
+            _ => '_',
+        })
+        .collect();
+    let fallback = match fallback.trim() {
+        "" => "original",
+        trimmed => trimmed,
+    };
+
+    let mut encoded = String::new();
+    for byte in filename.bytes() {
+        // RFC 5987 `attr-char`: what may appear in the value unencoded.
+        if byte.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&byte) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    format!("{kind}; filename=\"{fallback}\"; filename*=UTF-8''{encoded}")
+}
+
+#[derive(Debug, Serialize)]
+struct ImportResponse {
+    recording_id: Ulid,
+}
+
+/// Receives a file to import.
+///
+/// Everything that can be decided from the headers is decided before a byte
+/// of the body is read: whether importing is possible at all, whether the
+/// declared size is within the limit and fits on the disk, whether another
+/// upload is already arriving. Finding any of those out after a
+/// multi-gigabyte upload would waste the whole upload.
+async fn import_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<(StatusCode, Json<ImportResponse>), ApiError> {
+    authorize(&state, &headers)?;
+
+    if let Err(reason) = state.imports.toolchain() {
+        return Err(ApiError::with_status(StatusCode::SERVICE_UNAVAILABLE, reason));
+    }
+
+    let length = content_length(&headers)?;
+    if length == 0 {
+        return Err(ApiError::bad_request("the file is empty"));
+    }
+    let request = UploadRequest::from_headers(&headers).map_err(ApiError::bad_request)?;
+
+    let limits = tokio::task::spawn_blocking(crate::config::Settings::load)
+        .await
+        .map_err(|e| ApiError::internal(format!("reading settings failed: {e}")))?
+        .unwrap_or_default()
+        .imports;
+    if length > limits.max_upload_bytes() {
+        return Err(ApiError::with_status(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "the file is {}; the largest file that can be imported is {} GB \
+                 (imports.max_upload_gb in settings)",
+                gigabytes(length),
+                limits.max_upload_gb()
+            ),
+        ));
+    }
+
+    // Held until this handler ends, however it ends.
+    let _permit = state.imports.begin_upload().ok_or_else(|| {
+        ApiError::conflict("another file is being uploaded; import this one when it has finished")
+    })?;
+
+    let root = state
+        .store
+        .local_root()
+        .ok_or_else(|| ApiError::internal("imports need a store on the local filesystem"))?;
+    let free = state.imports.free_space(root).map_err(ApiError::from_anyhow)?;
+    if !upload::room_for(length, free) {
+        return Err(ApiError::with_status(
+            StatusCode::INSUFFICIENT_STORAGE,
+            format!(
+                "not enough disk space: importing this file needs {} free, and {} is",
+                gigabytes(upload::space_needed(length)),
+                gigabytes(free)
+            ),
+        ));
+    }
+
+    let recording_id = upload::receive(
+        Arc::clone(&state.store),
+        Arc::clone(&state.db),
+        request,
+        length,
+        body,
+        upload::BODY_IDLE_TIMEOUT,
+    )
+    .await
+    .map_err(|e| match e {
+        UploadError::Request(message) => ApiError::bad_request(message),
+        UploadError::Internal(e) => ApiError::from_anyhow(e),
+    })?;
+
+    Ok((StatusCode::ACCEPTED, Json(ImportResponse { recording_id })))
+}
+
+/// The declared body length, which an upload must state.
+fn content_length(headers: &HeaderMap) -> Result<u64, ApiError> {
+    let Some(value) = headers.get(header::CONTENT_LENGTH) else {
+        return Err(ApiError::with_status(
+            StatusCode::LENGTH_REQUIRED,
+            "an import must state its size in Content-Length",
+        ));
+    };
+    value
+        .to_str()
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .ok_or_else(|| ApiError::bad_request("Content-Length is not a number"))
+}
+
+fn gigabytes(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / f64::from(1u32 << 30))
+}
+
+/// Whether a `Range` header asks for more than one range of bytes.
+fn is_multi_range(header: &str) -> bool {
+    header
+        .trim()
+        .strip_prefix("bytes=")
+        .is_some_and(|spec| spec.contains(','))
 }
 
 /// Parses a single-range `Range: bytes=…` header against a known total size.
 ///
-/// Returns inclusive start and end. Multi-range requests are not supported and
-/// yield `None`, which serves the whole file — a valid response.
+/// Returns inclusive start and end, or `None` for a range that cannot be
+/// satisfied. A multi-range request also yields `None`; [`serve_file`] never
+/// passes one here, answering it with the whole file instead.
 fn parse_range(header: &str, total: u64) -> Option<(u64, u64)> {
     if total == 0 {
         return None;
@@ -802,43 +1250,41 @@ fn parse_id(raw: &str) -> Result<Ulid, ApiError> {
 pub struct ApiError {
     status: StatusCode,
     message: String,
+    /// The size to report in `Content-Range` with a 416, which a client needs
+    /// to ask again for something that exists.
+    unsatisfied_range_of: Option<u64>,
 }
 
 impl ApiError {
-    fn internal(message: impl Into<String>) -> Self {
+    fn with_status(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
+            status,
             message: message.into(),
+            unsatisfied_range_of: None,
         }
+    }
+    fn internal(message: impl Into<String>) -> Self {
+        Self::with_status(StatusCode::INTERNAL_SERVER_ERROR, message)
     }
     fn bad_request(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: message.into(),
-        }
+        Self::with_status(StatusCode::BAD_REQUEST, message)
     }
     fn not_found(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            message: message.into(),
-        }
+        Self::with_status(StatusCode::NOT_FOUND, message)
     }
     fn conflict(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::CONFLICT,
-            message: message.into(),
-        }
+        Self::with_status(StatusCode::CONFLICT, message)
     }
     fn forbidden(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::FORBIDDEN,
-            message: message.into(),
-        }
+        Self::with_status(StatusCode::FORBIDDEN, message)
     }
     fn range_not_satisfiable(total: u64) -> Self {
         Self {
-            status: StatusCode::RANGE_NOT_SATISFIABLE,
-            message: format!("the requested range lies outside the {total}-byte file"),
+            unsatisfied_range_of: Some(total),
+            ..Self::with_status(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                format!("the requested range lies outside the {total}-byte file"),
+            )
         }
     }
 
@@ -859,7 +1305,14 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         tracing::debug!(status = %self.status, message = %self.message, "request failed");
-        (self.status, Json(serde_json::json!({ "error": self.message }))).into_response()
+        let mut response =
+            (self.status, Json(serde_json::json!({ "error": self.message }))).into_response();
+        if let Some(total) = self.unsatisfied_range_of {
+            if let Ok(value) = HeaderValue::from_str(&format!("bytes */{total}")) {
+                response.headers_mut().insert(header::CONTENT_RANGE, value);
+            }
+        }
+        response
     }
 }
 
@@ -908,8 +1361,12 @@ mod tests {
     }
 
     #[test]
-    fn multi_range_requests_fall_back_to_the_whole_file() {
+    fn multi_range_requests_are_recognised() {
         // Serving the entire body is a valid response to a multi-range request.
+        assert!(is_multi_range("bytes=0-10,20-30"));
+        assert!(is_multi_range(" bytes=0-0, -1"));
+        assert!(!is_multi_range("bytes=0-10"));
+        assert!(!is_multi_range("items=0-1,2-3"));
         assert_eq!(parse_range("bytes=0-10,20-30", 1000), None);
     }
 
@@ -917,10 +1374,71 @@ mod tests {
     fn every_run_mints_a_different_token() {
         // A predictable token would defeat the point: a hostile page could
         // simply guess it.
-        let a = mint_token();
-        let b = mint_token();
+        let a = mint_token().unwrap();
+        let b = mint_token().unwrap();
         assert_ne!(a, b);
         assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    /// Sends one request with the given `Host` through the same guard the
+    /// daemon's router uses, and reports the status it got back.
+    async fn status_for_host(host: Option<&str>) -> StatusCode {
+        use tower::ServiceExt;
+
+        let routes = Router::new().route("/api/v1/token", get(|| async { "secret" }));
+        let app = guard_host(routes, 7777);
+        let mut request = axum::http::Request::builder().uri("/api/v1/token");
+        if let Some(host) = host {
+            request = request.header(header::HOST, host);
+        }
+        app.oneshot(request.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn the_daemon_answers_to_its_own_loopback_names() {
+        for host in ["127.0.0.1:7777", "localhost:7777", "[::1]:7777", "LocalHost:7777"] {
+            assert_eq!(status_for_host(Some(host)).await, StatusCode::OK, "{host}");
+        }
+    }
+
+    /// DNS rebinding: a hostile page whose name has been re-pointed at
+    /// 127.0.0.1 is same-origin with itself, so the browser lets it read the
+    /// reply, including the token. The `Host` it sends still names the hostile
+    /// site, and that is what is refused.
+    #[tokio::test]
+    async fn any_other_host_is_refused() {
+        for host in [
+            Some("evil.example:7777"),
+            Some("evil.example"),
+            Some("127.0.0.1.evil.example:7777"),
+            Some("localhost.evil.example:7777"),
+            // The right name on the wrong port is a different service.
+            Some("127.0.0.1:8080"),
+            Some("localhost"),
+            Some("127.0.0.1:7777.evil.example"),
+            Some("127.0.0.2:7777"),
+            Some("0.0.0.0:7777"),
+            Some(""),
+            None,
+        ] {
+            assert_eq!(
+                status_for_host(host).await,
+                StatusCode::MISDIRECTED_REQUEST,
+                "{host:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_http_port_may_be_left_out_of_the_host() {
+        // Browsers omit `:80`, so a daemon on port 80 sees a bare name.
+        assert!(host_allowed(Some("localhost"), 80));
+        assert!(host_allowed(Some("localhost:80"), 80));
+        assert!(!host_allowed(Some("localhost"), 7777));
     }
 
     #[test]
@@ -973,5 +1491,570 @@ mod tests {
             INDEX_HTML.contains("/api/v1/"),
             "the page must talk to the API it is served by"
         );
+    }
+
+    #[test]
+    fn the_page_sends_what_the_import_route_reads() {
+        // The page sends a file with a hand-built request rather than through
+        // its JSON helper, so nothing else ties the header names it writes to
+        // the ones the route reads. A mismatch would refuse every import from
+        // the window while the command line went on working.
+        use crate::import::upload::{FILENAME_HEADER, KEEP_ORIGINAL_HEADER, TITLE_HEADER};
+        for header in [FILENAME_HEADER, TITLE_HEADER, KEEP_ORIGINAL_HEADER, TOKEN_HEADER] {
+            assert!(
+                INDEX_HTML.contains(&format!("\"{header}\"")),
+                "the page never sends {header}"
+            );
+        }
+        assert!(INDEX_HTML.contains("\"/api/v1/imports\""), "the page never posts an import");
+    }
+
+    #[test]
+    fn the_page_retries_an_import_through_a_stage_the_daemon_knows() {
+        // The Import chip's state is found by job name and its retry is
+        // posted by stage name; either drifting leaves a failed import with
+        // no chip, or a retry the daemon refuses as an unknown stage.
+        assert_eq!(kaseta_contracts::JobType::ImportMedia.as_str(), "import_media");
+        assert!(INDEX_HTML.contains("import: \"import_media\""));
+    }
+
+    #[test]
+    fn the_page_offers_delete_when_the_upload_is_gone() {
+        // Retrying decodes the upload again, so once it is gone the only
+        // useful action is deleting the item. The page decides that from the
+        // field the daemon reports, never from the wording of an error.
+        assert!(INDEX_HTML.contains("st?.upload_present === false"));
+        assert!(!INDEX_HTML.contains("the uploaded file is gone"));
+    }
+
+    // The routes, driven through the same router the daemon serves, with no
+    // socket. The supervisor is real; nothing here starts a recording, so it
+    // never touches an audio device.
+
+    use crate::import::sandbox::{HostLayout, Toolchain};
+    use crate::import::upload::{FILENAME_HEADER, KEEP_ORIGINAL_HEADER, TITLE_HEADER};
+    use tower::ServiceExt;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    struct App {
+        _dir: tempfile::TempDir,
+        store: Arc<dyn BlobStore>,
+        db: Arc<Mutex<Db>>,
+        imports: Arc<ImportRuntime>,
+        router: Router,
+    }
+
+    /// A runtime that would import: tools named, never run by these tests,
+    /// and a disk with room to spare.
+    fn ready() -> ImportRuntime {
+        ImportRuntime::with(Toolchain::at(
+            "/usr/bin/bwrap".into(),
+            "/usr/bin/ffmpeg".into(),
+            "/usr/bin/ffprobe".into(),
+            HostLayout::of_host(),
+        ))
+        .with_free_space(|_| Ok(1 << 40))
+    }
+
+    fn app(imports: ImportRuntime) -> App {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store: Arc<dyn BlobStore> =
+            Arc::new(crate::blobstore::LocalFsStore::new(dir.path()).unwrap());
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        let supervisor =
+            Arc::new(Supervisor::spawn(Arc::clone(&store), Arc::clone(&db)).unwrap());
+        let imports = Arc::new(imports);
+        let router = router(
+            supervisor,
+            Arc::clone(&store),
+            Arc::clone(&db),
+            Arc::clone(&imports),
+            Arc::new(TOKEN.to_string()),
+            7777,
+        );
+        App {
+            _dir: dir,
+            store,
+            db,
+            imports,
+            router,
+        }
+    }
+
+    impl App {
+        async fn send(&self, request: axum::http::Request<Body>) -> (StatusCode, HeaderMap, Vec<u8>) {
+            let response = self.router.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec();
+            (status, headers, body)
+        }
+
+        async fn get(&self, uri: &str, range: Option<&str>) -> (StatusCode, HeaderMap, Vec<u8>) {
+            let mut request = axum::http::Request::get(uri).header(header::HOST, "127.0.0.1:7777");
+            if let Some(range) = range {
+                request = request.header(header::RANGE, range);
+            }
+            self.send(request.body(Body::empty()).unwrap()).await
+        }
+
+        /// Posts `body` as an import. `length` is what the request claims,
+        /// which a test may make disagree with the body.
+        async fn import(&self, length: Option<u64>, body: Vec<u8>) -> (StatusCode, serde_json::Value) {
+            let mut request = axum::http::Request::post("/api/v1/imports")
+                .header(header::HOST, "127.0.0.1:7777")
+                .header(TOKEN_HEADER, TOKEN)
+                .header(FILENAME_HEADER, "Lecture%203%20%C3%9Cbung.mp4")
+                .header(TITLE_HEADER, "Week%203")
+                .header(KEEP_ORIGINAL_HEADER, "1");
+            if let Some(length) = length {
+                request = request.header(header::CONTENT_LENGTH, length);
+            }
+            let (status, _, body) = self.send(request.body(Body::from(body)).unwrap()).await;
+            (status, serde_json::from_slice(&body).unwrap_or_default())
+        }
+
+        fn count(&self, sql: &str) -> i64 {
+            self.db.lock().unwrap().conn().query_row(sql, [], |r| r.get(0)).unwrap()
+        }
+
+        fn staging_is_empty(&self) -> bool {
+            let root = self.store.local_root().unwrap().join("imports");
+            std::fs::read_dir(root).map_or(true, |mut d| d.next().is_none())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_upload_becomes_an_import_waiting_to_be_decoded() {
+        let app = app(ready());
+        // Larger than the router's default body limit, which this route lifts.
+        let body: Vec<u8> = (0..3 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let (status, json) = app.import(Some(body.len() as u64), body.clone()).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{json}");
+        let id = Ulid::from_string(json["recording_id"].as_str().unwrap()).unwrap();
+
+        let intent = crate::import::intent::Intent::read(&*app.store, id).unwrap().unwrap();
+        assert_eq!(intent.original_filename, "Lecture 3 \u{dc}bung.mp4");
+        assert_eq!(intent.title, "Week 3");
+        assert!(intent.keep_original);
+        assert_eq!(intent.bytes, Some(body.len() as u64));
+        let staged = app.store.local_root().unwrap().join(intent.upload_key().unwrap().as_str());
+        assert_eq!(std::fs::read(staged).unwrap(), body);
+
+        let item = {
+            let db = app.db.lock().unwrap();
+            library::get(&db, id).unwrap().unwrap()
+        };
+        assert_eq!(item.status, "processing");
+        assert_eq!(item.origin, kaseta_contracts::Origin::Imported);
+        assert_eq!(item.title, "Week 3");
+        assert_eq!(item.stages[0].stage, "import_media");
+        assert_eq!(item.stages[0].state, "queued");
+    }
+
+    /// A failed import says whether its upload is still there to decode
+    /// again, which is what decides between offering Retry and only Delete.
+    #[tokio::test]
+    async fn a_failed_import_says_whether_its_upload_is_still_there() {
+        let app = app(ready());
+        let (status, json) = app.import(Some(3), b"abc".to_vec()).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{json}");
+        let id = Ulid::from_string(json["recording_id"].as_str().unwrap()).unwrap();
+
+        let stage = |body: &[u8]| -> serde_json::Value {
+            let item: serde_json::Value = serde_json::from_slice(body).unwrap();
+            item["stages"][0].clone()
+        };
+        let listed = |body: &[u8]| -> serde_json::Value {
+            let list: serde_json::Value = serde_json::from_slice(body).unwrap();
+            list["items"][0]["stages"][0].clone()
+        };
+
+        // Not asked while the import is still on its way.
+        let (_, _, body) = app.get(&format!("/api/v1/recordings/{id}"), None).await;
+        assert!(stage(&body).get("upload_present").is_none(), "{}", stage(&body));
+
+        {
+            let db = app.db.lock().unwrap();
+            let job = db.claim_next_job(1).unwrap().unwrap();
+            db.fail_job(job.id, "job_failed", "not enough disk space", false).unwrap();
+        }
+        let (_, _, body) = app.get(&format!("/api/v1/recordings/{id}"), None).await;
+        let failed = stage(&body);
+        assert_eq!(failed["state"], "failed");
+        assert_eq!(failed["upload_present"], true);
+        assert_eq!(failed["retryable"], true);
+        let (_, _, body) = app.get("/api/v1/recordings", None).await;
+        assert_eq!(listed(&body)["upload_present"], true);
+
+        crate::import::remove_staging(&*app.store, id).unwrap();
+        let (_, _, body) = app.get(&format!("/api/v1/recordings/{id}"), None).await;
+        let gone = stage(&body);
+        assert_eq!(gone["state"], "failed");
+        assert_eq!(gone["upload_present"], false);
+        assert_eq!(gone["retryable"], false, "a retry could only be refused");
+        let (_, _, body) = app.get("/api/v1/recordings", None).await;
+        assert_eq!(listed(&body)["upload_present"], false);
+    }
+
+    #[tokio::test]
+    async fn an_upload_without_the_token_is_refused() {
+        let app = app(ready());
+        let request = axum::http::Request::post("/api/v1/imports")
+            .header(header::HOST, "127.0.0.1:7777")
+            .header(header::CONTENT_LENGTH, 3)
+            .header(FILENAME_HEADER, "a.mp3")
+            .body(Body::from("abc"))
+            .unwrap();
+        let (status, _, _) = app.send(request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(app.staging_is_empty());
+        assert_eq!(app.count("SELECT COUNT(*) FROM recordings"), 0);
+    }
+
+    /// Without the tools or the sandbox, importing is refused before the
+    /// upload, and the status says why so the page can too.
+    #[tokio::test]
+    async fn importing_without_the_tools_is_unavailable_and_says_why() {
+        let reason = "Importing needs bubblewrap: sudo pacman -S --needed bubblewrap";
+        let app = app(ImportRuntime::unavailable(reason));
+
+        let (status, json) = app.import(Some(3), b"abc".to_vec()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["error"], reason);
+        assert!(app.staging_is_empty());
+
+        let (_, _, body) = app.get("/api/v1/status", None).await;
+        let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status["import"]["available"], false);
+        assert_eq!(status["import"]["reason"], reason);
+        assert_eq!(status["state"], "idle", "the daemon's own status is still there");
+    }
+
+    #[tokio::test]
+    async fn the_status_says_importing_is_available() {
+        let app = app(ready());
+        let (_, _, body) = app.get("/api/v1/status", None).await;
+        let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status["import"]["available"], true);
+        assert!(status["import"].get("reason").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_upload_must_state_its_size() {
+        let app = app(ready());
+        let (status, json) = app.import(None, b"abc".to_vec()).await;
+        assert_eq!(status, StatusCode::LENGTH_REQUIRED, "{json}");
+        let (status, _) = app.import(Some(0), Vec::new()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "an empty file is nothing to import");
+        assert!(app.staging_is_empty());
+    }
+
+    /// Refused on the declared size, before a byte is read. Past the highest
+    /// limit that can be configured, so the machine's own settings cannot
+    /// change the answer.
+    #[tokio::test]
+    async fn an_upload_over_the_limit_is_refused_before_it_is_read() {
+        let app = app(ready());
+        let too_big = (u64::from(crate::config::ImportSettings::MAX_UPLOAD_GB_CEILING) << 30) + 1;
+        let (status, json) = app.import(Some(too_big), Vec::new()).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{json}");
+        assert!(json["error"].as_str().unwrap().contains("imports.max_upload_gb"));
+        assert!(app.staging_is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_upload_the_disk_cannot_hold_is_refused_before_it_is_read() {
+        let app = app(ready().with_free_space(|_| Ok(1 << 30)));
+        let (status, json) = app.import(Some(3), b"abc".to_vec()).await;
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{json}");
+        assert!(json["error"].as_str().unwrap().contains("not enough disk space"));
+        assert!(app.staging_is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_second_upload_waits_for_the_first() {
+        let app = app(ready());
+        let first = app.imports.begin_upload().unwrap();
+
+        let (status, json) = app.import(Some(3), b"abc".to_vec()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+        assert!(app.staging_is_empty());
+
+        drop(first);
+        let (status, _) = app.import(Some(3), b"abc".to_vec()).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    /// A body that disagrees with its declared size leaves no staging and no
+    /// recording, and frees the slot for the next upload.
+    #[tokio::test]
+    async fn a_body_that_disagrees_with_its_size_leaves_nothing_and_frees_the_slot() {
+        let app = app(ready());
+        for (declared, sent) in [(10u64, &b"abc"[..]), (2, &b"abc"[..])] {
+            let (status, json) = app.import(Some(declared), sent.to_vec()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+            assert!(app.staging_is_empty());
+            assert_eq!(app.count("SELECT COUNT(*) FROM recordings"), 0);
+        }
+        let (status, _) = app.import(Some(3), b"abc".to_vec()).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "the slot was released");
+        assert_eq!(app.count("SELECT COUNT(*) FROM jobs WHERE job_type = 'import_media'"), 1);
+    }
+
+    #[tokio::test]
+    async fn unreadable_metadata_is_refused() {
+        let app = app(ready());
+        let request = axum::http::Request::post("/api/v1/imports")
+            .header(header::HOST, "127.0.0.1:7777")
+            .header(TOKEN_HEADER, TOKEN)
+            .header(header::CONTENT_LENGTH, 3)
+            .header(FILENAME_HEADER, "%FF%FE.mp4")
+            .body(Body::from("abc"))
+            .unwrap();
+        let (status, _, body) = app.send(request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(&body).contains("not readable"));
+        assert!(app.staging_is_empty());
+    }
+
+    /// The bytes of a kept original, distinguishable at every offset.
+    fn original_bytes() -> Vec<u8> {
+        (0..1000u32).map(|i| (i % 256) as u8).collect()
+    }
+
+    /// An imported recording, finished, whose original was kept (and is
+    /// still here when `local`).
+    fn imported(app: &App, keep: bool, local: bool) -> Ulid {
+        let id = Ulid::new();
+        let started_at = time::macros::datetime!(2026-10-09 08:00:00 UTC);
+        let prefix = kaseta_contracts::RecordingPrefix::new(id, started_at);
+        let key = prefix.original("mp4").unwrap();
+        if keep && local {
+            app.store.put(&key, &original_bytes()).unwrap();
+        }
+        let source = ImportSource {
+            original_filename: "Vortrag \u{dc}ber \"Rust\".mp4".into(),
+            original_key: keep.then_some(key),
+            original_bytes: 1000,
+            original_sha256: "ab".repeat(32),
+            container: "mov".into(),
+            codec: "aac".into(),
+            content_type: "video/mp4".into(),
+            media_kind: kaseta_contracts::MediaType::Video,
+            media_created_at: None,
+            imported_at: started_at,
+            duration_s: 3.0,
+        };
+        let db = app.db.lock().unwrap();
+        db.create_import(&crate::db::NewImport {
+            recording_id: id,
+            started_at,
+            title: "Vortrag".into(),
+        })
+        .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE recordings SET status = 'ready', source_json = ?2, original_local = ?3
+                 WHERE id = ?1",
+                rusqlite::params![
+                    id.to_string(),
+                    serde_json::to_string(&source).unwrap(),
+                    (keep && local) as i64
+                ],
+            )
+            .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn the_original_is_served_whole_with_its_type() {
+        let app = app(ready());
+        let id = imported(&app, true, true);
+        let (status, headers, body) = app.get(&format!("/api/v1/recordings/{id}/original"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, original_bytes());
+        assert_eq!(headers[header::CONTENT_TYPE], "video/mp4");
+        assert_eq!(headers[header::ACCEPT_RANGES], "bytes");
+        assert_eq!(headers[header::CONTENT_LENGTH], "1000");
+        assert!(headers[header::CONTENT_DISPOSITION].to_str().unwrap().starts_with("inline;"));
+    }
+
+    /// Every range form a media element sends when seeking.
+    #[tokio::test]
+    async fn the_original_is_served_in_ranges() {
+        let app = app(ready());
+        let id = imported(&app, true, true);
+        let uri = format!("/api/v1/recordings/{id}/original");
+        let all = original_bytes();
+
+        for (range, start, end) in [
+            ("bytes=100-199", 100usize, 199usize),
+            ("bytes=-50", 950, 999),
+            ("bytes=990-", 990, 999),
+            ("bytes=0-", 0, 999),
+            ("bytes=900-5000", 900, 999),
+        ] {
+            let (status, headers, body) = app.get(&uri, Some(range)).await;
+            assert_eq!(status, StatusCode::PARTIAL_CONTENT, "{range}");
+            assert_eq!(body, &all[start..=end], "{range}");
+            assert_eq!(
+                headers[header::CONTENT_RANGE],
+                format!("bytes {start}-{end}/1000").as_str(),
+                "{range}"
+            );
+            assert_eq!(headers[header::CONTENT_LENGTH], (end - start + 1).to_string().as_str());
+        }
+
+        let (status, headers, _) = app.get(&uri, Some("bytes=1000-")).await;
+        assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(headers[header::CONTENT_RANGE], "bytes */1000");
+    }
+
+    /// Several ranges at once are not served as a multipart body; the whole
+    /// file is, which is just as valid an answer, rather than a refusal.
+    #[tokio::test]
+    async fn a_multi_range_request_gets_the_whole_original() {
+        let app = app(ready());
+        let id = imported(&app, true, true);
+        let uri = format!("/api/v1/recordings/{id}/original");
+
+        for range in ["bytes=0-10,20-30", "bytes=0-0, -1", "bytes=5000-6000,0-1"] {
+            let (status, headers, body) = app.get(&uri, Some(range)).await;
+            assert_eq!(status, StatusCode::OK, "{range}");
+            assert_eq!(body, original_bytes(), "{range}");
+            assert_eq!(headers[header::CONTENT_LENGTH], "1000", "{range}");
+            assert!(headers.get(header::CONTENT_RANGE).is_none(), "{range}");
+        }
+    }
+
+    /// Saved under the name it had, exactly, with a plain fallback for
+    /// clients that only read that.
+    #[tokio::test]
+    async fn the_original_downloads_under_its_own_name() {
+        let app = app(ready());
+        let id = imported(&app, true, true);
+        let (status, headers, body) =
+            app.get(&format!("/api/v1/recordings/{id}/original?download=1"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.len(), 1000);
+        assert_eq!(
+            headers[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"Vortrag _ber _Rust_.mp4\"; \
+             filename*=UTF-8''Vortrag%20%C3%9Cber%20%22Rust%22.mp4"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_original_that_is_not_here_is_not_found() {
+        let app = app(ready());
+        for (keep, local, expected) in [
+            (true, false, "in your bucket"),
+            (false, false, "was not kept"),
+        ] {
+            let id = imported(&app, keep, local);
+            let (status, _, body) = app.get(&format!("/api/v1/recordings/{id}/original"), None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert!(String::from_utf8_lossy(&body).contains(expected), "{expected}");
+        }
+
+        // A captured recording has no original at all.
+        let captured = Ulid::new();
+        app.db
+            .lock()
+            .unwrap()
+            .conn()
+            .execute(
+                "INSERT INTO recordings (id, owner_id, status, started_at, manifest_version)
+                 VALUES (?1, ?2, 'ready', 0, 'v')",
+                rusqlite::params![captured.to_string(), crate::db::LOCAL_OWNER_ID],
+            )
+            .unwrap();
+        let (status, _, body) =
+            app.get(&format!("/api/v1/recordings/{captured}/original"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(String::from_utf8_lossy(&body).contains("not imported"));
+    }
+
+    /// The exported audio goes through the same streaming ranges.
+    #[tokio::test]
+    async fn exported_audio_is_streamed_in_ranges() {
+        let app = app(ready());
+        let id = imported(&app, false, false);
+        let prefix = kaseta_contracts::RecordingPrefix::new(
+            id,
+            time::macros::datetime!(2026-10-09 08:00:00 UTC),
+        );
+        app.store
+            .put(&prefix.export("mixed.flac").unwrap(), &original_bytes())
+            .unwrap();
+        let uri = format!("/api/v1/recordings/{id}/audio/mixed.flac");
+
+        let (status, headers, body) = app.get(&uri, Some("bytes=10-19")).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body, &original_bytes()[10..20]);
+        assert_eq!(headers[header::CONTENT_TYPE], "audio/flac");
+
+        let (status, _, body) = app.get(&uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.len(), 1000);
+
+        let (status, _, _) =
+            app.get(&format!("/api/v1/recordings/{id}/audio/a_local-mic_01.flac"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn a_plain_name_needs_no_encoding_but_gets_both_forms() {
+        assert_eq!(
+            content_disposition("inline", "talk.mp4"),
+            "inline; filename=\"talk.mp4\"; filename*=UTF-8''talk.mp4"
+        );
+        // Nothing usable in ASCII still names something.
+        assert!(content_disposition("attachment", "\u{1f3a4}")
+            .starts_with("attachment; filename=\"_\"; filename*=UTF-8''%F0%9F%8E%A4"));
+        assert!(content_disposition("attachment", "a\\b/c")
+            .starts_with("attachment; filename=\"a_b_c\""));
+    }
+
+    /// The transcript as text names each line the way the page does.
+    #[tokio::test]
+    async fn the_text_transcript_uses_the_labels() {
+        let app = app(ready());
+        let id = imported(&app, false, false);
+        {
+            let db = app.db.lock().unwrap();
+            let transcript_id = Ulid::new().to_string();
+            db.conn()
+                .execute(
+                    "INSERT INTO transcripts (id, recording_id, revision, engine_name, engine_model,
+                                              language)
+                     VALUES (?1, ?2, 1, 'parakeet', 'tdt-0.6b', 'en')",
+                    rusqlite::params![transcript_id, id.to_string()],
+                )
+                .unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO transcript_segments
+                         (id, transcript_id, track_id, seq, start_boottime_ns, end_boottime_ns,
+                          speaker_hint, text)
+                     VALUES (?1, ?2, 'a_imported_01', 0, 0, 1, 'unknown', 'Welcome.')",
+                    rusqlite::params![Ulid::new().to_string(), transcript_id],
+                )
+                .unwrap();
+        }
+        let (status, _, body) =
+            app.get(&format!("/api/v1/recordings/{id}/transcript.txt"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(String::from_utf8(body).unwrap(), "[00:00] Speaker: Welcome.");
+
+        let (_, _, body) = app.get(&format!("/api/v1/recordings/{id}/transcript"), None).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["lines"][0]["label"], "Speaker");
+        assert_eq!(json["lines"][0]["speaker"], "unknown");
     }
 }

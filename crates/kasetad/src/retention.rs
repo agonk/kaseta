@@ -108,8 +108,11 @@ fn expired_before(db: &Db, cutoff: time::OffsetDateTime) -> Result<Vec<(Ulid, ti
 
 /// Removes a recording's audio, keeping the recording itself.
 ///
-/// Chunks and exports go; the manifest and headers stay, so the recording
-/// remains identifiable and its transcript keeps its timeline.
+/// Chunks, exports and a kept original go; the manifest and headers stay, so
+/// the recording remains identifiable and its transcript keeps its timeline.
+/// The original is media like the rest, usually the largest object a
+/// recording has, and keeping it would leave this policy reclaiming the
+/// smaller part of an imported recording.
 fn remove_audio(
     store: &dyn BlobStore,
     db: &Db,
@@ -125,7 +128,7 @@ fn remove_audio(
         // Metadata is tiny and is what makes the remainder legible; only the
         // audio is worth reclaiming.
         let is_audio = path.ends_with(".flac") || path.ends_with(".wav");
-        if !is_audio {
+        if !is_audio && !crate::library::is_original(&key) {
             continue;
         }
         store
@@ -135,10 +138,11 @@ fn remove_audio(
     }
 
     if removed > 0 {
-        // Reflected in the index so the interface stops offering a player for
-        // audio that is no longer there.
+        // Reflected in the index, in one step, so the interface stops
+        // offering a player for audio, or an original, that is no longer
+        // there.
         db.conn().execute(
-            "UPDATE recordings SET has_mixed = 0, tracks_json = '[]',
+            "UPDATE recordings SET has_mixed = 0, tracks_json = '[]', original_local = 0,
                     updated_at = strftime('%s','now')
              WHERE id = ?1",
             rusqlite::params![id.to_string()],
@@ -268,6 +272,68 @@ mod tests {
 
         assert!(store.exists(&prefix.manifest()).unwrap(), "the manifest must survive");
         assert!(!store.exists(&prefix.export("mixed.flac").unwrap()).unwrap());
+    }
+
+    fn original_local(db: &Arc<Mutex<Db>>, id: Ulid) -> i64 {
+        db.lock()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT original_local FROM recordings WHERE id = ?1",
+                rusqlite::params![id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// An imported recording's kept original is media too, and usually the
+    /// largest object it has. Keeping only transcripts must take it as well,
+    /// and the index must stop calling it local in the same step.
+    #[test]
+    fn keeping_only_transcripts_removes_a_kept_original() {
+        let (_dir, store, db) = setup();
+        let id = recording(&store, &db, 90);
+        let started = NOW - time::Duration::days(90);
+        let prefix = kaseta_contracts::RecordingPrefix::new(id, started);
+        let original = prefix.original("mp4").unwrap();
+        store.put(&original, b"video").unwrap();
+        db.lock()
+            .unwrap()
+            .conn()
+            .execute(
+                "UPDATE recordings SET origin = 'imported', original_local = 1 WHERE id = ?1",
+                rusqlite::params![id.to_string()],
+            )
+            .unwrap();
+
+        let swept = sweep(&store, &db, &policy(true, 30, true), NOW).unwrap();
+        assert_eq!(swept.audio_removed, 1);
+
+        assert!(!store.exists(&original).unwrap(), "the original must go with the audio");
+        assert_eq!(original_local(&db, id), 0);
+        assert!(store.exists(&prefix.manifest()).unwrap(), "the manifest still names it");
+    }
+
+    /// An original whose extension is also an audio one is caught either way;
+    /// one with any other extension must not be left behind.
+    #[test]
+    fn an_original_is_removed_whatever_its_extension() {
+        let (_dir, store, db) = setup();
+        let id = recording(&store, &db, 90);
+        let prefix =
+            kaseta_contracts::RecordingPrefix::new(id, NOW - time::Duration::days(90));
+        // Only the original: the audio is already gone.
+        for key in store.list_prefix(prefix.root().as_str()).unwrap() {
+            if key.as_str().ends_with(".flac") {
+                store.delete(&key).unwrap();
+            }
+        }
+        let original = prefix.original("mkv").unwrap();
+        store.put(&original, b"video").unwrap();
+
+        let swept = sweep(&store, &db, &policy(true, 30, true), NOW).unwrap();
+        assert_eq!(swept.audio_removed, 1);
+        assert!(!store.exists(&original).unwrap());
     }
 
     #[test]

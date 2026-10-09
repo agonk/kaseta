@@ -16,13 +16,24 @@
 //!
 //! Decoding and re-encoding is lossless in both directions, so a merged file is
 //! sample-identical to what was captured.
+//!
+//! # Memory
+//!
+//! Every export here streams: audio is decoded a chunk at a time, processed a
+//! window at a time, and encoded output goes to a file beside its key as it is
+//! produced ([`PendingBlob`]), committed whole at the end. Nothing holds a
+//! recording-length buffer, so exporting a three-hour import costs what a
+//! three-minute meeting does. `tests/export_memory.rs` holds the line.
+
+use std::io::{Seek, SeekFrom, Write};
 
 use anyhow::{bail, Context, Result};
 use kaseta_contracts::manifest::{Chunk, RecordingManifest, Track};
 use kaseta_contracts::BlobKey;
 
-use crate::blobstore::BlobStore;
+use crate::blobstore::{BlobStore, PendingBlob};
 use crate::clock::samples_to_ns;
+use crate::flac::FlacFileWriter;
 
 /// What a merge produced for one track.
 #[derive(Debug)]
@@ -169,62 +180,13 @@ impl<'a> TrackReader<'a> {
         }
         Ok(out)
     }
-}
 
-/// Feeds a [`TrackReader`] to the FLAC encoder block by block.
-///
-/// The encoder pulls fixed-size blocks, so the whole track never has to exist
-/// in memory at once.
-struct StreamingSource<'a, 'b> {
-    reader: &'b mut TrackReader<'a>,
-    total: usize,
-    /// The encoder's error type cannot carry a cause, so a read failure is kept
-    /// here and re-raised afterwards. Without this a corrupt chunk surfaces as
-    /// an opaque "invalid format" instead of naming the integrity failure.
-    failure: Option<anyhow::Error>,
-}
-
-impl flacenc::source::Source for StreamingSource<'_, '_> {
-    fn channels(&self) -> usize {
-        self.reader.channels as usize
-    }
-
-    fn bits_per_sample(&self) -> usize {
-        16
-    }
-
-    fn sample_rate(&self) -> usize {
-        self.reader.sample_rate as usize
-    }
-
-    fn read_samples<F: flacenc::source::Fill>(
-        &mut self,
-        block_size: usize,
-        dest: &mut F,
-    ) -> std::result::Result<usize, flacenc::error::SourceError> {
-        let channels = self.reader.channels as usize;
-        let want = block_size * channels;
-
-        let samples = match self.reader.take(want) {
-            Ok(samples) => samples,
-            Err(e) => {
-                self.failure = Some(e);
-                return Err(flacenc::error::SourceError::by_reason(
-                    flacenc::error::SourceErrorReason::InvalidFormat,
-                ));
-            }
-        };
-        if samples.is_empty() {
-            return Ok(0);
-        }
-
-        let widened: Vec<i32> = samples.iter().map(|s| *s as i32).collect();
-        dest.fill_interleaved(&widened)?;
-        Ok(samples.len() / channels)
-    }
-
-    fn len_hint(&self) -> Option<usize> {
-        Some(self.total)
+    /// One second of interleaved samples: the step every export reads in.
+    ///
+    /// A whole second is an exact multiple of any sensible rate ratio, which
+    /// the ASR resampler relies on, and small enough not to matter.
+    fn window(&self) -> usize {
+        self.sample_rate as usize * self.channels as usize
     }
 }
 
@@ -234,62 +196,35 @@ fn merge_track(
     prefix: &kaseta_contracts::RecordingPrefix,
 ) -> Result<MergedTrack> {
     let mut reader = TrackReader::new(store, track)?;
-    let channels = reader.channels;
-    let sample_rate = reader.sample_rate;
-    let total = (reader.total_samples() / channels.max(1) as u64) as usize;
-
-    let encoded = {
-        let mut source = StreamingSource {
-            reader: &mut reader,
-            total,
-            failure: None,
-        };
-        let encoded = encode_flac_streaming(&mut source, sample_rate);
-        match source.failure.take() {
-            // Reading failed underneath the encoder; report why, not that the
-            // encoder was unhappy.
-            Some(cause) => return Err(cause),
-            None => encoded?,
-        }
-    };
-
     let key = prefix
         .export(&format!("{}.flac", track.track_id))
         .context("building export key")?;
-    store
-        .put(&key, &encoded)
+
+    let mut out = PendingBlob::create(store, &key)
+        .with_context(|| format!("writing merged track {}", track.track_id))?;
+    let mut flac = FlacFileWriter::new(out.writer(), reader.sample_rate, reader.channels)?;
+    let window = reader.window();
+    loop {
+        let block = reader.take(window)?;
+        if block.is_empty() {
+            break;
+        }
+        flac.write_samples(&block)
+            .with_context(|| format!("encoding merged track {}", track.track_id))?;
+    }
+    let (_, written) = flac
+        .finish()
+        .with_context(|| format!("encoding merged track {}", track.track_id))?;
+    let stored = out
+        .commit()
         .with_context(|| format!("writing merged track {}", track.track_id))?;
 
     Ok(MergedTrack {
         key,
-        bytes: encoded.len() as u64,
-        frames: total as u64,
+        bytes: stored.bytes,
+        frames: written.frames,
         padded_frames: reader.padded_frames,
     })
-}
-
-/// Encodes from a pull-based source rather than a buffer of every sample.
-fn encode_flac_streaming<S: flacenc::source::Source>(
-    source: &mut S,
-    sample_rate: u32,
-) -> Result<Vec<u8>> {
-    use flacenc::component::BitRepr;
-    use flacenc::error::Verify;
-
-    let config = flacenc::config::Encoder::default()
-        .into_verified()
-        .map_err(|e| anyhow::anyhow!("invalid FLAC encoder config: {e:?}"))?;
-
-    let stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
-        .map_err(|e| anyhow::anyhow!("FLAC encoding failed: {e:?}"))?;
-
-    let mut sink = flacenc::bitsink::ByteSink::new();
-    stream
-        .write(&mut sink)
-        .map_err(|e| anyhow::anyhow!("writing FLAC stream failed: {e:?}"))?;
-
-    debug_assert!(sample_rate > 0);
-    Ok(sink.into_inner())
 }
 
 /// A single stereo file combining every track in a recording.
@@ -316,6 +251,14 @@ pub struct MixedRecording {
 ///
 /// Output is stereo: a mono microphone is placed in both channels rather than
 /// left only.
+///
+/// # Streaming
+///
+/// All tracks are read side by side, a second at a time, and each mixed second
+/// is encoded and reduced into the waveform as soon as it exists. Whether the
+/// sum clips is only known by looking at it, so the first pass runs at full
+/// gain and stops at the first clipped sample; only then is the recording mixed
+/// again, attenuated. Most recordings never clip and are read once.
 pub fn mix_recording(
     store: &dyn BlobStore,
     manifest: &RecordingManifest,
@@ -353,103 +296,177 @@ pub fn mix_recording(
         .min()
         .context("no chunk carries a start time")?;
 
-    // Summed in i16 with saturation rather than i32: an i32 accumulator would
-    // double what a long recording needs, and clipping is rare enough that
-    // detecting it and redoing the pass costs less than always paying for the
-    // wider type. Each track is streamed rather than decoded whole.
-    let mut mixed: Vec<i16> = Vec::new();
+    let key = prefix.export("mixed.flac").context("building export key")?;
+
     let mut needed_attenuation = false;
-
-    for pass in 0..2 {
-        // The second pass runs only if the first clipped, applying the
-        // attenuation that pass proved necessary.
-        let gain = if pass == 0 { 1.0f32 } else { 0.5f32 };
-        mixed.clear();
-        let mut clipped = false;
-
+    for gain in [1.0f32, 0.5f32] {
+        let mut inputs = Vec::with_capacity(tracks.len());
         for track in &tracks {
-            let mut reader = TrackReader::new(store, track)?;
-            let channels = reader.channels;
-
             let offset_ns = track
                 .chunks
                 .first()
                 .map(|c| c.boottime_start_ns.saturating_sub(earliest))
                 .unwrap_or(0);
-            let mut out_frame = ns_to_frames(offset_ns, sample_rate) as usize;
+            inputs.push(MixInput {
+                reader: TrackReader::new(store, track)?,
+                start: ns_to_frames(offset_ns, sample_rate),
+                done: false,
+            });
+        }
+        // Known from the manifest before anything is decoded, which is what
+        // lets the waveform be reduced on the fly into a fixed number of points.
+        let expected_frames = inputs
+            .iter()
+            .map(|i| i.start + i.reader.total_samples() / i.reader.channels as u64)
+            .max()
+            .unwrap_or(0);
 
-            let window = sample_rate as usize * channels as usize;
-            loop {
-                let block = reader.take(window)?;
-                if block.is_empty() {
-                    break;
-                }
-                let frames = block.len() / channels as usize;
-                let needed = (out_frame + frames) * 2;
-                if mixed.len() < needed {
-                    mixed.resize(needed, 0);
-                }
+        let mut out = PendingBlob::create(store, &key).context("writing mixed recording")?;
+        let mut flac = FlacFileWriter::new(out.writer(), sample_rate, 2)?;
+        let mut peaks = PeakMeter::new(expected_frames, WAVEFORM_POINTS);
 
-                for frame in 0..frames {
-                    let base = frame * channels as usize;
-                    // A mono source belongs in the middle, not hard left.
-                    let (left, right) = if channels == 1 {
-                        (block[base], block[base])
-                    } else {
-                        (block[base], block[base + 1])
-                    };
-                    let out = (out_frame + frame) * 2;
+        // Only the full-gain pass can be abandoned: the attenuated one is the
+        // answer whether or not it still clips, exactly as a single clamped
+        // pass would be.
+        let stop_on_clip = gain == 1.0;
+        let outcome = mix_tracks(&mut inputs, sample_rate, gain, stop_on_clip, |block| {
+            peaks.push(block, 2);
+            flac.write_samples(block).context("encoding mixed recording")
+        })?;
 
-                    for (i, sample) in [left, right].into_iter().enumerate() {
-                        let scaled = (sample as f32 * gain) as i32;
-                        let sum = mixed[out + i] as i32 + scaled;
-                        if sum > i16::MAX as i32 || sum < i16::MIN as i32 {
-                            clipped = true;
-                        }
-                        mixed[out + i] = sum.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                    }
-                }
-                out_frame += frames;
+        if outcome.clipped && stop_on_clip {
+            // Dropping the pending blob removes its partial file.
+            needed_attenuation = true;
+            continue;
+        }
+
+        flac.finish().context("encoding mixed recording")?;
+        let stored = out.commit().context("writing mixed recording")?;
+
+        // Computed here rather than on demand: the samples were already in
+        // hand, and drawing a waveform from the file would mean decoding the
+        // whole recording again.
+        if let Ok(peaks_key) = prefix.export("mixed.peaks.json") {
+            let encoded = serde_json::to_vec(&peaks.finish()).unwrap_or_else(|_| b"[]".to_vec());
+            if let Err(e) = store.put(&peaks_key, &encoded) {
+                // A missing waveform costs a nicer scrubber, not the recording.
+                tracing::warn!(error = %format!("{e:#}"), "could not write the waveform");
             }
         }
 
-        if !clipped {
+        return Ok(Some(MixedRecording {
+            key,
+            bytes: stored.bytes,
+            frames: outcome.frames,
+            sample_rate_hz: sample_rate,
+            gain: if needed_attenuation { 0.5 } else { 1.0 },
+        }));
+    }
+    unreachable!("the attenuated pass always returns")
+}
+
+/// One track's place in a mix.
+struct MixInput<'a> {
+    reader: TrackReader<'a>,
+    /// Output frame at which this track's first sample belongs.
+    start: u64,
+    /// The reader has delivered everything it has.
+    done: bool,
+}
+
+struct MixOutcome {
+    frames: u64,
+    clipped: bool,
+}
+
+/// Sums `inputs` into stereo a second at a time, handing each mixed second to
+/// `emit`.
+///
+/// The output runs from the earliest track's start to the latest track's end;
+/// stretches where no track has audio, before a late track begins, are silence.
+/// The length comes from what the readers deliver, not from the manifest, so a
+/// chunk whose recorded sample count is wrong cannot truncate or pad the mix.
+fn mix_tracks(
+    inputs: &mut [MixInput<'_>],
+    sample_rate: u32,
+    gain: f32,
+    stop_on_clip: bool,
+    mut emit: impl FnMut(&[i16]) -> Result<()>,
+) -> Result<MixOutcome> {
+    let window = sample_rate.max(1) as u64;
+    let mut sums = vec![0i32; window as usize * 2];
+    let mut mixed: Vec<i16> = Vec::with_capacity(window as usize * 2);
+    let mut position = 0u64;
+    let mut frames = 0u64;
+    let mut clipped = false;
+
+    while inputs.iter().any(|i| !i.done) {
+        sums.fill(0);
+        let window_end = position + window;
+        // The furthest any track reached inside this window, and whether any
+        // track still has audio to come after it.
+        let mut reached = position;
+        let mut more_to_come = false;
+
+        for input in inputs.iter_mut().filter(|i| !i.done) {
+            let begin = input.start.max(position);
+            if begin >= window_end {
+                // Not started yet; its silence is already in `sums`.
+                more_to_come = true;
+                continue;
+            }
+            let want = (window_end - begin) as usize;
+            let channels = input.reader.channels as usize;
+            let block = input.reader.take(want * channels)?;
+            let got = block.len() / channels;
+            if got < want {
+                input.done = true;
+            } else {
+                more_to_come = true;
+            }
+            if got > 0 {
+                reached = reached.max(begin + got as u64);
+            }
+
+            let base = (begin - position) as usize;
+            for (frame, samples) in block.chunks_exact(channels).enumerate() {
+                // A mono source belongs in the middle, not hard left.
+                let (left, right) = if channels == 1 {
+                    (samples[0], samples[0])
+                } else {
+                    (samples[0], samples[1])
+                };
+                let out = (base + frame) * 2;
+                sums[out] += (left as f32 * gain) as i32;
+                sums[out + 1] += (right as f32 * gain) as i32;
+            }
+        }
+
+        let valid = if more_to_come {
+            window
+        } else {
+            reached - position
+        };
+        if valid == 0 {
             break;
         }
-        // Whether attenuation was required is a property of the first pass. The
-        // second pass exists to apply it, so its own result must not overwrite
-        // the answer.
-        needed_attenuation = true;
-    }
 
-    let gain = if needed_attenuation { 0.5f32 } else { 1.0f32 };
-    let samples = mixed;
-
-    let frames = (samples.len() / 2) as u64;
-    let encoded = crate::capture::chunk::encode_flac_samples(&samples, sample_rate, 2)
-        .context("encoding mixed recording")?;
-
-    let key = prefix.export("mixed.flac").context("building export key")?;
-    store.put(&key, &encoded).context("writing mixed recording")?;
-
-    // Computed here rather than on demand: the samples are already in hand, and
-    // drawing a waveform later would mean decoding the whole recording again.
-    let peaks = peaks_from(&samples, 2, WAVEFORM_POINTS);
-    if let Ok(peaks_key) = prefix.export("mixed.peaks.json") {
-        let encoded = serde_json::to_vec(&peaks).unwrap_or_else(|_| b"[]".to_vec());
-        if let Err(e) = store.put(&peaks_key, &encoded) {
-            // A missing waveform costs a nicer scrubber, not the recording.
-            tracing::warn!(error = %format!("{e:#}"), "could not write the waveform");
+        mixed.clear();
+        for sum in &sums[..valid as usize * 2] {
+            if *sum > i16::MAX as i32 || *sum < i16::MIN as i32 {
+                clipped = true;
+            }
+            mixed.push((*sum).clamp(i16::MIN as i32, i16::MAX as i32) as i16);
         }
+        if clipped && stop_on_clip {
+            return Ok(MixOutcome { frames, clipped });
+        }
+        emit(&mixed)?;
+        frames += valid;
+        position = window_end;
     }
 
-    Ok(Some(MixedRecording {
-        key,
-        bytes: encoded.len() as u64,
-        frames,
-        sample_rate_hz: sample_rate,
-        gain,
-    }))
+    Ok(MixOutcome { frames, clipped })
 }
 
 /// How many points a waveform is reduced to.
@@ -458,29 +475,82 @@ pub fn mix_recording(
 /// part of a page load. The player scales it to whatever space it has.
 pub const WAVEFORM_POINTS: usize = 800;
 
-/// Reduces audio to a peak per bucket, for drawing.
+/// Reduces audio to a peak per bucket, for drawing, as it streams past.
 ///
 /// Peaks rather than averages: averaging washes speech down to a flat band,
 /// because a waveform's mean over a bucket is near zero regardless of how loud
 /// it was. The peak is what makes speech look like speech.
-fn peaks_from(samples: &[i16], channels: u16, points: usize) -> Vec<f32> {
-    let channels = channels.max(1) as usize;
-    let frames = samples.len() / channels;
-    if frames == 0 || points == 0 {
-        return Vec::new();
+///
+/// The bucket size comes from the expected length, so a correct estimate gives
+/// exactly the buckets a whole-buffer reduction would. Should the audio run
+/// longer than expected, adjacent buckets are merged pairwise and the bucket
+/// size doubles: the point count stays bounded whatever the estimate said.
+struct PeakMeter {
+    points: usize,
+    frames_per_point: u64,
+    peaks: Vec<f32>,
+    current: f32,
+    filled: u64,
+}
+
+impl PeakMeter {
+    fn new(expected_frames: u64, points: usize) -> Self {
+        Self {
+            points,
+            frames_per_point: expected_frames.div_ceil(points.max(1) as u64).max(1),
+            peaks: Vec::with_capacity(points + 1),
+            current: 0.0,
+            filled: 0,
+        }
     }
 
-    let per_point = frames.div_ceil(points).max(1);
-    let mut peaks = Vec::with_capacity(points);
-
-    for bucket in samples.chunks(per_point * channels) {
-        let peak = bucket
-            .iter()
-            .map(|s| s.saturating_abs() as f32)
-            .fold(0.0f32, f32::max);
-        peaks.push(peak / i16::MAX as f32);
+    fn push(&mut self, samples: &[i16], channels: u16) {
+        if self.points == 0 {
+            return;
+        }
+        for frame in samples.chunks_exact(channels.max(1) as usize) {
+            let peak = frame
+                .iter()
+                .map(|s| s.saturating_abs() as f32)
+                .fold(0.0f32, f32::max);
+            self.current = self.current.max(peak / i16::MAX as f32);
+            self.filled += 1;
+            if self.filled == self.frames_per_point {
+                self.close_bucket();
+            }
+        }
     }
-    peaks
+
+    fn close_bucket(&mut self) {
+        self.peaks.push(self.current);
+        self.current = 0.0;
+        self.filled = 0;
+        if self.peaks.len() > self.points {
+            let leftover = (self.peaks.len() % 2 == 1).then(|| self.peaks[self.peaks.len() - 1]);
+            self.peaks = self
+                .peaks
+                .chunks_exact(2)
+                .map(|pair| pair[0].max(pair[1]))
+                .collect();
+            // An unpaired last bucket becomes the start of the next, larger one.
+            if let Some(last) = leftover {
+                self.current = last;
+                self.filled = self.frames_per_point;
+            }
+            self.frames_per_point *= 2;
+        }
+    }
+
+    fn finish(mut self) -> Vec<f32> {
+        if self.filled > 0 {
+            self.close_bucket();
+            if self.filled > 0 {
+                // Merging left a partial bucket behind; it is the last point.
+                self.peaks.push(self.current);
+            }
+        }
+        self.peaks
+    }
 }
 
 /// Sample rate speech models expect. Higher rates carry no speech information
@@ -513,23 +583,25 @@ pub fn write_asr_audio(
     let source_rate = reader.sample_rate;
     let channels = reader.channels;
 
-    // One second of input at a time. Converting in windows keeps memory flat,
-    // and a whole second is an exact multiple of any sensible rate ratio, so
-    // resampling each window independently introduces no boundary artefact.
-    let window = source_rate as usize * channels as usize;
-    let mut resampled: Vec<i16> = Vec::new();
+    let mut out = PendingBlob::create(store, &key)
+        .with_context(|| format!("writing transcription audio for {}", track.track_id))?;
+    let mut wav = WavWriter::new(out.writer(), ASR_SAMPLE_RATE_HZ)?;
+
+    // Converting in one-second windows keeps memory flat, and a whole second
+    // is an exact multiple of any sensible rate ratio, so resampling each
+    // window independently introduces no boundary artefact.
+    let window = reader.window();
     loop {
         let block = reader.take(window)?;
         if block.is_empty() {
             break;
         }
         let mono = downmix_to_mono(&block, channels);
-        resampled.extend(resample(&mono, source_rate, ASR_SAMPLE_RATE_HZ));
+        wav.write_samples(&resample(&mono, source_rate, ASR_SAMPLE_RATE_HZ))?;
     }
-
-    let wav = encode_wav(&resampled, ASR_SAMPLE_RATE_HZ);
-    store
-        .put(&key, &wav)
+    wav.finish()
+        .with_context(|| format!("writing transcription audio for {}", track.track_id))?;
+    out.commit()
         .with_context(|| format!("writing transcription audio for {}", track.track_id))?;
     Ok(key)
 }
@@ -579,27 +651,93 @@ fn resample(samples: &[i16], from_hz: u32, to_hz: u32) -> Vec<i16> {
     out
 }
 
-/// Encodes mono 16-bit samples as a WAV file.
-fn encode_wav(samples: &[i16], sample_rate_hz: u32) -> Vec<u8> {
-    let data_bytes = (samples.len() * 2) as u32;
-    let mut wav = Vec::with_capacity(44 + data_bytes as usize);
+/// Size of a canonical PCM WAV header.
+const WAV_HEADER_BYTES: u64 = 44;
 
-    wav.extend_from_slice(b"RIFF");
-    wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
-    wav.extend_from_slice(b"WAVEfmt ");
-    wav.extend_from_slice(&16u32.to_le_bytes()); // PCM header size
-    wav.extend_from_slice(&1u16.to_le_bytes()); // uncompressed
-    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
-    wav.extend_from_slice(&sample_rate_hz.to_le_bytes());
-    wav.extend_from_slice(&(sample_rate_hz * 2).to_le_bytes()); // bytes per second
-    wav.extend_from_slice(&2u16.to_le_bytes()); // block align
-    wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
-    wav.extend_from_slice(b"data");
-    wav.extend_from_slice(&data_bytes.to_le_bytes());
-    for s in samples {
-        wav.extend_from_slice(&s.to_le_bytes());
+/// The header of a mono 16-bit PCM WAV file holding `data_bytes` of samples.
+fn wav_header(sample_rate_hz: u32, data_bytes: u32) -> [u8; WAV_HEADER_BYTES as usize] {
+    let mut header = [0u8; WAV_HEADER_BYTES as usize];
+    let fields: [&[u8]; 12] = [
+        b"RIFF",
+        &(36 + data_bytes).to_le_bytes(),
+        b"WAVEfmt ",
+        &16u32.to_le_bytes(), // PCM header size
+        &1u16.to_le_bytes(),  // uncompressed
+        &1u16.to_le_bytes(),  // mono
+        &sample_rate_hz.to_le_bytes(),
+        &(sample_rate_hz * 2).to_le_bytes(), // bytes per second
+        &2u16.to_le_bytes(),                 // block align
+        &16u16.to_le_bytes(),                // bits per sample
+        b"data",
+        &data_bytes.to_le_bytes(),
+    ];
+    let mut at = 0;
+    for field in fields {
+        header[at..at + field.len()].copy_from_slice(field);
+        at += field.len();
     }
-    wav
+    header
+}
+
+/// Writes mono 16-bit WAV as samples arrive.
+///
+/// The header states the data size up front. Rather than trusting a size
+/// computed from the manifest, which can disagree with what the chunks
+/// actually decode to, a placeholder goes first and the real size is written
+/// back once the samples are out.
+struct WavWriter<W: Write + Seek> {
+    out: W,
+    sample_rate_hz: u32,
+    start: u64,
+    data_bytes: u64,
+    bytes: Vec<u8>,
+}
+
+impl<W: Write + Seek> WavWriter<W> {
+    fn new(mut out: W, sample_rate_hz: u32) -> Result<Self> {
+        let start = out.stream_position().context("locating the WAV start")?;
+        out.write_all(&wav_header(sample_rate_hz, 0))
+            .context("writing the WAV header")?;
+        Ok(Self {
+            out,
+            sample_rate_hz,
+            start,
+            data_bytes: 0,
+            bytes: Vec::new(),
+        })
+    }
+
+    fn write_samples(&mut self, samples: &[i16]) -> Result<()> {
+        self.bytes.clear();
+        self.bytes.extend(samples.iter().flat_map(|s| s.to_le_bytes()));
+        self.out
+            .write_all(&self.bytes)
+            .context("writing WAV samples")?;
+        self.data_bytes += self.bytes.len() as u64;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<W> {
+        // RIFF sizes are 32-bit. At 16 kHz mono that is over 37 hours, far past
+        // any recording, but a wrapped size would make the file unreadable
+        // rather than merely long, so it is refused outright.
+        let data_bytes = u32::try_from(self.data_bytes)
+            .ok()
+            .filter(|b| *b <= u32::MAX - 36)
+            .context("the transcription audio is too long for a WAV file")?;
+        let end = self.out.stream_position().context("locating the WAV end")?;
+        self.out
+            .seek(SeekFrom::Start(self.start))
+            .context("seeking back to the WAV header")?;
+        self.out
+            .write_all(&wav_header(self.sample_rate_hz, data_bytes))
+            .context("patching the WAV header")?;
+        self.out
+            .seek(SeekFrom::Start(end))
+            .context("returning to the WAV end")?;
+        self.out.flush().context("flushing the WAV file")?;
+        Ok(self.out)
+    }
 }
 
 /// Converts a duration to whole frames, rounding to nearest.
@@ -648,7 +786,6 @@ pub fn frames_to_seconds(frames: u64, sample_rate_hz: u32) -> f64 {
 mod tests {
     use super::*;
     use crate::blobstore::LocalFsStore;
-    use crate::capture::chunk::encode_flac_samples;
     use kaseta_contracts::manifest::{
         Chunk, ClockDomain, MediaType, TrackFormat, TrackRole, TrackSource,
     };
@@ -656,6 +793,44 @@ mod tests {
     use tempfile::TempDir;
     use time::macros::datetime;
     use ulid::Ulid;
+
+    fn encode_flac_samples(samples: &[i16], sample_rate_hz: u32, channels: u16) -> Result<Vec<u8>> {
+        let mut writer =
+            FlacFileWriter::new(std::io::Cursor::new(Vec::new()), sample_rate_hz, channels)?;
+        writer.write_samples(samples)?;
+        Ok(writer.finish()?.0.into_inner())
+    }
+
+    fn encode_wav(samples: &[i16], sample_rate_hz: u32) -> Vec<u8> {
+        let mut wav = WavWriter::new(std::io::Cursor::new(Vec::new()), sample_rate_hz).unwrap();
+        wav.write_samples(samples).unwrap();
+        wav.finish().unwrap().into_inner()
+    }
+
+    fn peaks_from(samples: &[i16], channels: u16, points: usize) -> Vec<f32> {
+        let frames = samples.len() / channels.max(1) as usize;
+        let mut meter = PeakMeter::new(frames as u64, points);
+        meter.push(samples, channels);
+        meter.finish()
+    }
+
+    /// Files under the store that are not objects: anything an export left
+    /// behind.
+    fn temporaries(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.to_string_lossy().ends_with(".tmp") {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
 
     fn tone(frames: usize, channels: u16) -> Vec<i16> {
         (0..frames * channels as usize)
@@ -890,6 +1065,7 @@ mod tests {
                 build("a_remote-mix_01", TrackRole::RemoteMix, remote),
             ],
             notes: RecordingNotes::default(),
+            source: None,
         }
     }
 
@@ -1159,5 +1335,149 @@ mod tests {
         assert_eq!(ns_to_frames(500_000_000, 48_000), 24_000);
         assert_eq!(ns_to_frames(20_833, 48_000), 1);
         assert_eq!(ns_to_frames(0, 48_000), 0);
+    }
+
+    #[test]
+    fn a_track_that_starts_after_another_ends_keeps_the_silence_between() {
+        // One second of mic, then nothing, then the remote side two seconds
+        // in. The mix must hold the second of silence, not close it up.
+        let (_dir, store, prefix) = setup();
+        let manifest = two_track_manifest(
+            &store,
+            &prefix,
+            (vec![1_000i16; 48_000], 1, 0),
+            (vec![2_000i16; 96_000], 2, 2_000_000_000),
+        );
+
+        let mixed = mix_recording(&store, &manifest, &prefix).unwrap().unwrap();
+        let decoded = decode_flac(&store.get(&mixed.key).unwrap(), 2).unwrap();
+
+        assert_eq!(mixed.frames, 3 * 48_000);
+        assert_eq!(decoded[0], 1_000);
+        assert_eq!(decoded[(48_000 + 10) * 2], 0, "the gap is silence");
+        assert_eq!(decoded[(2 * 48_000 + 10) * 2], 2_000);
+    }
+
+    #[test]
+    fn a_streamed_mix_equals_summing_whole_tracks() {
+        // Several windows, an offset that is not a whole window, and stereo
+        // against mono: compared with the obvious whole-buffer computation.
+        let (_dir, store, prefix) = setup();
+        let mic: Vec<i16> = tone(150_000, 1).iter().map(|s| s / 2).collect();
+        let remote: Vec<i16> = tone(100_000, 2).iter().map(|s| s / 3).collect();
+        let offset_frames = 30_001usize;
+        let offset_ns = offset_frames as u64 * 1_000_000_000 / 48_000 + 1;
+        let manifest = two_track_manifest(
+            &store,
+            &prefix,
+            (mic.clone(), 1, 0),
+            (remote.clone(), 2, offset_ns),
+        );
+
+        let mixed = mix_recording(&store, &manifest, &prefix).unwrap().unwrap();
+        let decoded = decode_flac(&store.get(&mixed.key).unwrap(), 2).unwrap();
+
+        let start = ns_to_frames(offset_ns, 48_000) as usize;
+        let frames = (start + 100_000).max(150_000);
+        let mut expected = vec![0i32; frames * 2];
+        for (i, s) in mic.iter().enumerate() {
+            expected[i * 2] += *s as i32;
+            expected[i * 2 + 1] += *s as i32;
+        }
+        for (i, s) in remote.iter().enumerate() {
+            expected[start * 2 + i] += *s as i32;
+        }
+        let expected: Vec<i16> = expected.iter().map(|s| *s as i16).collect();
+        assert_eq!(mixed.frames as usize, frames);
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn exports_leave_no_temporary_files() {
+        let (dir, store, prefix) = setup();
+        // Loud enough to clip, so the abandoned full-gain pass is exercised.
+        let manifest = two_track_manifest(
+            &store,
+            &prefix,
+            (vec![30_000i16; 60_000], 1, 0),
+            (vec![30_000i16; 120_000], 2, 0),
+        );
+
+        merge_recording(&store, &manifest, &prefix).unwrap();
+        let mixed = mix_recording(&store, &manifest, &prefix).unwrap().unwrap();
+        write_asr_audio(&store, &manifest.tracks[0], &prefix).unwrap();
+
+        assert!(mixed.gain < 1.0);
+        assert!(
+            temporaries(dir.path()).is_empty(),
+            "left behind: {:?}",
+            temporaries(dir.path())
+        );
+    }
+
+    #[test]
+    fn a_failed_export_leaves_neither_an_object_nor_a_temporary() {
+        let (dir, store, prefix) = setup();
+        let track = track_with_chunks(&store, &prefix, 1, &[(tone(1_000, 1), 0)]);
+        store
+            .put(
+                &track.chunks[0].blob,
+                &encode_flac_samples(&vec![42i16; 1_000], 48_000, 1).unwrap(),
+            )
+            .unwrap();
+
+        assert!(merge_track(&store, &track, &prefix).is_err());
+        let key = prefix.export("a_local-mic_01.flac").unwrap();
+        assert!(!store.exists(&key).unwrap());
+        assert!(temporaries(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn transcription_audio_declares_what_it_actually_holds() {
+        // The manifest's sample counts are wrong here. The WAV header must
+        // describe the samples written, not the ones promised.
+        let (_dir, store, prefix) = setup();
+        let mut track =
+            track_with_chunks(&store, &prefix, 2, &[(tone(48_000, 2), 0), (tone(24_000, 2), 0)]);
+        track.chunks[0].sample_count = None;
+        track.chunks[1].sample_count = Some(1);
+
+        let key = write_asr_audio(&store, &track, &prefix).unwrap();
+        let wav = store.get(&key).unwrap();
+
+        let declared = u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]) as usize;
+        assert_eq!(declared, wav.len() - 44);
+        assert_eq!(declared, 24_000 * 2, "1.5 s at 16 kHz mono, 16-bit");
+        let riff = u32::from_le_bytes([wav[4], wav[5], wav[6], wav[7]]) as usize;
+        assert_eq!(riff, wav.len() - 8);
+    }
+
+    #[test]
+    fn a_waveform_stays_bounded_when_the_audio_outlasts_its_estimate() {
+        // The estimate comes from the manifest and could be wrong. However
+        // long the audio turns out to be, the point count must not grow with it.
+        let mut meter = PeakMeter::new(1_000, 100);
+        let mut loud_at_end = vec![0i16; 99_000];
+        loud_at_end.extend(vec![30_000i16; 1_000]);
+        meter.push(&loud_at_end, 1);
+        let peaks = meter.finish();
+
+        assert!(peaks.len() <= 100, "{} points", peaks.len());
+        assert!(peaks.len() >= 50, "{} points: resolution was lost", peaks.len());
+        assert!(peaks[0] < 0.01);
+        assert!(*peaks.last().unwrap() > 0.9, "the loud end survives merging");
+    }
+
+    #[test]
+    fn a_waveform_matches_a_whole_buffer_reduction_when_the_estimate_is_right() {
+        let samples: Vec<i16> = (0..10_007).map(|i| ((i * 37) % 20_000) as i16).collect();
+        let peaks = peaks_from(&samples, 1, 800);
+
+        let per_point = 10_007usize.div_ceil(800);
+        let expected: Vec<f32> = samples
+            .chunks(per_point)
+            .map(|b| b.iter().map(|s| s.saturating_abs() as f32).fold(0.0, f32::max) / i16::MAX as f32)
+            .collect();
+        assert_eq!(peaks, expected);
     }
 }

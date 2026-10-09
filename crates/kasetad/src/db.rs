@@ -13,12 +13,12 @@
 #![allow(dead_code)]
 
 use anyhow::{Context, Result};
-use kaseta_contracts::{Job, JobState, JobType};
+use kaseta_contracts::{Job, JobState, JobType, Origin};
 use rusqlite::{params, Connection, OptionalExtension};
 use ulid::Ulid;
 
 /// Bumped whenever the schema changes. Migrations run in order at startup.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// The single local user. Present so every query is already scoped by owner and
 /// adding real accounts does not mean rewriting them.
@@ -119,6 +119,11 @@ impl Db {
                 .execute_batch(include_str!("migrations/007_publish_webhook.sql"))
                 .context("applying migration 007_publish_webhook")?;
         }
+        if current < 8 {
+            self.conn
+                .execute_batch(include_str!("migrations/008_import.sql"))
+                .context("applying migration 008_import")?;
+        }
 
         self.conn
             .pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -215,6 +220,10 @@ impl Db {
         Ok(job)
     }
 
+    /// Records a failed attempt and decides whether the job gets another.
+    ///
+    /// An import that this makes terminal also fails its recording, in the
+    /// same transaction.
     pub fn fail_job(
         &self,
         id: Ulid,
@@ -247,6 +256,15 @@ impl Db {
              WHERE id = ?5",
             params![next.as_str(), code, message, delay_s, id.to_string()],
         )?;
+
+        // However an import ends for good, its recording ends with it, in the
+        // same transaction that decided it was over: nothing else will ever
+        // move the row out of "processing", and recovery only looks at jobs
+        // still running, so a crash between two commits would strand it.
+        if next == JobState::FailedTerminal && job.job_type == JobType::ImportMedia {
+            Self::fail_import_row(&tx, &job.recording_id.to_string())?;
+        }
+
         tx.commit()?;
         Ok(next)
     }
@@ -359,17 +377,25 @@ impl Db {
     /// startup has no live worker, because the daemon that spawned it is gone.
     /// Model inference is not resumable, so orphans restart from the beginning
     /// and their partial output is discarded by the worker's own atomic write.
+    ///
+    /// An import that has used up its attempts also fails its recording, in the
+    /// same transaction. Nothing else would: the job that would have finalised
+    /// it is the one being given up on, so the row would read "processing" for
+    /// ever.
     pub fn recover_orphaned_jobs(&self) -> Result<Vec<Ulid>> {
         let tx = self.conn.unchecked_transaction()?;
 
-        let ids: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT id FROM jobs WHERE state = ?1")?;
-            let rows = stmt.query_map(params![JobState::Running.as_str()], |r| r.get(0))?;
+        let ids: Vec<(String, String, String)> = {
+            let mut stmt =
+                tx.prepare("SELECT id, job_type, recording_id FROM jobs WHERE state = ?1")?;
+            let rows = stmt.query_map(params![JobState::Running.as_str()], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
             rows.collect::<Result<_, _>>()?
         };
 
         let mut recovered = Vec::new();
-        for id in &ids {
+        for (id, job_type, recording_id) in &ids {
             // Attempts already incremented on claim, so a job that repeatedly
             // kills the daemon eventually exhausts its budget instead of
             // crash-looping.
@@ -394,11 +420,193 @@ impl Db {
                 params![next.as_str(), JobState::FailedTerminal.as_str(), id],
             )?;
 
+            let import = job_type.as_str() == JobType::ImportMedia.as_str();
+            if next == JobState::FailedTerminal && import {
+                Self::fail_import_row(&tx, recording_id)?;
+            }
+
             recovered.push(Ulid::from_string(id)?);
         }
 
         tx.commit()?;
         Ok(recovered)
+    }
+
+    /// One job, by id. `None` once it is gone, which for an import means its
+    /// recording was deleted and the row cascaded with it.
+    pub fn job(&self, id: Ulid) -> Result<Option<Job>> {
+        Self::load_job(&self.conn, &id.to_string())
+    }
+
+    // ---- imports ----------------------------------------------------------
+
+    /// Registers an uploaded file as a recording waiting to be decoded, and
+    /// queues the stage that decodes it. Returns that job's id.
+    ///
+    /// One transaction, so there is never a recording with nothing coming to
+    /// produce it, nor a decode with no recording to fill in.
+    ///
+    /// The row starts with no clock origin, no source and no local original,
+    /// and with neither dirty flag set: nothing exists to store or back up
+    /// until the file has been decoded, and finalisation sets both.
+    pub fn create_import(&self, import: &NewImport) -> Result<Ulid> {
+        // The prefix every object goes under is built from the start time to
+        // the second. A fraction stored here would name a different moment
+        // than the prefix does, and anything rebuilding the prefix from the
+        // row would look in the wrong place.
+        anyhow::ensure!(
+            import.started_at.nanosecond() == 0,
+            "an import's start time must be whole seconds"
+        );
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO recordings
+                 (id, owner_id, status, title, started_at, manifest_version, clock_started_ns,
+                  origin, source_json, original_local, derived_dirty, remote_dirty)
+             VALUES (?1, ?2, 'processing', ?3, ?4, ?5, 0, ?6, NULL, 0, 0, 0)",
+            params![
+                import.recording_id.to_string(),
+                LOCAL_OWNER_ID,
+                import.title,
+                import.started_at.unix_timestamp(),
+                kaseta_contracts::MANIFEST_VERSION,
+                Origin::Imported.as_str(),
+            ],
+        )?;
+        let job = self.enqueue(import.recording_id, JobType::ImportMedia, 1)?;
+        tx.commit()?;
+        Ok(job)
+    }
+
+    /// Marks a decoded import ready, if it is still wanted, and queues what
+    /// follows. Returns whether it did.
+    ///
+    /// A compare-and-set rather than an update: the recording must still
+    /// exist, must not have been deleted, must be an import, and `job_id` must
+    /// be its decode stage and still running. Any of those failing means the
+    /// work was overtaken while it ran, most often by someone deleting the
+    /// recording, and indexing it anyway would bring back something that was
+    /// deleted. The caller then removes what it wrote.
+    ///
+    /// Indexing, the job's success and the follow-up stages commit together.
+    /// Split, a crash between them would leave a ready recording whose
+    /// transcription was never queued, or a job requeued to decode a file that
+    /// had already been indexed.
+    pub fn finalize_import_success(
+        &self,
+        recording_id: Ulid,
+        job_id: Ulid,
+        fields: &IndexFields,
+    ) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        // The start time is deliberately not updated: it was fixed when the
+        // upload arrived, and it names the prefix everything was written to.
+        let updated = tx.execute(
+            "UPDATE recordings SET
+                 status           = 'ready',
+                 title            = COALESCE(?3, title),
+                 ended_at         = ?4,
+                 manifest_version = ?5,
+                 clock_started_ns = ?6,
+                 duration_ms      = ?7,
+                 has_mixed        = ?8,
+                 tracks_json      = ?9,
+                 source_json      = ?10,
+                 original_local   = ?11,
+                 derived_dirty    = 1,
+                 remote_dirty     = 1,
+                 updated_at       = strftime('%s','now')
+             WHERE id = ?1
+               AND deleted_at IS NULL
+               AND origin = 'imported'
+               AND EXISTS (
+                   SELECT 1 FROM jobs
+                   WHERE id = ?2 AND recording_id = ?1
+                     AND job_type = 'import_media' AND state = 'running'
+               )",
+            params![
+                recording_id.to_string(),
+                job_id.to_string(),
+                fields.title,
+                fields.ended_at,
+                fields.manifest_version,
+                fields.clock_started_ns,
+                fields.duration_ms,
+                fields.has_mixed as i64,
+                fields.tracks_json,
+                fields.source_json,
+                fields.original_local as i64,
+            ],
+        )?;
+        if updated == 0 {
+            return Ok(false);
+        }
+
+        let mut job = Self::load_job(&tx, &job_id.to_string())?
+            .with_context(|| format!("job {job_id} not found"))?;
+        job.transition(JobState::Succeeded)?;
+        tx.execute(
+            "UPDATE jobs SET state = ?1, worker_pid = NULL WHERE id = ?2",
+            params![JobState::Succeeded.as_str(), job_id.to_string()],
+        )?;
+
+        // The same follow-up a capture gets when it ends, side by side for the
+        // same reason: a recording whose transcription fails is still copied.
+        self.enqueue_once(recording_id, JobType::Transcribe, 1)?;
+        self.enqueue_once(recording_id, JobType::UploadRemote, 1)?;
+
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Marks an unfinished import's recording failed. Only an import still on
+    /// its way: a ready recording is never demoted by a stale failure, and a
+    /// deleted one stays as its deletion left it.
+    fn fail_import_row(conn: &Connection, recording_id: &str) -> Result<()> {
+        conn.execute(
+            "UPDATE recordings SET status = 'failed', updated_at = strftime('%s','now')
+             WHERE id = ?1 AND origin = 'imported' AND status = 'processing'
+               AND deleted_at IS NULL",
+            params![recording_id],
+        )?;
+        Ok(())
+    }
+
+    /// Gives a failed import another go: the recording back to `processing`
+    /// and a fresh decode queued. Returns the new job's id, or `None` when
+    /// there was nothing to retry.
+    ///
+    /// Only a `failed` import qualifies. One still processing already has a
+    /// decode on its way, and a second would race it over the same objects; a
+    /// ready one has nothing to redo. Whether the uploaded file is still there
+    /// to decode is the caller's question, since it lives in storage.
+    pub fn reset_import_for_retry(&self, recording_id: Ulid) -> Result<Option<Ulid>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let reset = tx.execute(
+            "UPDATE recordings SET status = 'processing', updated_at = strftime('%s','now')
+             WHERE id = ?1 AND origin = 'imported' AND status = 'failed' AND deleted_at IS NULL",
+            params![recording_id.to_string()],
+        )?;
+        if reset == 0 {
+            return Ok(None);
+        }
+
+        // The failed attempt is history once a new one is queued; leaving it
+        // would let the interface show the old reason beside a running decode.
+        tx.execute(
+            "DELETE FROM jobs WHERE recording_id = ?1 AND job_type = ?2
+               AND state IN ('failed_terminal','failed_retryable','canceled')",
+            params![recording_id.to_string(), JobType::ImportMedia.as_str()],
+        )?;
+        let Some(job) = self.enqueue_once(recording_id, JobType::ImportMedia, 1)? else {
+            // Something is already pending, which a failed row should never
+            // have. Leave everything as it was rather than half-reset.
+            return Ok(None);
+        };
+        tx.commit()?;
+        Ok(Some(job))
     }
 
     fn load_job(conn: &Connection, id: &str) -> Result<Option<Job>> {
@@ -443,6 +651,40 @@ impl Db {
     }
 }
 
+/// An uploaded file about to become a recording.
+#[derive(Clone, Debug)]
+pub struct NewImport {
+    pub recording_id: Ulid,
+    /// When the upload arrived, in whole UTC seconds. Fixed once, because it
+    /// names the prefix every object of the recording is written under.
+    pub started_at: time::OffsetDateTime,
+    /// What the person called it, or the file's name without its extension.
+    pub title: String,
+}
+
+/// Everything the index records about a recording that is derived from its
+/// manifest and what exists under its prefix.
+///
+/// Computed in one place and written by two: indexing a captured or rebuilt
+/// recording, and finalising an import. Two computations would drift, and an
+/// import indexed by the reconciler would then look different from the same
+/// import finalised by its job.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IndexFields {
+    pub title: Option<String>,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub manifest_version: String,
+    pub clock_started_ns: i64,
+    pub duration_ms: i64,
+    pub has_mixed: bool,
+    pub tracks_json: String,
+    pub origin: Origin,
+    pub source_json: Option<String>,
+    /// Whether the kept original is in local storage right now.
+    pub original_local: bool,
+}
+
 /// Parsers reject unknown values rather than substituting a default.
 ///
 /// A silent fallback would turn database corruption, or a row written by a newer
@@ -456,6 +698,7 @@ fn parse_job_type(s: &str) -> Result<JobType> {
         "merge_transcript" => JobType::MergeTranscript,
         "summarize" => JobType::Summarize,
         "upload_remote" => JobType::UploadRemote,
+        "import_media" => JobType::ImportMedia,
         other => anyhow::bail!("unknown job_type in database: {other:?}"),
     })
 }
@@ -518,6 +761,7 @@ mod tests {
             JobType::Summarize,
             JobType::UploadRemote,
             JobType::PublishWebhook,
+            JobType::ImportMedia,
         ] {
             db.enqueue(rec, job, 1)
                 .unwrap_or_else(|e| panic!("{job:?} cannot be queued: {e:#}"));
@@ -937,6 +1181,501 @@ mod tests {
                 other => Err(other),
             })
             .expect("the library query must run against an upgraded database");
+    }
+
+    // ---- imports ----------------------------------------------------------
+
+    fn new_import(id: Ulid) -> NewImport {
+        NewImport {
+            recording_id: id,
+            started_at: time::macros::datetime!(2026-10-09 08:00:00 UTC),
+            title: "Lecture 3".into(),
+        }
+    }
+
+    /// An import's row as it stands, for asserting on.
+    fn import_row(db: &Db, id: Ulid) -> (String, String, i64, i64, i64, Option<String>) {
+        db.conn
+            .query_row(
+                "SELECT status, origin, original_local, derived_dirty, remote_dirty, source_json
+                 FROM recordings WHERE id = ?1",
+                params![id.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .unwrap()
+    }
+
+    fn job_types_queued(db: &Db, id: Ulid) -> Vec<String> {
+        let mut stmt = db
+            .conn
+            .prepare(
+                "SELECT job_type FROM jobs WHERE recording_id = ?1 AND state = 'queued'
+                 ORDER BY enqueue_seq",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map(params![id.to_string()], |r| r.get::<_, String>(0))
+            .unwrap();
+        rows.collect::<Result<_, _>>().unwrap()
+    }
+
+    fn index_fields() -> IndexFields {
+        IndexFields {
+            title: Some("Lecture 3".into()),
+            started_at: time::macros::datetime!(2026-10-09 08:00:00 UTC).unix_timestamp(),
+            ended_at: Some(time::macros::datetime!(2026-10-09 09:00:00 UTC).unix_timestamp()),
+            manifest_version: kaseta_contracts::MANIFEST_VERSION.into(),
+            clock_started_ns: 42_000_000_000,
+            duration_ms: 3_600_000,
+            has_mixed: true,
+            tracks_json: r#"[{"track_id":"a_imported_01","role":"unattributed"}]"#.into(),
+            origin: Origin::Imported,
+            source_json: Some(r#"{"original_filename":"lecture.mp4"}"#.into()),
+            original_local: true,
+        }
+    }
+
+    /// Creates an import and claims its job, which is where finalisation
+    /// finds it.
+    fn running_import(db: &Db) -> (Ulid, Ulid) {
+        let rec = Ulid::new();
+        let job = db.create_import(&new_import(rec)).unwrap();
+        let claimed = db.claim_next_job(1).unwrap().unwrap();
+        assert_eq!(claimed.id, job);
+        assert_eq!(claimed.job_type, JobType::ImportMedia);
+        (rec, job)
+    }
+
+    #[test]
+    fn an_import_starts_as_a_processing_row_with_its_job() {
+        let db = Db::open_in_memory().unwrap();
+        let rec = Ulid::new();
+        let job_id = db.create_import(&new_import(rec)).unwrap();
+
+        let (status, origin, original_local, derived_dirty, remote_dirty, source_json) =
+            import_row(&db, rec);
+        assert_eq!(status, "processing");
+        assert_eq!(origin, "imported");
+        assert_eq!(original_local, 0);
+        assert_eq!(source_json, None, "filled only once the file is decoded");
+        // Nothing may store or back up a recording that does not exist yet.
+        assert_eq!((derived_dirty, remote_dirty), (0, 0));
+
+        let (title, started_at, manifest_version, clock): (String, i64, String, i64) = db
+            .conn
+            .query_row(
+                "SELECT title, started_at, manifest_version, clock_started_ns
+                 FROM recordings WHERE id = ?1",
+                params![rec.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "Lecture 3");
+        assert_eq!(started_at, new_import(rec).started_at.unix_timestamp());
+        assert_eq!(manifest_version, kaseta_contracts::MANIFEST_VERSION);
+        assert_eq!(clock, 0);
+
+        let job = db.job(job_id).unwrap().unwrap();
+        assert_eq!(job.job_type, JobType::ImportMedia);
+        assert_eq!(job.state, JobState::Queued);
+        assert_eq!(job.recording_id, rec);
+        assert_eq!(job_types_queued(&db, rec), vec!["import_media"]);
+    }
+
+    /// The prefix is built from whole seconds, so a start time with a
+    /// fraction would name a different place than the one stored.
+    #[test]
+    fn an_import_start_time_must_be_whole_seconds() {
+        let db = Db::open_in_memory().unwrap();
+        let mut import = new_import(Ulid::new());
+        import.started_at += time::Duration::milliseconds(250);
+        assert!(db.create_import(&import).is_err());
+        let rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM recordings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn finalising_an_import_indexes_it_and_queues_what_follows_exactly_once() {
+        let db = Db::open_in_memory().unwrap();
+        let (rec, job) = running_import(&db);
+
+        assert!(db.finalize_import_success(rec, job, &index_fields()).unwrap());
+
+        let (status, origin, original_local, derived_dirty, remote_dirty, source_json) =
+            import_row(&db, rec);
+        assert_eq!(status, "ready");
+        assert_eq!(origin, "imported");
+        assert_eq!(original_local, 1);
+        assert_eq!((derived_dirty, remote_dirty), (1, 1));
+        assert_eq!(source_json.as_deref(), index_fields().source_json.as_deref());
+
+        let (duration, has_mixed, clock, tracks): (i64, i64, i64, String) = db
+            .conn
+            .query_row(
+                "SELECT duration_ms, has_mixed, clock_started_ns, tracks_json
+                 FROM recordings WHERE id = ?1",
+                params![rec.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(duration, 3_600_000);
+        assert_eq!(has_mixed, 1);
+        assert_eq!(clock, 42_000_000_000);
+        assert_eq!(tracks, index_fields().tracks_json);
+
+        assert_eq!(db.job(job).unwrap().unwrap().state, JobState::Succeeded);
+        assert_eq!(job_types_queued(&db, rec), vec!["transcribe", "upload_remote"]);
+
+        // A second finalisation finds the job no longer running and changes
+        // nothing: no second transcription, no second backup.
+        assert!(!db.finalize_import_success(rec, job, &index_fields()).unwrap());
+        assert_eq!(job_types_queued(&db, rec), vec!["transcribe", "upload_remote"]);
+    }
+
+    /// Deleted while it was decoding. Indexing it now would bring back a
+    /// recording somebody deleted.
+    #[test]
+    fn finalising_refuses_a_deleted_import() {
+        let db = Db::open_in_memory().unwrap();
+        let (rec, job) = running_import(&db);
+        db.conn
+            .execute(
+                "UPDATE recordings SET deleted_at = 1, purge_pending = 1 WHERE id = ?1",
+                params![rec.to_string()],
+            )
+            .unwrap();
+
+        assert!(!db.finalize_import_success(rec, job, &index_fields()).unwrap());
+        assert_eq!(import_row(&db, rec).0, "processing");
+        assert_eq!(db.job(job).unwrap().unwrap().state, JobState::Running);
+        assert!(job_types_queued(&db, rec).is_empty());
+    }
+
+    #[test]
+    fn finalising_refuses_a_row_that_is_gone() {
+        let db = Db::open_in_memory().unwrap();
+        let (rec, job) = running_import(&db);
+        db.conn
+            .execute("DELETE FROM recordings WHERE id = ?1", params![rec.to_string()])
+            .unwrap();
+
+        assert!(!db.finalize_import_success(rec, job, &index_fields()).unwrap());
+        let rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM recordings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "finalising must not resurrect the row");
+    }
+
+    #[test]
+    fn finalising_refuses_a_job_that_is_not_the_one_running() {
+        let db = Db::open_in_memory().unwrap();
+        let (rec, job) = running_import(&db);
+
+        assert!(!db.finalize_import_success(rec, Ulid::new(), &index_fields()).unwrap());
+
+        // The job of a different recording does not count either.
+        let (other, other_job) = running_import(&db);
+        assert!(!db.finalize_import_success(rec, other_job, &index_fields()).unwrap());
+        assert!(!db.finalize_import_success(other, job, &index_fields()).unwrap());
+
+        assert_eq!(import_row(&db, rec).0, "processing");
+        assert!(job_types_queued(&db, rec).is_empty());
+    }
+
+    /// A job requeued by recovery, or failed by a terminal error, is no longer
+    /// the attempt entitled to finalise.
+    #[test]
+    fn finalising_refuses_a_job_that_is_not_running() {
+        let db = Db::open_in_memory().unwrap();
+        let rec = Ulid::new();
+        let job = db.create_import(&new_import(rec)).unwrap();
+        assert!(!db.finalize_import_success(rec, job, &index_fields()).unwrap(), "queued");
+
+        db.claim_next_job(1).unwrap();
+        db.fail_job(job, "x", "decoder crashed", true).unwrap();
+        assert!(!db.finalize_import_success(rec, job, &index_fields()).unwrap(), "failed");
+        assert_eq!(import_row(&db, rec).0, "processing");
+    }
+
+    #[test]
+    fn finalising_refuses_a_captured_recording() {
+        let (db, rec) = db_with_recording();
+        let job = db.enqueue(rec, JobType::ImportMedia, 1).unwrap();
+        db.claim_next_job(1).unwrap();
+        assert!(!db.finalize_import_success(rec, job, &index_fields()).unwrap());
+    }
+
+    #[test]
+    fn a_terminal_import_failure_fails_the_job_and_the_recording_together() {
+        let db = Db::open_in_memory().unwrap();
+        let (rec, job) = running_import(&db);
+
+        assert_eq!(
+            db.fail_job(job, "job_failed", "This file has no audio track", false).unwrap(),
+            JobState::FailedTerminal
+        );
+
+        let failed = db.job(job).unwrap().unwrap();
+        assert_eq!(failed.state, JobState::FailedTerminal);
+        assert_eq!(failed.error_message.as_deref(), Some("This file has no audio track"));
+        assert_eq!(import_row(&db, rec).0, "failed");
+        assert_eq!(db.requeue_retryable().unwrap(), 0, "nothing comes back around");
+    }
+
+    /// Running out of attempts is decided in the same operation that fails the
+    /// recording, so no crash can fall between the job going terminal and the
+    /// row leaving "processing".
+    #[test]
+    fn an_import_that_runs_out_of_attempts_fails_its_recording_in_one_step() {
+        let db = Db::open_in_memory().unwrap();
+        let (rec, job) = running_import(&db);
+        db.conn
+            .execute(
+                "UPDATE jobs SET attempt = max_attempts WHERE id = ?1",
+                params![job.to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.fail_job(job, "job_failed", "ffmpeg crashed", true).unwrap(),
+            JobState::FailedTerminal
+        );
+        assert_eq!(db.job(job).unwrap().unwrap().state, JobState::FailedTerminal);
+        assert_eq!(import_row(&db, rec).0, "failed");
+    }
+
+    #[test]
+    fn an_import_with_attempts_left_stays_processing_after_a_failure() {
+        let db = Db::open_in_memory().unwrap();
+        let (rec, job) = running_import(&db);
+
+        assert_eq!(
+            db.fail_job(job, "job_failed", "ffmpeg crashed", true).unwrap(),
+            JobState::FailedRetryable
+        );
+        assert_eq!(import_row(&db, rec).0, "processing");
+    }
+
+    #[test]
+    fn a_terminal_failure_cannot_undo_a_finished_import() {
+        let db = Db::open_in_memory().unwrap();
+        let (rec, job) = running_import(&db);
+        assert!(db.finalize_import_success(rec, job, &index_fields()).unwrap());
+
+        assert!(db.fail_job(job, "job_failed", "late", false).is_err());
+        assert_eq!(import_row(&db, rec).0, "ready");
+        assert_eq!(db.job(job).unwrap().unwrap().state, JobState::Succeeded);
+    }
+
+    #[test]
+    fn retrying_a_failed_import_puts_it_back_in_the_queue() {
+        let db = Db::open_in_memory().unwrap();
+        let (rec, job) = running_import(&db);
+        db.fail_job(job, "job_failed", "not enough disk space", false).unwrap();
+
+        let again = db.reset_import_for_retry(rec).unwrap().expect("a failed import retries");
+        assert_ne!(again, job);
+        assert_eq!(import_row(&db, rec).0, "processing");
+        assert_eq!(job_types_queued(&db, rec), vec!["import_media"]);
+        assert!(db.job(job).unwrap().is_none(), "the failed attempt is cleared");
+    }
+
+    /// Only a failed import is retried. Resetting one that is still running
+    /// would queue a second decode of the same file alongside it.
+    #[test]
+    fn only_a_failed_import_is_reset() {
+        let db = Db::open_in_memory().unwrap();
+        let (rec, job) = running_import(&db);
+        assert!(db.reset_import_for_retry(rec).unwrap().is_none(), "running");
+
+        assert!(db.finalize_import_success(rec, job, &index_fields()).unwrap());
+        assert!(db.reset_import_for_retry(rec).unwrap().is_none(), "ready");
+
+        let (captured_db, captured) = db_with_recording();
+        captured_db
+            .conn
+            .execute(
+                "UPDATE recordings SET status = 'failed' WHERE id = ?1",
+                params![captured.to_string()],
+            )
+            .unwrap();
+        assert!(
+            captured_db.reset_import_for_retry(captured).unwrap().is_none(),
+            "a captured recording is never an import"
+        );
+    }
+
+    /// A daemon that keeps dying while decoding a file eventually gives up on
+    /// it, and the recording must say so rather than read "processing" for
+    /// ever.
+    #[test]
+    fn an_import_that_keeps_killing_the_daemon_fails_its_recording() {
+        let db = Db::open_in_memory().unwrap();
+        let rec = Ulid::new();
+        let job = db.create_import(&new_import(rec)).unwrap();
+
+        for _ in 0..Job::DEFAULT_MAX_ATTEMPTS {
+            db.claim_next_job(1).unwrap();
+            db.recover_orphaned_jobs().unwrap();
+        }
+
+        assert_eq!(db.job(job).unwrap().unwrap().state, JobState::FailedTerminal);
+        assert_eq!(import_row(&db, rec).0, "failed");
+    }
+
+    #[test]
+    fn a_recovered_import_with_attempts_left_stays_processing() {
+        let db = Db::open_in_memory().unwrap();
+        let rec = Ulid::new();
+        let job = db.create_import(&new_import(rec)).unwrap();
+        db.claim_next_job(1).unwrap();
+        db.recover_orphaned_jobs().unwrap();
+
+        assert_eq!(db.job(job).unwrap().unwrap().state, JobState::Queued);
+        assert_eq!(import_row(&db, rec).0, "processing");
+    }
+
+    /// Builds a database exactly as version 7 left it, with captured
+    /// recordings and jobs in it, the way a real installation would be when
+    /// this version first opens it.
+    fn version_7_database(path: &std::path::Path) -> (Ulid, Vec<(String, i64, String)>) {
+        let conn = Connection::open(path).unwrap();
+        Db::configure(&conn).unwrap();
+        for sql in [
+            include_str!("migrations/001_initial.sql"),
+            include_str!("migrations/002_library.sql"),
+            include_str!("migrations/003_exports.sql"),
+            include_str!("migrations/004_backoff.sql"),
+            include_str!("migrations/005_progress.sql"),
+            include_str!("migrations/006_derived_backup.sql"),
+            include_str!("migrations/007_publish_webhook.sql"),
+        ] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 7i64).unwrap();
+
+        let rec = Ulid::new();
+        conn.execute(
+            "INSERT INTO recordings (id, owner_id, status, title, started_at, manifest_version,
+                                     clock_started_ns, duration_ms, has_mixed, tracks_json)
+             VALUES (?1, 1, 'ready', 'Standup', 1760000000, 'recording-manifest/v1',
+                     5000, 60000, 1, '[]')",
+            params![rec.to_string()],
+        )
+        .unwrap();
+        let mut jobs = Vec::new();
+        for (seq, (job_type, state)) in [
+            ("transcribe", "succeeded"),
+            ("upload_remote", "failed_retryable"),
+            ("publish_webhook", "queued"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = Ulid::new().to_string();
+            conn.execute(
+                "INSERT INTO jobs (id, enqueue_seq, recording_id, job_type, revision, state,
+                                   attempt, max_attempts, next_attempt_at)
+                 VALUES (?1, ?2, ?3, ?4, 1, ?5, 1, 3, 1760000100)",
+                params![id, seq as i64 + 1, rec.to_string(), job_type, state],
+            )
+            .unwrap();
+            jobs.push((id, seq as i64 + 1, state.to_string()));
+        }
+        (rec, jobs)
+    }
+
+    #[test]
+    fn a_version_7_database_upgrades_and_keeps_its_recordings_and_jobs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("kaseta.db");
+        let (rec, jobs) = version_7_database(&path);
+
+        let db = Db::open(&path).expect("a version 7 database must upgrade");
+        let version: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 8);
+
+        // Existing recordings were all captured.
+        let (status, origin, original_local, _, _, source_json) = import_row(&db, rec);
+        assert_eq!((status.as_str(), origin.as_str()), ("ready", "captured"));
+        assert_eq!(original_local, 0);
+        assert_eq!(source_json, None);
+        let title: String = db
+            .conn
+            .query_row("SELECT title FROM recordings WHERE id = ?1", params![rec.to_string()], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, "Standup");
+
+        // Every job survived the rebuild with its order, state and backoff.
+        for (id, seq, state) in &jobs {
+            let (got_seq, got_state, next): (i64, String, Option<i64>) = db
+                .conn
+                .query_row(
+                    "SELECT enqueue_seq, state, next_attempt_at FROM jobs WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!((&got_seq, &got_state), (seq, state));
+            assert_eq!(next, Some(1760000100));
+        }
+
+        // The rebuilt table has every index the queue relies on.
+        let indexes: Vec<String> = {
+            let mut stmt = db
+                .conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'jobs'",
+                )
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.collect::<Result<_, _>>().unwrap()
+        };
+        for wanted in [
+            "idx_jobs_enqueue_seq",
+            "idx_jobs_state",
+            "idx_jobs_recording",
+            "idx_jobs_claimable",
+            "idx_jobs_by_recording_state",
+        ] {
+            assert!(indexes.iter().any(|i| i == wanted), "{wanted} missing: {indexes:?}");
+        }
+
+        // The new stage is storable, the old ones still are, and the CHECK
+        // still rejects what is not a stage.
+        let import = Ulid::new();
+        db.create_import(&new_import(import)).unwrap();
+        db.enqueue(rec, JobType::Summarize, 1).unwrap();
+        assert!(db
+            .conn
+            .execute(
+                "INSERT INTO jobs (id, enqueue_seq, recording_id, job_type, state)
+                 VALUES ('x', 999, ?1, 'make_coffee', 'queued')",
+                params![rec.to_string()],
+            )
+            .is_err());
+        // And the origin CHECK guards the new column.
+        assert!(db
+            .conn
+            .execute(
+                "UPDATE recordings SET origin = 'downloaded' WHERE id = ?1",
+                params![rec.to_string()],
+            )
+            .is_err());
+
+        // Claiming still walks the queue in order: the queued send from
+        // before the upgrade comes before anything added after it.
+        let first = db.claim_next_job(1).unwrap().unwrap();
+        assert_eq!(first.job_type, JobType::PublishWebhook);
     }
 
     #[test]

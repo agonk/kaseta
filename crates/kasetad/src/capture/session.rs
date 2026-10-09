@@ -20,14 +20,15 @@ use std::thread::JoinHandle;
 use anyhow::{Context, Result};
 use kaseta_contracts::manifest::{
     CanonicalClock, Chunk, ClockDomain, ClockKind, FormatEpoch, MediaType, RecordingHeader,
-    RecordingManifest, RecordingNotes, Timeline, Track, TrackFormat, TrackHeader, TrackRole,
-    TrackSource, MANIFEST_VERSION,
+    RecordingManifest, RecordingNotes, Track, TrackHeader, TrackRole, TrackSource,
+    MANIFEST_VERSION,
 };
-use kaseta_contracts::{BlobKey, RecordingPrefix, TrackId};
+use kaseta_contracts::{RecordingPrefix, TrackId};
 use ulid::Ulid;
 
 use super::chunk::{CapturedBuffer, ChunkConfig, ChunkWriter, SealedChunk};
 use super::devices::{capture_target, AudioDevice, DeviceKind};
+use super::persist::{self, ManifestParts};
 use super::stream::{CaptureEvent, CaptureStream};
 use crate::blobstore::BlobStore;
 use crate::clock::boottime_ns;
@@ -174,12 +175,7 @@ impl RecordingSession {
             master_track_id: master_track_id.clone(),
             notes: notes.clone(),
         };
-        store
-            .put_idempotent(
-                &prefix.header(),
-                &serde_json::to_vec(&header).context("serialising recording header")?,
-            )
-            .context("writing recording header")?;
+        persist::write_header(&*store, &prefix, &header)?;
 
         let (tx, rx) = mpsc::channel::<(usize, CaptureEvent)>();
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -306,41 +302,27 @@ impl RecordingSession {
                     source_clock: "pipewire".into(),
                     device_clock_id: Some(spec.device.node_name.clone()),
                 },
-                format: TrackFormat {
-                    container: "flac".into(),
-                    codec: "flac".into(),
+                // A track that never negotiated has no rate or channel count,
+                // and says so rather than claiming the defaults.
+                format: kaseta_contracts::manifest::TrackFormat {
                     sample_rate_hz: acc.sample_rate_hz,
                     channels: acc.channels,
-                    sample_format: Some("s16".into()),
+                    ..persist::flac_format(0, 0)
                 },
                 chunks: acc.chunks,
             });
         }
 
-        let master = self.master_track_id.clone();
-
-        let nominal_rate = tracks
-            .iter()
-            .find(|t| t.track_id == master)
-            .and_then(|t| t.format.sample_rate_hz)
-            .unwrap_or(48_000);
-
-        Ok(RecordingManifest {
-            manifest_version: MANIFEST_VERSION.into(),
+        Ok(persist::build_manifest(ManifestParts {
             recording_id: self.recording_id,
             started_at: self.started_at,
             ended_at: Some(ended_at),
-            canonical_clock: CanonicalClock {
-                kind: ClockKind::BoottimeNs,
-                started_at_ns: self.clock_started_ns,
-            },
-            timeline: Timeline {
-                master_track_id: master,
-                nominal_sample_rate_hz: nominal_rate,
-            },
+            clock_started_ns: self.clock_started_ns,
+            master_track_id: self.master_track_id.clone(),
             tracks,
             notes: self.notes.clone(),
-        })
+            source: None,
+        }))
     }
 }
 
@@ -442,13 +424,7 @@ fn spawn_collector(
                             ..ChunkConfig::default()
                         };
 
-                        let format = TrackFormat {
-                            container: "flac".into(),
-                            codec: "flac".into(),
-                            sample_rate_hz: Some(sample_rate_hz),
-                            channels: Some(channels),
-                            sample_format: Some("s16".into()),
-                        };
+                        let format = persist::flac_format(sample_rate_hz, channels);
 
                         match acc.writer.as_mut() {
                             // A renegotiation mid-recording, e.g. a Bluetooth
@@ -475,12 +451,7 @@ fn spawn_collector(
                                         device_clock_id: Some(spec.device.node_name.clone()),
                                     },
                                 };
-                                let encoded = serde_json::to_vec(&header)
-                                    .context("serialising track header")
-                                    .map_err(&publish)?;
-                                store
-                                    .put_idempotent(&prefix.track_header(&spec.track_id), &encoded)
-                                    .context("writing track header")
+                                persist::write_track_header(&*store, &prefix, &header)
                                     .map_err(&publish)?;
                                 acc.writer = Some(ChunkWriter::new(config));
                             }
@@ -495,15 +466,7 @@ fn spawn_collector(
                             .map(|w| w.next_seq())
                             .unwrap_or(0);
                         let epoch = FormatEpoch { from_seq, format };
-                        let encoded = serde_json::to_vec(&epoch)
-                            .context("serialising format epoch")
-                            .map_err(&publish)?;
-                        store
-                            .put_idempotent(
-                                &prefix.format_epoch(&spec.track_id, from_seq),
-                                &encoded,
-                            )
-                            .context("writing format epoch")
+                        persist::write_format_epoch(&*store, &prefix, &spec.track_id, &epoch)
                             .map_err(&publish)?;
                     }
                     CaptureEvent::Buffer {
@@ -588,16 +551,10 @@ fn spawn_collector(
         .expect("spawning collector thread")
 }
 
-/// Writes a sealed chunk to storage and records it in the manifest.
+/// Writes a sealed chunk and records it against its track.
 ///
-/// Two objects are written per chunk: the audio, then a sidecar holding its
-/// timing metadata. The manifest is only assembled when the session ends, so
-/// without the sidecar a crash would leave audio on disk whose timestamps,
-/// discontinuity flags and digests died with the in-memory accumulator —
-/// unusable for alignment or transcription.
-///
-/// Audio is written first. A sidecar therefore implies its audio is present,
-/// and recovery can treat any chunk lacking one as incomplete.
+/// The writing itself is shared with import (see [`persist::persist_chunk`]);
+/// what is particular to capture is the running tally the session reports.
 fn persist_chunk(
     store: &dyn BlobStore,
     prefix: &RecordingPrefix,
@@ -605,38 +562,13 @@ fn persist_chunk(
     chunk: SealedChunk,
     acc: &mut TrackAccumulator,
 ) -> Result<()> {
-    let key: BlobKey = prefix.chunk(track_id, chunk.seq, "flac");
-    store
-        .put_idempotent(&key, &chunk.encoded)
-        .with_context(|| format!("persisting chunk {} of {track_id}", chunk.seq))?;
+    let record = persist::persist_chunk(store, prefix, track_id, &chunk)?;
 
     acc.stats.chunks_sealed += 1;
-    acc.stats.bytes_written += chunk.encoded.len() as u64;
+    acc.stats.bytes_written += record.bytes;
     if chunk.discontinuity {
         acc.stats.discontinuities += 1;
     }
-
-    let record = Chunk {
-        seq: chunk.seq,
-        blob: key,
-        sha256: chunk.sha256,
-        bytes: chunk.encoded.len() as u64,
-        sample_count: Some(chunk.sample_count),
-        boottime_start_ns: chunk.boottime_start_ns,
-        boottime_end_ns: chunk.boottime_end_ns,
-        source_pts_start_ns: chunk.source_pts_start_ns,
-        source_pts_end_ns: chunk.source_pts_end_ns,
-        discontinuity: chunk.discontinuity,
-        gap_before_ns: chunk.gap_before_ns,
-        drops_before_chunk: chunk.drops_before_chunk,
-    };
-
-    let sidecar = prefix.chunk(track_id, record.seq, "json");
-    let encoded = serde_json::to_vec(&record).context("serialising chunk metadata")?;
-    store
-        .put_idempotent(&sidecar, &encoded)
-        .with_context(|| format!("persisting metadata for chunk {} of {track_id}", record.seq))?;
-
     acc.chunks.push(record);
     Ok(())
 }

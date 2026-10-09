@@ -13,17 +13,19 @@ pub mod blob;
 pub mod derived;
 pub mod jobs;
 pub mod manifest;
+pub mod speaker;
 pub mod worker;
 
-pub use blob::{BlobKey, BlobKeyError, RecordingPrefix, TrackId};
+pub use blob::{BlobKey, BlobKeyError, ImportStaging, RecordingPrefix, TrackId};
 pub use derived::{
     ActionItem, LibraryMetadata, SummaryBody, SummaryDocument, TranscriptDocument, TranscriptLine,
     DERIVED_VERSION,
 };
 pub use jobs::{IllegalTransition, Job, JobState, JobType};
 pub use manifest::{
-    CanonicalClock, Chunk, ClockKind, Drift, FormatEpoch, MediaType, RecordingHeader,
-    RecordingManifest, Track, TrackFormat, TrackHeader, TrackRole, TrackSource, MANIFEST_VERSION,
+    CanonicalClock, Chunk, ClockKind, Drift, FormatEpoch, ImportSource, MediaType, Origin,
+    RecordingHeader, RecordingManifest, Track, TrackFormat, TrackHeader, TrackRole, TrackSource,
+    IMPORTED_TRACK_ID, MANIFEST_VERSION,
 };
 pub use worker::{
     Segment, SpeakerHint, TranscribeParams, TranscribeSpec, WorkerResult, WorkerStatus,

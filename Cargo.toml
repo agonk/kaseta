@@ -26,3 +26,20 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# The audio codecs and hashes are built optimised even in debug and test
+# builds. They do all the per-sample work, and unoptimised they run slower
+# than real time, which makes the tests that push minutes of audio through the
+# exports take longer than the audio itself. Only these crates, so a first
+# debug build does not pay to optimise the whole HTTP and TLS stack as well.
+[profile.dev.package.flacenc]
+opt-level = 3
+
+[profile.dev.package.claxon]
+opt-level = 3
+
+[profile.dev.package.md-5]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3

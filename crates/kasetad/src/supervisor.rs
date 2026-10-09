@@ -466,6 +466,7 @@ pub fn role_label(role: TrackRole) -> &'static str {
         TrackRole::RemoteMix => "others",
         TrackRole::Application => "application",
         TrackRole::Visual => "video",
+        TrackRole::Unattributed => "speaker",
     }
 }
 
@@ -530,5 +531,6 @@ mod tests {
     fn roles_read_as_people_not_internals() {
         assert_eq!(role_label(TrackRole::LocalMic), "you");
         assert_eq!(role_label(TrackRole::RemoteMix), "others");
+        assert_eq!(role_label(TrackRole::Unattributed), "speaker");
     }
 }
