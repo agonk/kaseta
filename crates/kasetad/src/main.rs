@@ -11,6 +11,7 @@ mod config;
 mod db;
 mod derived;
 mod http;
+mod import;
 mod library;
 mod remote;
 mod retention;
@@ -552,6 +553,21 @@ fn cmd_serve(port: u16) -> Result<()> {
         Err(e) => tracing::error!(error = %format!("{e:#}"), "job recovery failed"),
     }
 
+    // Uploads nothing will come back for: finished imports whose cleanup was
+    // interrupted, and uploads abandoned before they became a recording.
+    // After the purge, so a deleted import's staging is already gone, and
+    // before the scheduler, so nothing is decoding while it looks.
+    match import::sweep::sweep(&*store, &db, time::OffsetDateTime::now_utc()) {
+        Ok(n) if n > 0 => tracing::info!(uploads = n, "removed leftover import uploads"),
+        Ok(_) => {}
+        Err(e) => tracing::error!(error = %format!("{e:#}"), "could not sweep import uploads"),
+    }
+
+    // Decided once: whether ffmpeg, ffprobe and the sandbox that contains
+    // them are all here. Without them imports are refused up front rather
+    // than failing after the upload.
+    let imports = Arc::new(import::ImportRuntime::detect());
+
     let db = Arc::new(Mutex::new(db));
     let supervisor = Arc::new(supervisor::Supervisor::spawn(
         Arc::clone(&store),
@@ -578,6 +594,7 @@ fn cmd_serve(port: u16) -> Result<()> {
         Arc::clone(&store),
         Arc::clone(&db),
         storage_root,
+        imports,
     )?;
 
     // A multi-thread runtime, so one slow request cannot stall the others.

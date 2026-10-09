@@ -134,6 +134,12 @@ pub struct ImportSource {
     pub container: String,
     /// Codec of the audio stream that was decoded.
     pub codec: String,
+    /// The media type the original is served with, e.g. `video/mp4`.
+    ///
+    /// Decided once, from what probing found inside the file, and stored so
+    /// that serving the original never has to guess again. The extension is
+    /// not consulted: it is whatever the file happened to be called.
+    pub content_type: String,
     /// Whether the original carried video. An audio-only file has nothing to
     /// show, so the interface plays the decoded audio instead.
     pub media_kind: MediaType,
@@ -682,6 +688,7 @@ mod tests {
                 original_sha256: "ab".repeat(32),
                 container: "mov".into(),
                 codec: "aac".into(),
+                content_type: "video/mp4".into(),
                 media_kind: MediaType::Video,
                 media_created_at: Some(datetime!(2026-10-01 17:30:00 UTC)),
                 imported_at: datetime!(2026-10-09 08:00:00 UTC),

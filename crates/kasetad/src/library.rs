@@ -129,6 +129,14 @@ pub fn reconcile(store: &dyn BlobStore, db: &Db) -> Result<usize> {
             continue;
         }
 
+        // An import whose decode has not succeeded may have left a manifest
+        // behind from an attempt that was then overtaken or failed. Only its
+        // own finalisation decides whether it is a recording, so the
+        // reconciler leaves it alone, derived artefacts included.
+        if unfinished_import(db, manifest.recording_id)? {
+            continue;
+        }
+
         seen.insert(manifest.recording_id.to_string());
         index_recording(store, db, &manifest)?;
         indexed += 1;
@@ -154,6 +162,24 @@ pub fn reconcile(store: &dyn BlobStore, db: &Db) -> Result<usize> {
     }
     tracing::info!(indexed, "library reconciled with storage");
     Ok(indexed)
+}
+
+/// Whether `id` is an import that has not been finalised: still decoding,
+/// failed, or with its latest decode not (yet) a success.
+fn unfinished_import(db: &Db, id: Ulid) -> Result<bool> {
+    Ok(db
+        .conn()
+        .query_row(
+            "SELECT r.status <> 'ready'
+                    OR COALESCE((SELECT state FROM jobs
+                                 WHERE recording_id = r.id AND job_type = 'import_media'
+                                 ORDER BY enqueue_seq DESC LIMIT 1), 'succeeded') <> 'succeeded'
+             FROM recordings r WHERE r.id = ?1 AND r.origin = 'imported'",
+            params![id.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(false))
 }
 
 /// Inserts or refreshes one recording, preserving anything the user set.
@@ -343,6 +369,10 @@ pub fn purge_pending(store: &dyn BlobStore, db: &Db) -> Result<usize> {
             if store.delete(&key).is_err() {
                 cleared = false;
             }
+        }
+        // An import's upload is outside the prefix, and goes with it.
+        if store.local_root().is_some() && crate::import::remove_staging(store, ulid).is_err() {
+            cleared = false;
         }
         if cleared {
             db.conn()
@@ -752,6 +782,12 @@ fn started_at(db: &Db, id: Ulid) -> Result<Option<time::OffsetDateTime>> {
 /// The tombstone is written first. Purging blobs is not atomic, so a crash
 /// partway through would otherwise let the startup reconciler resurrect a
 /// half-deleted recording from whatever survived.
+///
+/// An import being decoded right now is the exception: it is still writing
+/// under the prefix, so anything removed here could be written again a
+/// moment later. Its row is tombstoned and every other job of it cancelled;
+/// the decode notices at its own finalisation, removes what it wrote and then
+/// the row. A crash before that leaves the tombstone for the startup purge.
 pub fn delete(store: &dyn BlobStore, db: &Db, id: Ulid) -> Result<bool> {
     let started_at: Option<i64> = db
         .conn()
@@ -774,6 +810,22 @@ pub fn delete(store: &dyn BlobStore, db: &Db, id: Ulid) -> Result<bool> {
         params![id.to_string()],
     )?;
 
+    let decoding: bool = db.conn().query_row(
+        "SELECT EXISTS (SELECT 1 FROM jobs
+                        WHERE recording_id = ?1 AND job_type = 'import_media'
+                          AND state = 'running')",
+        params![id.to_string()],
+        |r| r.get(0),
+    )?;
+    if decoding {
+        db.conn().execute(
+            "UPDATE jobs SET state = 'canceled'
+             WHERE recording_id = ?1 AND state IN ('queued','failed_retryable')",
+            params![id.to_string()],
+        )?;
+        return Ok(true);
+    }
+
     let started_at = time::OffsetDateTime::from_unix_timestamp(started_at)
         .context("recording has an invalid start time")?;
     let prefix = prefix_for(id, started_at);
@@ -782,6 +834,13 @@ pub fn delete(store: &dyn BlobStore, db: &Db, id: Ulid) -> Result<bool> {
     for key in store.list_prefix(prefix.root().as_str())? {
         if let Err(e) = store.delete(&key) {
             tracing::warn!(%key, error = %format!("{e:#}"), "could not remove object");
+            purged_everything = false;
+        }
+    }
+    // An import's upload waits outside the prefix, and goes with it.
+    if store.local_root().is_some() {
+        if let Err(e) = crate::import::remove_staging(store, id) {
+            tracing::warn!(%id, error = %format!("{e:#}"), "could not remove the import's upload");
             purged_everything = false;
         }
     }
@@ -955,6 +1014,7 @@ mod tests {
             original_sha256: "ab".repeat(32),
             container: "mov".into(),
             codec: "aac".into(),
+            content_type: "video/mp4".into(),
             media_kind: MediaType::Video,
             media_created_at: None,
             imported_at: STARTED,
@@ -1086,6 +1146,126 @@ mod tests {
             assert_eq!(now, status);
             assert_eq!(source_json, None, "the row is left exactly as it was");
         }
+    }
+
+    /// A manifest left by an import that never finalised is not a recording.
+    /// The reconciler must not bring it into the library, nor read anything
+    /// derived back from beside it.
+    #[test]
+    fn reconciling_skips_an_unfinished_import() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::blobstore::LocalFsStore::new(dir.path()).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let id = Ulid::new();
+        db.create_import(&crate::db::NewImport {
+            recording_id: id,
+            started_at: STARTED,
+            title: "Lecture 3".into(),
+        })
+        .unwrap();
+        let m = manifest(id, Some(import_source(None)));
+        store
+            .put(&RecordingPrefix::new(id, STARTED).manifest(), &serde_json::to_vec(&m).unwrap())
+            .unwrap();
+
+        assert_eq!(reconcile(&store, &db).unwrap(), 0);
+        let status: String = db
+            .conn()
+            .query_row("SELECT status FROM recordings WHERE id = ?1", params![id.to_string()], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "processing");
+
+        // Finalised, it is reconciled like any other recording.
+        db.conn().execute("UPDATE recordings SET status = 'ready'", []).unwrap();
+        db.conn().execute("UPDATE jobs SET state = 'succeeded'", []).unwrap();
+        assert_eq!(reconcile(&store, &db).unwrap(), 1);
+
+        // And a rebuilt index, with no rows at all, restores it.
+        let fresh = Db::open_in_memory().unwrap();
+        assert_eq!(reconcile(&store, &fresh).unwrap(), 1);
+    }
+
+    fn staged(store: &crate::blobstore::LocalFsStore, id: Ulid) -> std::path::PathBuf {
+        let dir = crate::import::staging_dir(store, id).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("upload.mp4"), b"upload").unwrap();
+        dir
+    }
+
+    /// Deleting an import that is waiting, or failed, removes it outright,
+    /// upload included.
+    #[test]
+    fn deleting_an_import_that_is_not_decoding_removes_its_upload() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::blobstore::LocalFsStore::new(dir.path()).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let id = Ulid::new();
+        db.create_import(&crate::db::NewImport {
+            recording_id: id,
+            started_at: STARTED,
+            title: "Lecture 3".into(),
+        })
+        .unwrap();
+        let staging = staged(&store, id);
+
+        assert!(delete(&store, &db, id).unwrap());
+
+        assert!(!staging.exists());
+        let rows: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM recordings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+        let jobs: i64 = db.conn().query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0)).unwrap();
+        assert_eq!(jobs, 0, "the queued decode went with the recording");
+    }
+
+    /// While the decode runs it is still writing, so the deletion is left to
+    /// it: the row stays tombstoned and nothing else of it may start.
+    #[test]
+    fn deleting_an_import_mid_decode_leaves_the_tombstone_to_the_decode() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::blobstore::LocalFsStore::new(dir.path()).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let id = Ulid::new();
+        db.create_import(&crate::db::NewImport {
+            recording_id: id,
+            started_at: STARTED,
+            title: "Lecture 3".into(),
+        })
+        .unwrap();
+        db.claim_next_job(1).unwrap().unwrap();
+        db.enqueue(id, kaseta_contracts::JobType::Transcribe, 1).unwrap();
+        let staging = staged(&store, id);
+
+        assert!(delete(&store, &db, id).unwrap());
+
+        let (deleted, pending): (bool, i64) = db
+            .conn()
+            .query_row(
+                "SELECT deleted_at IS NOT NULL, purge_pending FROM recordings WHERE id = ?1",
+                params![id.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(deleted);
+        assert_eq!(pending, 1);
+        assert!(staging.exists(), "the decode is still reading it");
+        let states: Vec<String> = db
+            .conn()
+            .prepare("SELECT state FROM jobs ORDER BY enqueue_seq")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(states, ["running", "canceled"]);
+        assert!(!delete(&store, &db, id).unwrap(), "already deleted");
+
+        // A crash before the decode finished: the startup purge completes it.
+        db.conn().execute("UPDATE jobs SET state = 'queued'", []).unwrap();
+        assert_eq!(purge_pending(&store, &db).unwrap(), 1);
+        assert!(!staging.exists());
     }
 
     /// A captured recording indexed again is refreshed as before.

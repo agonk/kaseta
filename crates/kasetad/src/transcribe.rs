@@ -30,12 +30,30 @@ use ulid::Ulid;
 use crate::blobstore::BlobStore;
 use crate::db::Db;
 
-/// How long a worker may run before it is killed.
+/// The least time a worker is given before it is killed.
 ///
 /// Transcription is far faster than real time on the intended model, so
-/// exceeding this means the worker is stuck rather than slow. Without a bound, a
-/// hung child would occupy the pipeline indefinitely.
+/// exceeding the budget means the worker is stuck rather than slow. Without a
+/// bound, a hung child would occupy the pipeline indefinitely.
 const WORKER_TIMEOUT: Duration = Duration::from_secs(3 * 3600);
+
+/// How long a worker may run on `manifest`: three hours, or one and a half
+/// times the recording, whichever is longer.
+///
+/// A flat budget was enough while recordings were meetings. An imported
+/// lecture can run for hours, and killing it at a fixed mark would fail it
+/// identically on every retry, each time after hours of work.
+fn worker_timeout(manifest: &RecordingManifest) -> Duration {
+    let longest_s = manifest
+        .tracks
+        .iter()
+        .filter_map(|t| {
+            let rate = t.format.sample_rate_hz.filter(|r| *r > 0)?;
+            Some(t.sample_count() as f64 / f64::from(rate))
+        })
+        .fold(0.0, f64::max);
+    WORKER_TIMEOUT.max(Duration::from_secs_f64(longest_s * 1.5))
+}
 
 /// A segment placed on the canonical timeline.
 #[derive(Debug, Clone)]
@@ -58,6 +76,38 @@ pub fn transcribe(
     storage_root: &str,
     manifest: &RecordingManifest,
 ) -> Result<Transcription> {
+    let spec = build_spec(store, storage_root, manifest)?;
+    if spec.tracks.is_empty() {
+        return Ok(Transcription {
+            segments: Vec::new(),
+            engine: None,
+            language: None,
+        });
+    }
+
+    let result = run_worker(&spec, worker_timeout(manifest))?;
+    let segments = place_on_timeline(manifest, &result)?;
+
+    Ok(Transcription {
+        segments,
+        engine: result.engine,
+        language: result.tracks.first().and_then(|t| t.language.clone()),
+    })
+}
+
+/// What the worker is asked to do for `manifest`: one entry per track with
+/// audio, each prepared as the mono WAV the recogniser reads and labelled
+/// with who its role says is speaking.
+///
+/// Separate from running the worker, so what a recording is turned into can
+/// be checked without a model installed. The parameters are the same for
+/// every recording, captured or imported; nothing about where the audio came
+/// from reaches the engine.
+pub fn build_spec(
+    store: &dyn BlobStore,
+    storage_root: &str,
+    manifest: &RecordingManifest,
+) -> Result<TranscribeSpec> {
     let prefix = kaseta_contracts::RecordingPrefix::new(manifest.recording_id, manifest.started_at);
 
     let mut tracks = Vec::new();
@@ -88,15 +138,7 @@ pub fn transcribe(
         });
     }
 
-    if tracks.is_empty() {
-        return Ok(Transcription {
-            segments: Vec::new(),
-            engine: None,
-            language: None,
-        });
-    }
-
-    let spec = TranscribeSpec::new(
+    Ok(TranscribeSpec::new(
         Ulid::new(),
         manifest.recording_id,
         1,
@@ -105,16 +147,7 @@ pub fn transcribe(
         },
         tracks,
         TranscribeParams::default(),
-    );
-
-    let result = run_worker(&spec)?;
-    let segments = place_on_timeline(manifest, &result)?;
-
-    Ok(Transcription {
-        segments,
-        engine: result.engine,
-        language: result.tracks.first().and_then(|t| t.language.clone()),
-    })
+    ))
 }
 
 /// A finished transcription, before it is stored.
@@ -162,6 +195,8 @@ fn hint_for(role: TrackRole) -> SpeakerHint {
     match role {
         TrackRole::LocalMic => SpeakerHint::Local,
         TrackRole::RemoteMix => SpeakerHint::Remote,
+        // An imported file is one track carrying every voice in it.
+        TrackRole::Unattributed => SpeakerHint::Unknown,
         _ => SpeakerHint::Unknown,
     }
 }
@@ -253,7 +288,7 @@ mod worker_path_tests {
 }
 
 /// Spawns the worker, feeds it the spec, and reads back its result.
-fn run_worker(spec: &TranscribeSpec) -> Result<WorkerResult> {
+fn run_worker(spec: &TranscribeSpec, budget: Duration) -> Result<WorkerResult> {
     let python = worker_python();
     let spec_json = serde_json::to_vec(spec).context("serialising the job spec")?;
 
@@ -279,7 +314,7 @@ fn run_worker(spec: &TranscribeSpec) -> Result<WorkerResult> {
         .write_all(&spec_json)
         .context("sending the job spec")?;
 
-    let output = wait_with_timeout(child, WORKER_TIMEOUT)?;
+    let output = wait_with_timeout(child, budget)?;
 
     let result: WorkerResult = serde_json::from_slice(&output).map_err(|e| {
         // A worker that printed something other than a result is a bug in the
@@ -607,6 +642,59 @@ mod tests {
         assert_eq!(hint_for(TrackRole::LocalMic), SpeakerHint::Local);
         assert_eq!(hint_for(TrackRole::RemoteMix), SpeakerHint::Remote);
         assert_eq!(hint_for(TrackRole::Visual), SpeakerHint::Unknown);
+    }
+
+    #[test]
+    fn an_imported_track_is_attributed_to_nobody() {
+        assert_eq!(hint_for(TrackRole::Unattributed), SpeakerHint::Unknown);
+    }
+
+    fn with_samples(mut t: Track, frames: u64) -> Track {
+        t.chunks[0].sample_count = Some(frames);
+        t
+    }
+
+    /// Three hours is plenty for a meeting. A six-hour lecture gets half as
+    /// long again as it lasts, or every attempt would be killed at the same
+    /// point.
+    #[test]
+    fn the_worker_budget_grows_with_the_recording() {
+        let hour = 48_000 * 3600;
+        let short = manifest(vec![with_samples(track("a_local-mic_01", TrackRole::LocalMic, 0), hour)]);
+        assert_eq!(worker_timeout(&short), WORKER_TIMEOUT);
+
+        let long = manifest(vec![
+            with_samples(track("a_local-mic_01", TrackRole::LocalMic, 0), hour),
+            with_samples(track("a_imported_01", TrackRole::Unattributed, 0), 6 * hour),
+        ]);
+        assert_eq!(worker_timeout(&long), Duration::from_secs(9 * 3600));
+
+        assert_eq!(worker_timeout(&manifest(vec![])), WORKER_TIMEOUT);
+    }
+
+    /// The spec is buildable, and checkable, without the worker: one entry
+    /// per track with audio, each pointing at the prepared WAV.
+    #[test]
+    fn the_spec_names_each_track_and_who_speaks_on_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::blobstore::LocalFsStore::new(dir.path()).unwrap();
+        let mut m = manifest(vec![track("a_imported_01", TrackRole::Unattributed, 0)]);
+        m.recording_id = Ulid::new();
+        let prefix = kaseta_contracts::RecordingPrefix::new(m.recording_id, m.started_at);
+
+        // Without the merged export there is nothing to prepare from.
+        assert!(build_spec(&store, "/data", &m).is_err());
+
+        // A prepared WAV already in place is used as it is.
+        store.put(&prefix.export("a_imported_01.flac").unwrap(), b"flac").unwrap();
+        store.put(&prefix.export("a_imported_01.asr.wav").unwrap(), b"wav").unwrap();
+        let spec = build_spec(&store, "/data", &m).unwrap();
+
+        assert_eq!(spec.recording_id, m.recording_id);
+        assert_eq!(spec.tracks.len(), 1);
+        assert_eq!(spec.tracks[0].speaker_hint, SpeakerHint::Unknown);
+        assert_eq!(spec.tracks[0].audio, prefix.export("a_imported_01.asr.wav").unwrap());
+        assert!(matches!(spec.storage, StorageRef::LocalFs { ref root } if root == "/data"));
     }
 
     #[test]

@@ -23,6 +23,7 @@ use ulid::Ulid;
 
 use crate::blobstore::BlobStore;
 use crate::db::Db;
+use crate::import::ImportRuntime;
 
 /// How long to wait before looking for work again when the queue is empty.
 ///
@@ -51,13 +52,18 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub fn spawn(store: Arc<dyn BlobStore>, db: Arc<Mutex<Db>>, storage_root: String) -> Result<Self> {
+    pub fn spawn(
+        store: Arc<dyn BlobStore>,
+        db: Arc<Mutex<Db>>,
+        storage_root: String,
+        imports: Arc<ImportRuntime>,
+    ) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
 
         let thread = std::thread::Builder::new()
             .name("kaseta-scheduler".into())
-            .spawn(move || run(store, db, storage_root, flag))
+            .spawn(move || run(store, db, storage_root, imports, flag))
             .context("spawning scheduler thread")?;
 
         Ok(Self {
@@ -97,6 +103,7 @@ fn run(
     store: Arc<dyn BlobStore>,
     db: Arc<Mutex<Db>>,
     storage_root: String,
+    imports: Arc<ImportRuntime>,
     stop: Arc<AtomicBool>,
 ) {
     let mut next_sweep = std::time::Instant::now() + RETENTION_INTERVAL;
@@ -134,8 +141,15 @@ fn run(
 
         match claim(&db) {
             Ok(Some(job)) => {
-                let outcome =
-                    execute(&*store, &db, &storage_root, job.id, job.job_type, job.recording_id);
+                let outcome = execute(
+                    &*store,
+                    &db,
+                    &storage_root,
+                    &imports,
+                    job.id,
+                    job.job_type,
+                    job.recording_id,
+                );
                 finish(&db, job.id, job.job_type, job.recording_id, outcome);
             }
             Ok(None) => std::thread::sleep(IDLE_POLL),
@@ -258,20 +272,23 @@ fn execute(
     store: &dyn BlobStore,
     db: &Arc<Mutex<Db>>,
     storage_root: &str,
+    imports: &ImportRuntime,
     job_id: Ulid,
     job_type: JobType,
     recording_id: Ulid,
 ) -> Result<StageOutcome> {
+    let settings = crate::config::Settings::load().unwrap_or_default();
+
     // Decoding is what produces the manifest, so it is dispatched before one
     // is read. It also skips the generic precondition check below: whether it
     // can run depends on its upload still being in storage, and a missing
     // upload is a failure to show on the recording rather than a quiet skip.
     if job_type == JobType::ImportMedia {
-        return import_media(store, db, job_id, recording_id);
+        let limits = crate::import::job::Limits::from_settings(&settings.imports);
+        return crate::import::job::run(store, db, imports, &limits, recording_id, job_id);
     }
 
     let manifest = load_manifest(store, db, recording_id)?;
-    let settings = crate::config::Settings::load().unwrap_or_default();
 
     // Asked once, for every stage, before any work starts. A stage that cannot
     // run says so rather than running and quietly achieving nothing.
@@ -503,19 +520,6 @@ fn execute(
     }
 }
 
-/// Decodes an uploaded file into a recording.
-///
-/// This build carries no decoder, so the stage ends permanently rather than
-/// spending its attempts on a failure no retry can change.
-fn import_media(
-    _store: &dyn BlobStore,
-    _db: &Arc<Mutex<Db>>,
-    _job_id: Ulid,
-    _recording_id: Ulid,
-) -> Result<StageOutcome> {
-    Err(Permanent("this build cannot decode imported files".into()).into())
-}
-
 /// Reads a recording's manifest, which every stage needs.
 fn load_manifest(
     store: &dyn BlobStore,
@@ -625,7 +629,6 @@ pub enum StageOutcome {
     /// same transaction as its result. Only decoding an import does this: its
     /// result and its success must not be separable by a crash, so there is
     /// nothing left for [`finish`] to record.
-    #[allow(dead_code)]
     Finalized,
 }
 
@@ -1428,18 +1431,68 @@ mod import_tests {
 
     /// The decode stage is what produces the manifest, so it must be reached
     /// without reading one: a manifest-first dispatch would fail every import
-    /// with "reading the manifest".
+    /// with "reading the manifest". With no upload staged, what it reaches is
+    /// the decode's own verdict, and that verdict is final.
     #[test]
     fn an_import_is_dispatched_before_any_manifest_is_read() {
         let (db, rec, job) = running_import();
         let dir = tempfile::TempDir::new().unwrap();
         let store = crate::blobstore::LocalFsStore::new(dir.path()).unwrap();
+        let imports = ImportRuntime::unavailable("no tools here");
 
-        let err = execute(&store, &db, "", job.id, JobType::ImportMedia, rec).unwrap_err();
-        assert!(
-            !format!("{err:#}").contains("manifest"),
-            "the import must not look for a manifest: {err:#}"
+        let err =
+            execute(&store, &db, "", &imports, job.id, JobType::ImportMedia, rec).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<Permanent>().map(|p| p.0.as_str()),
+            Some(crate::import::job::UPLOAD_GONE),
+            "{err:#}"
         );
+
+        finish(&db, job.id, job.job_type, rec, Err(err));
+        assert_eq!(status_of(&db, rec), "failed");
+    }
+
+    /// The whole way through the scheduler: a staged file is decoded, the
+    /// stage records its own success, and what follows is queued once.
+    #[test]
+    fn a_staged_file_goes_through_the_scheduler_to_ready() {
+        use crate::import::fixtures::{Fixture, Harness};
+        let Some(h) = Harness::new() else { return };
+        let Some(file) = h.fixture(Fixture::VideoFirstMp4) else { return };
+        let (rec, job) = h.stage(&file, false);
+
+        let outcome = execute(&h.store, &h.db, "", &h.runtime, job.id, job.job_type, rec);
+        assert!(matches!(outcome, Ok(StageOutcome::Finalized)), "{outcome:?}");
+        finish(&h.db, job.id, job.job_type, rec, outcome);
+
+        assert_eq!(status_of(&h.db, rec), "ready");
+        let mut queued = Vec::new();
+        while let Some(next) = claim(&h.db).unwrap() {
+            queued.push(next.job_type);
+            h.db
+                .lock()
+                .unwrap()
+                .transition_job(next.id, JobState::Succeeded)
+                .unwrap();
+        }
+        assert_eq!(queued, [JobType::Transcribe, JobType::UploadRemote]);
+    }
+
+    /// A file with no sound fails the recording with the reason, at once.
+    #[test]
+    fn a_file_without_sound_fails_its_recording_through_the_scheduler() {
+        use crate::import::fixtures::{Fixture, Harness};
+        let Some(h) = Harness::new() else { return };
+        let Some(file) = h.fixture(Fixture::NoAudioMp4) else { return };
+        let (rec, job) = h.stage(&file, false);
+
+        let outcome = execute(&h.store, &h.db, "", &h.runtime, job.id, job.job_type, rec);
+        finish(&h.db, job.id, job.job_type, rec, outcome);
+
+        assert_eq!(status_of(&h.db, rec), "failed");
+        let after = h.db.lock().unwrap().job(job.id).unwrap().unwrap();
+        assert_eq!(after.state, JobState::FailedTerminal);
+        assert_eq!(after.error_message.as_deref(), Some(crate::import::job::NO_AUDIO));
     }
 }
 

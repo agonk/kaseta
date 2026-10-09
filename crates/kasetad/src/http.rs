@@ -599,15 +599,31 @@ async fn run_stage(
         "summarize" => kaseta_contracts::JobType::Summarize,
         "backup" => kaseta_contracts::JobType::UploadRemote,
         "publish" => kaseta_contracts::JobType::PublishWebhook,
+        "import" => kaseta_contracts::JobType::ImportMedia,
         other => return Err(ApiError::bad_request(format!("unknown stage: {other}"))),
     };
 
+    let store = Arc::clone(&state.store);
     let queued = with_db(&state, move |db| {
         // A recording that no longer exists must not leave work queued against
         // it: the job would fail on every attempt with nothing to act on.
         let exists = library::get(db, id).map_err(ApiError::from_anyhow)?.is_some();
         if !exists {
             return Err(ApiError::not_found("no such recording"));
+        }
+
+        // Decoding again needs the upload, which lives in storage rather than
+        // in anything the database can vouch for, and only a failed import is
+        // waiting for another go: one still decoding already has its attempt.
+        if job_type == kaseta_contracts::JobType::ImportMedia {
+            if !crate::import::upload_present(&*store, id).map_err(ApiError::from_anyhow)? {
+                return Err(ApiError::bad_request(crate::import::job::UPLOAD_GONE));
+            }
+            return db
+                .reset_import_for_retry(id)
+                .map_err(ApiError::from_anyhow)?
+                .map(|_| true)
+                .ok_or_else(|| ApiError::bad_request("only an import that failed can be retried"));
         }
 
         // Pressing a button is a different question from the chain reaching a

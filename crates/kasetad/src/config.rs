@@ -33,6 +33,50 @@ pub struct Settings {
     pub transcription: TranscriptionSettings,
     #[serde(default)]
     pub webhook: WebhookSettings,
+    #[serde(default)]
+    pub imports: ImportSettings,
+}
+
+/// How much a single imported file may ask of this machine.
+///
+/// Both are budgets on a file nobody here produced: its size is checked before
+/// the upload is accepted, and its length before and while it is decoded. A
+/// limit that only applied after the fact would arrive with the disk already
+/// full.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImportSettings {
+    /// The largest upload accepted, in gigabytes (GiB).
+    pub max_upload_gb: u32,
+    /// The longest recording an import may decode to, in hours.
+    pub max_duration_hours: u32,
+}
+
+impl ImportSettings {
+    /// The largest upload that can be configured. Backups send an object in at
+    /// most 9,000 parts, and the part size grows with the object, so this is a
+    /// statement about what is sensible to import rather than what is
+    /// possible to store.
+    pub const MAX_UPLOAD_GB_CEILING: u32 = 64;
+    /// The longest import that can be configured. A day of audio is already
+    /// several gigabytes of chunks and hours of transcription.
+    pub const MAX_DURATION_HOURS_CEILING: u32 = 24;
+
+    /// The duration limit in hours, with an out-of-range setting brought
+    /// back inside the bounds rather than trusted.
+    pub fn max_duration_hours(&self) -> u32 {
+        self.max_duration_hours
+            .clamp(1, Self::MAX_DURATION_HOURS_CEILING)
+    }
+}
+
+impl Default for ImportSettings {
+    fn default() -> Self {
+        Self {
+            max_upload_gb: 8,
+            max_duration_hours: 6,
+        }
+    }
 }
 
 /// Where a finished recording is sent, if anywhere.
@@ -249,6 +293,8 @@ pub struct RedactedSettings {
     pub remote_storage: RedactedRemoteStorage,
     pub retention: RetentionSettings,
     pub webhook: RedactedWebhook,
+    /// Not secret, so passed through whole.
+    pub imports: ImportSettings,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -353,6 +399,7 @@ impl Settings {
                 token_hint: self.webhook.token.as_deref().and_then(hint),
                 configured: self.webhook.is_configured(),
             },
+            imports: self.imports.clone(),
         }
     }
 }
@@ -383,6 +430,8 @@ pub struct SettingsUpdate {
     pub webhook_url: Option<String>,
     pub webhook_token: Option<String>,
     pub webhook_send_when: Option<SendWhen>,
+    pub imports_max_upload_gb: Option<u32>,
+    pub imports_max_duration_hours: Option<u32>,
 }
 
 impl Settings {
@@ -450,6 +499,15 @@ impl Settings {
         }
         if let Some(v) = update.webhook_send_when {
             self.webhook.send_when = v;
+        }
+        // Stored inside the bounds, so the file never claims a limit the
+        // daemon would not actually apply.
+        if let Some(v) = update.imports_max_upload_gb {
+            self.imports.max_upload_gb = v.clamp(1, ImportSettings::MAX_UPLOAD_GB_CEILING);
+        }
+        if let Some(v) = update.imports_max_duration_hours {
+            self.imports.max_duration_hours =
+                v.clamp(1, ImportSettings::MAX_DURATION_HOURS_CEILING);
         }
     }
 }
@@ -589,6 +647,44 @@ mod tests {
             ..SettingsUpdate::default()
         });
         assert_eq!(settings.summaries.api_key.as_deref(), Some("sk-or-pasted"));
+    }
+
+    #[test]
+    fn import_limits_default_to_eight_gigabytes_and_six_hours() {
+        let settings = Settings::default();
+        assert_eq!(settings.imports.max_upload_gb, 8);
+        assert_eq!(settings.imports.max_duration_hours, 6);
+
+        // A settings file written before imports existed still loads, with
+        // the defaults filled in.
+        let old: Settings =
+            serde_json::from_str(r#"{"summaries":{"enabled":false}}"#).unwrap();
+        assert_eq!(old.imports, ImportSettings::default());
+    }
+
+    #[test]
+    fn import_limits_are_kept_inside_their_bounds() {
+        let mut settings = Settings::default();
+        settings.apply(SettingsUpdate {
+            imports_max_upload_gb: Some(500),
+            imports_max_duration_hours: Some(0),
+            ..SettingsUpdate::default()
+        });
+        assert_eq!(settings.imports.max_upload_gb, 64);
+        assert_eq!(settings.imports.max_duration_hours, 1);
+
+        // A hand-edited file is bounded when it is read, not trusted.
+        let edited: Settings = serde_json::from_str(
+            r#"{"imports":{"max_upload_gb":0,"max_duration_hours":1000}}"#,
+        )
+        .unwrap();
+        assert_eq!(edited.imports.max_duration_hours(), 24);
+    }
+
+    #[test]
+    fn import_limits_reach_the_interface() {
+        let json = serde_json::to_string(&Settings::default().redacted()).unwrap();
+        assert!(json.contains(r#""imports":{"max_upload_gb":8,"max_duration_hours":6}"#), "{json}");
     }
 
     #[test]

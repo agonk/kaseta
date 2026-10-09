@@ -6,6 +6,7 @@
 
 pub mod chunk;
 pub mod devices;
+pub mod persist;
 pub mod session;
 pub mod stream;
 

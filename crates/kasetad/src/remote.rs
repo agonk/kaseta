@@ -1693,6 +1693,7 @@ mod upload_tests {
             original_sha256: "ab".repeat(32),
             container: "mov".into(),
             codec: "aac".into(),
+            content_type: "video/mp4".into(),
             media_kind: kaseta_contracts::MediaType::Video,
             media_created_at: None,
             imported_at: time::macros::datetime!(2026-10-09 08:00:00 UTC),
