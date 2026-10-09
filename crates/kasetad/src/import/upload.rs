@@ -297,33 +297,45 @@ pub async fn receive(
     write_intent(&store, &intent).await?;
 
     let mut writer = AsyncStagingWriter::create(&path, length).await?;
+    let stalled = || {
+        UploadError::Request(format!(
+            "the upload stalled: nothing arrived for {} seconds",
+            idle.as_secs().max(1)
+        ))
+    };
+    // Moved on only by bytes. A frame with nothing in it, or one that is not
+    // data at all, is not progress, and a client sending only those must not
+    // hold the upload slot any longer than one sending nothing.
+    let mut deadline = tokio::time::Instant::now() + idle;
     loop {
-        let frame = match tokio::time::timeout(idle, std::future::poll_fn(|cx| {
+        let frame = match tokio::time::timeout_at(deadline, std::future::poll_fn(|cx| {
             std::pin::Pin::new(&mut body).poll_frame(cx)
         }))
         .await
         {
-            Err(_) => {
-                return Err(UploadError::Request(format!(
-                    "the upload stalled: nothing arrived for {} seconds",
-                    idle.as_secs().max(1)
-                )))
-            }
+            Err(_) => return Err(stalled()),
             Ok(None) => break,
             Ok(Some(Err(e))) => {
                 return Err(UploadError::Request(format!("the upload was interrupted: {e}")))
             }
             Ok(Some(Ok(frame))) => frame,
         };
-        let Ok(data) = frame.into_data() else {
+        let data = frame.into_data().unwrap_or_default();
+        if data.is_empty() {
+            // Checked here as well as by the timeout: a body that always has
+            // an empty frame ready would never let the timeout fire.
+            if tokio::time::Instant::now() >= deadline {
+                return Err(stalled());
+            }
             continue;
-        };
+        }
         if writer.written() + data.len() as u64 > length {
             return Err(UploadError::Request(format!(
                 "the upload is longer than the {length} bytes it declared"
             )));
         }
         writer.write(&data).await?;
+        deadline = tokio::time::Instant::now() + idle;
     }
     if writer.written() != length {
         return Err(UploadError::Request(format!(
@@ -788,6 +800,53 @@ mod tests {
         );
         assert!(err.contains("stalled"), "{err}");
         assert!(place.staged().is_empty());
+    }
+
+    /// A body that sends empty data frames every few milliseconds, for ever:
+    /// always arriving, never delivering.
+    struct EmptyFrames {
+        next: std::pin::Pin<Box<tokio::time::Sleep>>,
+    }
+
+    impl HttpBody for EmptyFrames {
+        type Data = axum::body::Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>>
+        {
+            use std::future::Future as _;
+            std::task::ready!(self.next.as_mut().poll(cx));
+            let again = tokio::time::Instant::now() + Duration::from_millis(5);
+            self.next.as_mut().reset(again);
+            std::task::Poll::Ready(Some(Ok(http_body::Frame::data(axum::body::Bytes::new()))))
+        }
+    }
+
+    /// Empty frames are not progress. A client sending nothing but those
+    /// would otherwise hold the one upload slot for as long as it liked.
+    #[tokio::test]
+    async fn empty_frames_do_not_keep_an_upload_alive() {
+        let place = place();
+        let gate = Arc::new(UploadGate::default());
+        let permit = gate.try_enter().expect("the slot is free");
+        let body = Body::new(EmptyFrames {
+            next: Box::pin(tokio::time::sleep(Duration::ZERO)),
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            let _permit = permit;
+            place.receive(10, body, Duration::from_millis(100)).await
+        })
+        .await
+        .expect("an upload of empty frames must be given up on");
+
+        let err = request_error(result);
+        assert!(err.contains("stalled"), "{err}");
+        assert!(gate.try_enter().is_some(), "the slot is released");
+        assert!(place.staged().is_empty(), "left {:?}", place.staged());
     }
 
     /// A client that disconnects can take the handler with it mid-await. The
