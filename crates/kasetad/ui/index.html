@@ -1686,7 +1686,9 @@ function startImport() {
   };
 
   xhr.upload.onprogress = (e) => showProgress(e.loaded, e.lengthComputable ? e.total : file.size);
+  let delivered = false;
   xhr.upload.onload = () => {
+    delivered = true;
     $("import-progress-text").textContent = "Uploaded · handing it to the recorder";
   };
   xhr.onload = async () => {
@@ -1705,8 +1707,18 @@ function startImport() {
     if (items.some((i) => i.id === body.recording_id)) select(body.recording_id);
   };
   // The daemon discards a partial upload, so there is nothing to clean up.
-  xhr.onerror = () => ended("The upload was interrupted, and nothing was kept. Try again.");
-  xhr.onabort = () => ended(null);
+  // A complete one is different: once the last byte has gone the recorder
+  // may already have taken the file, and it keeps it as an import rather than
+  // lose it, so the list is asked again to show it.
+  xhr.onerror = () => {
+    if (!delivered) return ended("The upload was interrupted, and nothing was kept. Try again.");
+    ended("The connection ended after the file was sent. If the recorder kept it, it is in the list.");
+    setTimeout(refreshList, 400);
+  };
+  xhr.onabort = () => {
+    ended(null);
+    if (delivered) setTimeout(refreshList, 400);
+  };
 
   upload = xhr;
   setUploading(true);

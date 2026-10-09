@@ -19,7 +19,10 @@
 //!    complete.
 //!
 //! Any failure, a disconnect included, removes the staging directory: the
-//! writer takes its `.part` with it, and a guard takes the rest.
+//! writer takes its `.part` with it, and a guard takes the rest. Steps 3 and
+//! 4 are the exception to "a disconnect included": once the file has fully
+//! arrived they run in a task of their own that a disconnect cannot stop, so
+//! a client that goes away then still leaves a valid import.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -274,7 +277,7 @@ pub async fn receive(
     // From here on, anything that goes wrong takes the staging directory
     // with it. Declared before the writer, so the writer (and its `.part`)
     // goes first.
-    let mut cleanup = StagingCleanup {
+    let cleanup = StagingCleanup {
         store: Arc::clone(&store),
         id,
         armed: true,
@@ -333,35 +336,52 @@ pub async fn receive(
     intent.state = IntentState::Uploaded;
     intent.bytes = Some(put.bytes);
     intent.sha256 = Some(put.sha256);
-    write_intent(&store, &intent).await?;
 
-    let new = NewImport {
-        recording_id: id,
-        started_at: intent.started_at(),
-        title: intent.title.clone(),
-    };
+    // The hand-off runs on its own and owns the staging directory from here.
+    // A client that disconnects drops this handler at its next await, and
+    // were the guard still here, the drop would delete the upload while the
+    // recording that is to decode it was being committed. A blocking task
+    // cannot be cancelled once it has started, so it ends one of two ways:
+    // the recording is committed and the guard disarmed, or something failed
+    // before the commit and the guard, dropped with the task, removes the
+    // upload. If the task never starts, the guard is dropped unstarted and
+    // the upload goes the same way.
     tokio::task::spawn_blocking(move || -> Result<()> {
+        // Taken whole: a closure that only touched `armed` would capture
+        // just that bool, and the guard would stay behind with the handler.
+        let mut cleanup = cleanup;
+        put_intent(&*store, &intent)?;
+        let new = NewImport {
+            recording_id: id,
+            started_at: intent.started_at(),
+            title: intent.title.clone(),
+        };
         let db = db.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
-        db.create_import(&new)?;
+        db.create_import(&new).context("creating the recording")?;
+        cleanup.armed = false;
         Ok(())
     })
     .await
-    .context("creating the recording")??;
+    .context("handing the upload over")??;
 
-    cleanup.armed = false;
     tracing::info!(recording_id = %id, bytes = length, "received a file to import");
     Ok(id)
 }
 
 /// Writes the intent atomically, off the async runtime.
 async fn write_intent(store: &Arc<dyn BlobStore>, intent: &Intent) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(intent).context("serialising the import intent")?;
-    let key = ImportStaging::new(intent.recording_id).intent();
     let store = Arc::clone(store);
-    tokio::task::spawn_blocking(move || store.put(&key, &bytes))
+    let intent = intent.clone();
+    tokio::task::spawn_blocking(move || put_intent(&*store, &intent))
         .await
         .context("writing the import intent")?
-        .context("writing the import intent")
+}
+
+/// Writes the intent atomically.
+fn put_intent(store: &dyn BlobStore, intent: &Intent) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(intent).context("serialising the import intent")?;
+    let key = ImportStaging::new(intent.recording_id).intent();
+    store.put(&key, &bytes).context("writing the import intent")
 }
 
 /// Removes an upload's staging directory unless the upload became an import.
@@ -623,6 +643,36 @@ mod tests {
             found
         }
 
+        /// The upload whose intent reads `uploaded`, once one does.
+        fn uploaded(&self) -> Option<Ulid> {
+            let root = self.store.local_root().unwrap().join("imports");
+            std::fs::read_dir(root).ok()?.flatten().find_map(|entry| {
+                let id = Ulid::from_string(&entry.file_name().to_string_lossy()).ok()?;
+                let intent = Intent::read(&*self.store, id).ok()??;
+                (intent.state == IntentState::Uploaded).then_some(id)
+            })
+        }
+
+        /// Holds the database from another thread until `release` is sent,
+        /// then runs `before_release` on it, so an upload can be caught inside
+        /// its hand-off.
+        fn hold_db(
+            &self,
+            before_release: impl FnOnce(&Db) + Send + 'static,
+        ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let db = Arc::clone(&self.db);
+            let holder = std::thread::spawn(move || {
+                let db = db.lock().unwrap();
+                locked_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+                before_release(&db);
+            });
+            locked_rx.recv().unwrap();
+            (release_tx, holder)
+        }
+
         fn recordings(&self) -> i64 {
             self.db
                 .lock()
@@ -764,6 +814,97 @@ mod tests {
 
         receiving.abort();
         let _ = receiving.await;
+        assert!(place.staged().is_empty(), "left {:?}", place.staged());
+        assert_eq!(place.recordings(), 0);
+    }
+
+    /// Starts an upload of six bytes in its own task and waits until it has
+    /// reached the hand-off, which `hold_db` keeps it inside.
+    async fn upload_into_the_handoff(
+        place: &Arc<Place>,
+    ) -> (tokio::task::JoinHandle<std::result::Result<Ulid, UploadError>>, Ulid) {
+        let receiving = {
+            let place = Arc::clone(place);
+            tokio::spawn(async move {
+                place
+                    .receive(6, body(vec![Ok(b"abcdef".to_vec())], false), BODY_IDLE_TIMEOUT)
+                    .await
+            })
+        };
+        for _ in 0..500 {
+            if let Some(id) = place.uploaded() {
+                return (receiving, id);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the upload never reached its hand-off");
+    }
+
+    /// A client that goes away once its file has fully arrived must not take
+    /// the file with it: the recording the hand-off creates still has the
+    /// upload it is to decode.
+    #[tokio::test]
+    async fn a_disconnect_during_the_handoff_still_leaves_a_valid_import() {
+        let place = Arc::new(place());
+        let (release, holder) = place.hold_db(|_| {});
+        let (receiving, id) = upload_into_the_handoff(&place).await;
+
+        receiving.abort();
+        let _ = receiving.await;
+        release.send(()).unwrap();
+        holder.join().unwrap();
+
+        let mut queued = None;
+        for _ in 0..500 {
+            queued = place.db.lock().unwrap().claim_next_job(1).unwrap();
+            if queued.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let job = queued.expect("the hand-off should have created the import");
+        assert_eq!((job.recording_id, job.job_type), (id, kaseta_contracts::JobType::ImportMedia));
+        assert!(
+            super::super::upload_present(&*place.store, id).unwrap(),
+            "the import's upload was deleted under it"
+        );
+    }
+
+    /// A hand-off that fails before it commits removes the upload, whether or
+    /// not anyone is still waiting for the answer.
+    #[tokio::test]
+    async fn a_handoff_that_fails_before_committing_leaves_nothing() {
+        let place = Arc::new(place());
+        let (release, holder) = place.hold_db(|db| {
+            db.conn().execute_batch("DROP TABLE jobs").unwrap();
+        });
+        let (receiving, _) = upload_into_the_handoff(&place).await;
+
+        receiving.abort();
+        let _ = receiving.await;
+        release.send(()).unwrap();
+        holder.join().unwrap();
+
+        for _ in 0..500 {
+            if place.staged().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(place.staged().is_empty(), "left {:?}", place.staged());
+        assert_eq!(place.recordings(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_handoff_that_fails_reports_it_and_leaves_nothing() {
+        let place = place();
+        place.db.lock().unwrap().conn().execute_batch("DROP TABLE jobs").unwrap();
+
+        let result = place
+            .receive(6, body(vec![Ok(b"abcdef".to_vec())], false), BODY_IDLE_TIMEOUT)
+            .await;
+
+        assert!(matches!(result, Err(UploadError::Internal(_))), "{result:?}");
         assert!(place.staged().is_empty(), "left {:?}", place.staged());
         assert_eq!(place.recordings(), 0);
     }
