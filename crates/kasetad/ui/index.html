@@ -121,6 +121,9 @@
     text-transform: uppercase; color: var(--on-surface-variant);
   }
   .pips { display: flex; align-items: center; gap: 6px; }
+  /* `display: flex` would otherwise outrank the attribute and show the
+     capture indicators while nothing is being captured. */
+  .pips[hidden] { display: none; }
   .pip { width: 7px; height: 7px; border-radius: var(--r-full); background: var(--outline-variant); }
   .pip.on { background: var(--ok); }
   .pip.warn { background: var(--warning); }
@@ -128,6 +131,11 @@
   .rail .meta { margin-left: auto; display: flex; gap: 18px; text-align: right; }
   .meta-item { font: 500 12px/16px var(--mono); color: var(--on-surface-variant); }
   .meta-item b { display: block; color: var(--on-surface); font-weight: 700; }
+
+  .import-btn { display: inline-flex; align-items: center; gap: 6px; margin-left: 4px; }
+  .import-btn svg { opacity: .8; }
+  /* Unavailable but still pressable: pressing it is how the reason is found. */
+  .import-btn[aria-disabled="true"] { opacity: .5; }
 
   .pulse { animation: pulse 1.6s ease-in-out infinite; }
   @keyframes pulse { 50% { opacity: .35; } }
@@ -155,7 +163,8 @@
   .item:hover { background: var(--surface-container); }
   .item[aria-current="true"] { background: var(--surface-container); border-left-color: var(--primary-container); }
   .item .name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .item .sub { display: flex; gap: 10px; margin-top: 1px; font: 500 12px/16px var(--mono); color: var(--on-surface-variant); }
+  .item .sub { display: flex; gap: 10px; margin-top: 1px; font: 500 12px/16px var(--mono); color: var(--on-surface-variant);
+               overflow: hidden; white-space: nowrap; }
 
   .detail { display: flex; flex-direction: column; min-height: 0; min-width: 0; overflow-y: auto; }
   .placeholder { margin: auto; text-align: center; color: var(--on-surface-variant); max-width: 340px; padding: 40px 20px; }
@@ -191,6 +200,13 @@
     display: grid; place-items: center;
   }
   .time { font: 500 12px/16px var(--mono); color: var(--on-surface-variant); }
+
+  /* A kept original that is a video plays here, in place of the audio. */
+  .screen { margin-top: 12px; background: #000; border-radius: var(--r); overflow: hidden;
+            border: 1px solid var(--outline-variant); }
+  .screen video { display: block; width: 100%; max-height: 360px; cursor: pointer; }
+  .screen.off { display: none; }
+  .provenance { margin-top: 2px; }
 
   .split { display: grid; grid-template-columns: 1fr 336px; flex: 1; min-height: 0; }
   .transcript-pane { padding: 14px var(--gutter); border-right: 1px solid var(--outline-variant); min-width: 0; }
@@ -307,6 +323,34 @@
         border: 1px solid var(--outline-variant); background: var(--surface-lowest); }
   .divider { height: 1px; background: var(--outline-variant); margin: 18px 0; }
 
+  /* ---- import ---------------------------------------------------------- */
+
+  .import-file { display: flex; align-items: center; gap: 12px; margin-bottom: 16px;
+                 padding: 10px 12px; border-radius: var(--r); background: var(--surface-container); }
+  .import-file svg { flex: 0 0 auto; opacity: .7; }
+  .import-file .name { display: block; font-weight: 600; word-break: break-all; }
+  .progress { height: 6px; border-radius: var(--r-full); background: var(--surface-highest);
+              overflow: hidden; margin-top: 14px; }
+  .progress i { display: block; height: 100%; width: 0; background: var(--primary-container);
+                transition: width .2s; }
+  .import-error { margin-top: 10px; font: 500 12px/16px var(--mono); color: var(--error);
+                  word-break: break-word; }
+  .import-error:empty { display: none; }
+  .sheet-foot .btn:disabled { opacity: .5; cursor: not-allowed; }
+  pre.command { margin: 8px 0 0; padding: 8px 10px; border-radius: var(--r); white-space: pre-wrap;
+                word-break: break-all; background: var(--surface-lowest);
+                border: 1px solid var(--outline-variant); font: 500 12px/18px var(--mono); }
+
+  /* Covers the window while a file is dragged over it, so the whole window
+     reads as the place to drop. Never takes the pointer: the drag events
+     belong to the page underneath. */
+  .drop { position: fixed; inset: 0; z-index: 10; display: grid; place-items: center;
+          pointer-events: none; background: color-mix(in srgb, var(--surface) 82%, transparent); }
+  .drop[hidden] { display: none; }
+  .drop div { padding: 28px 40px; max-width: 460px; text-align: center; border-radius: var(--r-lg);
+              border: 2px dashed var(--primary-container); background: var(--surface-low); }
+  .drop strong { display: block; font: 600 18px/24px var(--sans); margin-bottom: 4px; }
+
   .statusbar {
     flex: 0 0 auto; display: flex; align-items: center; gap: 12px;
     padding: 5px var(--gutter); border-top: 1px solid var(--outline-variant);
@@ -354,6 +398,14 @@
     <div class="timer" id="timer">00:00:00</div>
     <div class="rail-label" id="rail-label">Idle — ready to capture</div>
   </div>
+  <button class="btn import-btn" id="import" type="button">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+      <path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 17v3h16v-3"/>
+    </svg>
+    <span id="import-label">Import</span>
+  </button>
+  <input type="file" id="import-file" hidden
+         accept="audio/*,video/*,.mp4,.m4v,.mov,.m4a,.3gp,.mkv,.webm,.mp3,.wav,.w64,.flac,.ogg,.oga,.opus,.aac,.wma,.asf,.avi,.ts,.mts,.mpg,.mpeg,.caf,.aif,.aiff,.amr,.ac3,.eac3,.au">
   <div class="pips" id="pips" hidden>
     <span class="pip" id="pip-you"></span><span class="rail-label">You</span>
     <span class="pip" id="pip-them" style="margin-left:8px"></span><span class="rail-label">Them</span>
@@ -376,8 +428,15 @@
       <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
         <rect x="2" y="5" width="20" height="14" rx="2"/><circle cx="8.5" cy="12" r="2.5"/><circle cx="15.5" cy="12" r="2.5"/>
       </svg>
-      <p>Select a recording, or press record to capture one.</p>
+      <p>Select a recording, press record to capture one, or drop a file here to import it.</p>
     </div>
+  </div>
+</div>
+
+<div class="drop" id="drop" hidden>
+  <div>
+    <strong id="drop-title">Drop to import</strong>
+    <span class="hint" id="drop-hint">One audio or video file becomes a recording.</span>
   </div>
 </div>
 
@@ -427,7 +486,7 @@
       <div class="sec-head" style="margin:0">Cloud backup</div>
       <label class="switch"><input type="checkbox" id="r2-enabled" aria-label="Enable cloud backup"><span></span></label>
     </div>
-    <p class="hint" style="margin:6px 0 12px">Copies recordings to S3-compatible storage such as Cloudflare R2.</p>
+    <p class="hint" style="margin:6px 0 12px">Copies recordings, and any imported originals you chose to keep, to S3-compatible storage such as Cloudflare R2.</p>
     <div class="field">
       <label for="r2-endpoint">Endpoint <span class="hint" style="display:inline">— blank for Amazon S3</span></label>
       <input type="text" id="r2-endpoint" placeholder="https://ACCOUNT.r2.cloudflarestorage.com">
@@ -512,7 +571,8 @@
       <strong>Privacy.</strong> Recordings and transcripts are produced and kept on this machine.
       Transcription runs locally. Transcript text leaves it in two cases, each with its own switch
       above and both off until you turn them on: to your chosen summary provider, and to the
-      webhook you configured.
+      webhook you configured. Cloud backup, when on, copies recordings to your own bucket,
+      including the original of an imported file you chose to keep.
     </div>
 
     <div class="divider"></div>
@@ -535,6 +595,65 @@
   </div>
 </dialog>
 
+<dialog id="import-dialog" aria-labelledby="import-heading">
+  <div class="sheet-head">
+    <h2 id="import-heading">Import a file</h2>
+    <button class="icon-btn" id="import-close" aria-label="Close">✕</button>
+  </div>
+  <div class="sheet-body">
+    <!-- Shown when importing cannot work on this machine, with what fixes it. -->
+    <div id="import-unavailable" hidden>
+      <p style="margin-top:0">Importing is unavailable on this machine.</p>
+      <pre class="command" id="import-reason"></pre>
+      <p class="hint">After installing, restart the recorder:</p>
+      <pre class="command">systemctl --user restart kaseta.service</pre>
+    </div>
+
+    <div id="import-form">
+      <div class="import-file">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+          <path d="M14 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8z"/><path d="M14 3v5h5"/>
+          <path d="M10 12.5v5l4-2.5z"/>
+        </svg>
+        <div>
+          <span class="name" id="import-name"></span>
+          <span class="hint" id="import-size"></span>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="import-title">Title</label>
+        <input type="text" id="import-title" maxlength="200" autocomplete="off">
+      </div>
+
+      <div class="row-between">
+        <div>
+          <span style="font-size:13px">Keep original file</span>
+          <div class="hint" id="import-keep-hint"></div>
+        </div>
+        <label class="switch"><input type="checkbox" id="import-keep" aria-label="Keep original file"><span></span></label>
+      </div>
+
+      <p class="hint" style="margin:16px 0 0">
+        An imported file is one track, so its lines are not attributed to anyone and read as
+        Speaker. Supported: MP4/MOV/M4A/3GP, MKV/WebM, MP3, WAV/W64, FLAC, Ogg/Opus, AAC,
+        WMA/ASF, AVI, MPEG-TS, MPEG-PS, CAF, AIFF, AMR, AC-3/E-AC-3, AU. Other formats are rejected.
+      </p>
+
+      <div id="import-progress" hidden>
+        <div class="progress" role="progressbar" aria-label="Upload progress" aria-valuemin="0"
+             aria-valuemax="100" id="import-bar"><i></i></div>
+        <div class="hint" id="import-progress-text" style="margin-top:6px"></div>
+      </div>
+      <div class="import-error" id="import-error" role="alert"></div>
+    </div>
+  </div>
+  <div class="sheet-foot">
+    <button class="btn" id="import-cancel" type="button">Cancel</button>
+    <button class="btn primary" id="import-start" type="button">Import</button>
+  </div>
+</dialog>
+
 <script>
 const TOKEN = "__KASETA_TOKEN__";
 const $ = (id) => document.getElementById(id);
@@ -551,6 +670,9 @@ let selectedId = null;
 let query = "";
 let busy = false;
 let searchTimer = null;
+// The element playing the selected recording: an <audio>, or a <video> when a
+// kept original is a video. Both answer to the same calls, so everything that
+// plays, pauses and seeks treats them alike.
 let audio = null;
 let stageTimer = null;
 
@@ -561,8 +683,9 @@ let stageTimer = null;
 const signatureOf = (item) =>
   item
     ? JSON.stringify([
-        item.title, item.has_transcript, item.has_summary,
+        item.title, item.has_transcript, item.has_summary, item.status,
         item.audio_local, item.audio_remote, item.mixed_audio_url,
+        item.source?.filename, item.original?.local, item.original?.url,
         item.tracks?.map((t) => t.track_id),
         (item.stages || []).map((s) => [s.stage, s.state, s.error]),
       ])
@@ -580,6 +703,19 @@ const clockLong = (s) => {
 };
 const when = (iso) => new Date(iso).toLocaleString(undefined,
   { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+// With the year: a file brought in may have been made long before it was.
+const whenMade = (iso) => new Date(iso).toLocaleString(undefined,
+  { day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
+const size = (bytes) => {
+  const units = ["bytes", "KB", "MB", "GB", "TB"];
+  let n = bytes, u = 0;
+  while (n >= 1024 && u < units.length - 1) { n /= 1024; u++; }
+  return u === 0 ? `${n} bytes` : `${n.toFixed(n < 10 ? 1 : 0)} ${units[u]}`;
+};
+
+/// Whether a recording is a file still being decoded, or one that could not be.
+/// Neither has audio or a transcript to offer, and both say so instead.
+const unfinishedImport = (item) => item.origin === "imported" && item.status !== "ready";
 
 async function api(path, options = {}) {
   const res = await fetch(path, {
@@ -616,6 +752,7 @@ function renderStatus(s) {
   $("record").setAttribute("aria-label", live ? "Stop recording" : "Start recording");
 
   $("pips").hidden = !live;
+  renderImportButton(s.import);
   if (live) {
     const bad = s.degraded_tracks || [];
     const iffy = s.reconnecting || [];
@@ -685,7 +822,11 @@ function renderList(next) {
     row.append(el("span", "name", item.title));
 
     const sub = el("div", "sub");
-    sub.append(el("span", null, clock(item.duration_ms / 1000)));
+    // A file still being decoded has no length yet, and a zero would read as
+    // an empty recording.
+    sub.append(el("span", null, unfinishedImport(item)
+      ? (item.status === "failed" ? "Failed" : "Importing")
+      : clock(item.duration_ms / 1000)));
     sub.append(el("span", null, when(item.started_at)));
     if (item.has_transcript) sub.append(el("span", null, "TXT"));
     row.append(sub);
@@ -739,16 +880,52 @@ function renderDetailInner(item) {
   const title = el("h2", null, item.title);
   title.title = "Double-click to rename";
   title.ondblclick = () => renameInline(title, item);
-  grow.append(title, el("div", "hint", `${when(item.started_at)} · ${clock(item.duration_ms / 1000)}`));
+  grow.append(title, el("div", "hint", unfinishedImport(item)
+    ? when(item.started_at)
+    : `${when(item.started_at)} · ${clock(item.duration_ms / 1000)}`));
+  // Where an imported recording came from. The file's own date matters more
+  // than the import's: it is when whatever it holds actually happened.
+  if (item.source) {
+    const made = item.source.media_created_at;
+    grow.append(el("div", "hint provenance", made
+      ? `Imported from ${item.source.filename} · created ${whenMade(made)}`
+      : `Imported from ${item.source.filename}`));
+  }
+  if (item.original && !item.original.local) {
+    grow.append(el("div", "hint provenance",
+      "The original file is in your bucket, not on this machine."));
+  }
   grow.append(stageChips(item));
   row.append(grow);
 
-  // The mix, or either side alone. Keeping both sides separately is what makes
-  // attribution possible, so they are offered rather than hidden.
+  // What can be played. For a capture, the mix or either side alone: keeping
+  // both sides separately is what makes attribution possible, so they are
+  // offered rather than hidden. For an import, its one track, plus the file
+  // itself when it was kept, which for a video is the only way to see it.
+  const original = item.original?.local && item.original.url ? item.original : null;
+  const video = original?.media_kind === "video";
+  const tracks = item.tracks || [];
   const sources = [];
-  if (item.mixed_audio_url) sources.push({ name: "Mix", url: item.mixed_audio_url });
-  for (const t of item.tracks || [])
-    sources.push({ name: t.role === "local_mic" ? "You" : "Them", url: t.audio_url });
+  if (video) sources.push({ name: "Video", url: original.url, video: true });
+  if (tracks.length === 1 && item.mixed_audio_url) {
+    // One track is its own mix. Offering both would be two buttons playing the
+    // same thing under different names.
+    sources.push({ name: tracks[0].label, url: item.mixed_audio_url });
+  } else {
+    if (item.mixed_audio_url) sources.push({ name: "Mix", url: item.mixed_audio_url });
+    for (const t of tracks)
+      sources.push({
+        // The two captured sides keep their short names; anything else is
+        // named as the API names it, so an imported track reads as Speaker.
+        name: t.role === "local_mic" ? "You" : t.role === "remote_mix" ? "Them" : t.label,
+        url: t.audio_url,
+      });
+  }
+  if (original && !video) sources.push({ name: "Original", url: original.url });
+
+  // Shown only while the video is what is playing; any other source is sound
+  // alone, and a black frame above it would look like a broken video.
+  let screen = null;
 
   if (sources.length) {
     const seg = el("div", "seg");
@@ -759,6 +936,7 @@ function renderDetailInner(item) {
       b.onclick = () => {
         for (const other of seg.children) other.setAttribute("aria-pressed", "false");
         b.setAttribute("aria-pressed", "true");
+        if (screen) screen.classList.toggle("off", !src.video);
         if (audio) {
           const at = audio.currentTime, playing = !audio.paused;
           audio.src = src.url;
@@ -778,6 +956,14 @@ function renderDetailInner(item) {
     row.append(dl);
   }
 
+  if (original?.download_url) {
+    const dl = el("a", "btn", "Download original");
+    dl.href = original.download_url;
+    dl.title = `${original.filename} · ${size(original.bytes)}`;
+    dl.style.textDecoration = "none";
+    row.append(dl);
+  }
+
   row.append(sendButton(item));
 
   const del = el("button", "icon-btn", "✕");
@@ -788,9 +974,23 @@ function renderDetailInner(item) {
   head.append(row);
 
   if (sources.length) {
-    audio = document.createElement("audio");
-    audio.src = sources[0].url;
-    audio.preload = "metadata";
+    // Handlers below hold this element rather than reading `audio`, which
+    // moves on to the next recording's element when the pane is redrawn while
+    // the old one still has an event in flight.
+    const media = document.createElement(sources[0].video ? "video" : "audio");
+    audio = media;
+    media.src = sources[0].url;
+    media.preload = "metadata";
+
+    if (sources[0].video) {
+      screen = el("div", "screen");
+      media.playsInline = true;
+      media.title = "Click to play or pause, double-click for full screen";
+      media.onclick = () => (media.paused ? media.play() : media.pause());
+      media.ondblclick = () => media.requestFullscreen?.();
+      screen.append(media);
+      head.append(screen);
+    }
 
     const wave = el("div", "wave");
     const canvas = document.createElement("canvas");
@@ -805,18 +1005,18 @@ function renderDetailInner(item) {
     const total = el("span", "time", clock(item.duration_ms / 1000));
     total.style.marginLeft = "auto";
 
-    play.onclick = () => (audio.paused ? audio.play() : audio.pause());
-    audio.onplay = () => { play.textContent = "❚❚"; play.setAttribute("aria-label", "Pause"); };
-    audio.onpause = () => { play.textContent = "▶"; play.setAttribute("aria-label", "Play"); };
-    audio.ontimeupdate = () => {
-      const d = audio.duration || item.duration_ms / 1000 || 1;
-      elapsed.textContent = clock(audio.currentTime);
-      playhead.style.left = `${(audio.currentTime / d) * 100}%`;
+    play.onclick = () => (media.paused ? media.play() : media.pause());
+    media.onplay = () => { play.textContent = "❚❚"; play.setAttribute("aria-label", "Pause"); };
+    media.onpause = () => { play.textContent = "▶"; play.setAttribute("aria-label", "Play"); };
+    media.ontimeupdate = () => {
+      const d = media.duration || item.duration_ms / 1000 || 1;
+      elapsed.textContent = clock(media.currentTime);
+      playhead.style.left = `${(media.currentTime / d) * 100}%`;
     };
     wave.onclick = (e) => {
       const box = wave.getBoundingClientRect();
-      audio.currentTime = ((e.clientX - box.left) / box.width) *
-        (audio.duration || item.duration_ms / 1000);
+      media.currentTime = ((e.clientX - box.left) / box.width) *
+        (media.duration || item.duration_ms / 1000);
     };
 
     controls.append(play, elapsed, total);
@@ -837,6 +1037,7 @@ function renderDetailInner(item) {
 
 // The job each chip reports on, where the two are named differently.
 const STAGE_JOBS = {
+  import: "import_media",
   transcribe: "transcribe",
   summarize: "summarize",
   backup: "upload_remote",
@@ -845,6 +1046,10 @@ const STAGE_JOBS = {
 
 // What each stage is called, and what it means when it has not happened.
 const STAGES = [
+  // Decoding the file is what makes an import a recording at all, so it comes
+  // first, and only imports have it.
+  { key: "import",     name: "Import",     done: (i) => i.status === "ready",
+    only: (i) => i.origin === "imported" },
   { key: "transcribe", name: "Transcript", done: (i) => i.has_transcript },
   { key: "summarize",  name: "Summary",    done: (i) => i.has_summary },
   { key: "backup",     name: "Backup",     done: (i) => i.audio_remote },
@@ -911,16 +1116,23 @@ function stageChips(item) {
   const stateOf = (key) =>
     (item.stages || []).find((s) => s.stage === STAGE_JOBS[key]);
 
-  // Where the audio is, which changes once backup removes local copies.
-  const where = el("span", "chip");
-  where.textContent = item.audio_local && item.audio_remote ? "Local + remote"
-    : item.audio_remote ? "Remote only"
-    : item.audio_local ? "Local only"
-    : "No audio";
-  if (!item.audio_local && !item.audio_remote) where.classList.add("bad");
-  box.append(where);
+  // Where the audio is, which changes once backup removes local copies. A file
+  // still being decoded has none yet, which is not the alarm "No audio" is.
+  if (!unfinishedImport(item)) {
+    const where = el("span", "chip");
+    where.textContent = item.audio_local && item.audio_remote ? "Local + remote"
+      : item.audio_remote ? "Remote only"
+      : item.audio_local ? "Local only"
+      : "No audio";
+    if (!item.audio_local && !item.audio_remote) where.classList.add("bad");
+    box.append(where);
+  }
 
   for (const stage of STAGES) {
+    if (stage.only && !stage.only(item)) continue;
+    // Until the file is decoded there is nothing for the other stages to
+    // work on, and offering to run them would only earn a refusal.
+    if (unfinishedImport(item) && stage.key !== "import") continue;
     // Backup is only meaningful once it is switched on, and nothing reports
     // that per-recording, so it is shown only when it has happened or failed.
     const st = stateOf(stage.key);
@@ -969,10 +1181,13 @@ function stageChips(item) {
         failed ? `${stage.name} failed ` : skipped ? `${stage.name} skipped ` : `${stage.name} `));
       if (skipped && st.error) chip.title = st.error;
 
-      const act = el("button", null, failed ? "retry" : "run");
+      // Retrying an import decodes the upload again, so once the upload is gone
+      // retry can only be refused; deleting the item is what is left to do.
+      const gone = stage.key === "import" && failed && uploadGone(st);
+      const act = el("button", null, gone ? "delete" : failed ? "retry" : "run");
       act.type = "button";
       act.title = failed && st?.error ? st.error : `Run ${stage.name.toLowerCase()}`;
-      act.onclick = () => runStage(item, stage.key, act);
+      act.onclick = gone ? () => destroy(item) : () => runStage(item, stage.key, act);
       chip.append(act);
     }
     box.append(chip);
@@ -988,6 +1203,12 @@ function stageChips(item) {
   }
   return box;
 }
+
+/// Whether an import failed because its upload no longer exists.
+///
+/// Recognised by the start of the daemon's own message for it, which a test in
+/// the daemon pins to this exact phrase.
+const uploadGone = (st) => Boolean(st?.error?.startsWith("the uploaded file is gone"));
 
 /// Asks for a stage to run, and says so on the control that was pressed.
 ///
@@ -1040,6 +1261,15 @@ async function drawWaveform(canvas, id) {
 async function loadTranscript(pane, item) {
   pane.append(el("div", "sec-head", "Transcript"));
 
+  // Offering to transcribe a file that has not been decoded would only queue
+  // work the daemon refuses.
+  if (unfinishedImport(item)) {
+    pane.append(el("p", "hint", item.status === "failed"
+      ? "The file could not be imported, so there is nothing to transcribe."
+      : "Transcribing starts once the file is imported."));
+    return;
+  }
+
   if (!item.has_transcript) {
     const st = (item.stages || []).find((s) => s.stage === "transcribe");
     const busy = ["queued", "running", "retrying"].includes(st?.state);
@@ -1078,8 +1308,9 @@ async function loadTranscript(pane, item) {
       jump.title = "Play from here";
       jump.onclick = () => { if (audio) { audio.currentTime = line.at_s; audio.play(); } };
 
-      who.append(document.createTextNode(
-        line.speaker === "you" ? "You " : line.speaker === "them" ? "Them " : "Unknown "), jump);
+      // Named by the daemon, which knows the recording's origin: the same
+      // stored "unknown" reads as Unknown in a capture and Speaker in an import.
+      who.append(document.createTextNode(`${line.label} `), jump);
 
       const text = el("div", "text", line.text);
       if (query) highlight(text, query);
@@ -1202,7 +1433,8 @@ function renameInline(title, item) {
 }
 
 async function destroy(item) {
-  if (!confirm(`Delete “${item.title}”?\n\nThe audio and transcript are removed permanently.`)) return;
+  const what = item.original ? "The audio, transcript and original file are" : "The audio and transcript are";
+  if (!confirm(`Delete “${item.title}”?\n\n${what} removed permanently.`)) return;
   try {
     await api(`/api/v1/recordings/${item.id}`, { method: "DELETE" });
     selectedId = null;
@@ -1313,6 +1545,239 @@ $("settings-save").onclick = async () => {
   } catch (e) { fail(e.message); }
 };
 
+// ---- import ----------------------------------------------------------------
+
+const importDialog = $("import-dialog");
+// Whether files can be imported, as the daemon last said, and why not.
+let importing = { available: false, reason: null };
+// The largest upload the daemon accepts, from settings. Checked here only so a
+// file over it is refused before it is sent rather than after; the daemon
+// decides either way.
+let importLimit = null;
+// The file shown in the dialog, and the upload in flight, if any.
+let chosen = null;
+let upload = null;
+
+/// The Import button, in every state it has.
+///
+/// Never disabled outright: pressing it while importing is unavailable is how
+/// the reason is found, and a disabled button would not even show its tooltip
+/// in every browser.
+function renderImportButton(status) {
+  importing = status || { available: false, reason: "This recorder cannot import files." };
+  const b = $("import");
+  b.setAttribute("aria-disabled", String(!importing.available && !upload));
+  b.title = upload ? "Show the upload"
+    : importing.available ? "Import an audio or video file, or drop one on the window"
+    : importing.reason;
+}
+
+$("import").onclick = () => {
+  // While a file is uploading the dialog is where its progress is, and only
+  // one upload is accepted at a time.
+  if (upload) return importDialog.open || importDialog.showModal();
+  if (!importing.available) return showUnavailable();
+  $("import-file").value = "";
+  $("import-file").click();
+};
+
+$("import-file").onchange = (e) => {
+  const file = e.target.files[0];
+  if (file) chooseFile(file);
+};
+
+function showUnavailable() {
+  chosen = null;
+  $("import-unavailable").hidden = false;
+  $("import-form").hidden = true;
+  $("import-start").hidden = true;
+  $("import-cancel").textContent = "Close";
+  $("import-reason").textContent = importing.reason || "The recorder did not say why.";
+  importDialog.showModal();
+}
+
+const stem = (name) => name.replace(/\.[^.]*$/, "") || name;
+
+/// Opens the dialog for a file, before anything is sent.
+function chooseFile(file, others = 0) {
+  if (upload) return importDialog.open || importDialog.showModal();
+  if (!importing.available) return showUnavailable();
+
+  chosen = file;
+  $("import-unavailable").hidden = true;
+  $("import-form").hidden = false;
+  $("import-start").hidden = false;
+  $("import-cancel").textContent = "Cancel";
+  $("import-name").textContent = file.name;
+  $("import-size").textContent = others
+    ? `${size(file.size)} · one file at a time, so the other ${others === 1 ? "one was" : `${others} were`} left out`
+    : size(file.size);
+  $("import-title").value = stem(file.name);
+  $("import-keep").checked = false;
+  // The cost is stated, because it is the reason the switch starts off.
+  $("import-keep-hint").textContent =
+    `Stores the ${size(file.size)} file with the recording, to ${file.type.startsWith("video/")
+      ? "watch" : "play"} and download. Backed up with it when cloud backup is on.`;
+  $("import-progress").hidden = true;
+  setUploading(false);
+
+  const refusal = file.size === 0
+    ? "This file is empty."
+    : importLimit && file.size > importLimit
+      ? `This file is larger than the ${size(importLimit)} import limit (imports.max_upload_gb in settings.json).`
+      : "";
+  $("import-error").textContent = refusal;
+  $("import-start").disabled = Boolean(refusal);
+
+  importDialog.showModal();
+  $("import-title").focus();
+  $("import-title").select();
+}
+
+function setUploading(on) {
+  $("import-title").disabled = on;
+  $("import-keep").disabled = on;
+  $("import-start").disabled = on;
+  $("import-start").textContent = on ? "Uploading…" : "Import";
+  $("import-label").textContent = "Import";
+  if (on) {
+    $("import-progress").hidden = false;
+    $("import-error").textContent = "";
+  }
+  renderImportButton(importing);
+}
+
+function showProgress(sent, total) {
+  const pct = total ? Math.floor((sent / total) * 100) : 0;
+  $("import-bar").firstElementChild.style.width = `${pct}%`;
+  $("import-bar").setAttribute("aria-valuenow", String(pct));
+  $("import-progress-text").textContent = `${size(sent)} of ${size(total)} · ${pct}%`;
+  // Visible with the dialog closed, so the window can be used meanwhile.
+  $("import-label").textContent = `Import ${pct}%`;
+}
+
+/// Sends the chosen file to the daemon.
+///
+/// Sent with XMLHttpRequest rather than `api()`: that helper declares a JSON
+/// body, and only XMLHttpRequest reports how much of an upload has gone. The
+/// file goes as the request body itself, read from disk as it is sent, so a
+/// file of several gigabytes is never held in the page.
+function startImport() {
+  if (!chosen || upload) return;
+  const file = chosen;
+  const title = $("import-title").value.trim();
+
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", "/api/v1/imports");
+  xhr.setRequestHeader("x-kaseta-token", TOKEN);
+  // Percent-encoded because a header carries only ASCII, and file names do not.
+  xhr.setRequestHeader("x-kaseta-filename", encodeURIComponent(file.name));
+  if (title) xhr.setRequestHeader("x-kaseta-title", encodeURIComponent(title));
+  xhr.setRequestHeader("x-kaseta-keep-original", $("import-keep").checked ? "1" : "0");
+
+  const ended = (message) => {
+    upload = null;
+    setUploading(false);
+    $("import-progress").hidden = true;
+    if (message) {
+      $("import-error").textContent = message;
+      if (!importDialog.open) importDialog.showModal();
+    }
+  };
+
+  xhr.upload.onprogress = (e) => showProgress(e.loaded, e.lengthComputable ? e.total : file.size);
+  xhr.upload.onload = () => {
+    $("import-progress-text").textContent = "Uploaded · handing it to the recorder";
+  };
+  xhr.onload = async () => {
+    let body = {};
+    try { body = JSON.parse(xhr.responseText); } catch { /* the status says enough */ }
+    if (xhr.status !== 202 || !body.recording_id) {
+      ended(body.error || `${xhr.status} ${xhr.statusText}`);
+      return;
+    }
+    ended(null);
+    chosen = null;
+    importDialog.close();
+    // Shown straight away, with its Import chip, rather than left to be found.
+    selectedId = body.recording_id;
+    await refreshList();
+    if (items.some((i) => i.id === body.recording_id)) select(body.recording_id);
+  };
+  // The daemon discards a partial upload, so there is nothing to clean up.
+  xhr.onerror = () => ended("The upload was interrupted, and nothing was kept. Try again.");
+  xhr.onabort = () => ended(null);
+
+  upload = xhr;
+  setUploading(true);
+  showProgress(0, file.size);
+  xhr.send(file);
+}
+
+$("import-start").onclick = startImport;
+
+// Cancel stops an upload; closing only hides it. A large file takes a while,
+// and the rest of the window is usable meanwhile.
+$("import-cancel").onclick = () => {
+  if (upload) upload.abort();
+  importDialog.close();
+};
+$("import-close").onclick = () => importDialog.close();
+$("import-title").onkeydown = (e) => {
+  if (e.key === "Enter" && !upload) startImport();
+};
+
+// Leaving the page would end the upload with it.
+window.addEventListener("beforeunload", (e) => {
+  if (upload) e.preventDefault();
+});
+
+// A file dragged anywhere over the window opens the same dialog as the button.
+// Only drags carrying files are taken: text or a link dragged within the page
+// keeps doing what it did.
+const dragsFiles = (e) => Boolean(e.dataTransfer?.types?.includes("Files"));
+let dragDepth = 0;
+
+function showDrop(on) {
+  $("drop").hidden = !on;
+  if (!on) return;
+  $("drop-title").textContent = upload ? "Another file is uploading"
+    : importing.available ? "Drop to import" : "Importing is unavailable";
+  $("drop-hint").textContent = upload ? "One upload at a time. Wait for it to finish."
+    : importing.available ? "One audio or video file becomes a recording."
+    : importing.reason || "";
+}
+
+window.addEventListener("dragenter", (e) => {
+  if (!dragsFiles(e)) return;
+  e.preventDefault();
+  // Counted, because moving between elements fires a leave for the one left
+  // after the enter for the next, and the overlay would flicker on each.
+  dragDepth++;
+  showDrop(true);
+});
+window.addEventListener("dragover", (e) => {
+  if (!dragsFiles(e)) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = upload ? "none" : "copy";
+});
+window.addEventListener("dragleave", (e) => {
+  if (!dragsFiles(e)) return;
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (!dragDepth) showDrop(false);
+});
+window.addEventListener("drop", (e) => {
+  if (!dragsFiles(e)) return;
+  // Without this the browser opens the file in place of the window.
+  e.preventDefault();
+  dragDepth = 0;
+  showDrop(false);
+  const files = e.dataTransfer.files;
+  if (!files.length || upload) return;
+  if (sheet.open) sheet.close();
+  chooseFile(files[0], files.length - 1);
+});
+
 // ---- keyboard --------------------------------------------------------------
 
 document.addEventListener("keydown", (e) => {
@@ -1321,7 +1786,7 @@ document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") e.target.blur();
     return;
   }
-  if (sheet.open) return;
+  if (sheet.open || importDialog.open) return;
 
   if (e.key === "r" || e.key === "R") { e.preventDefault(); toggleRecording(); }
   else if (e.key === " ") { e.preventDefault(); if (audio) audio.paused ? audio.play() : audio.pause(); }
@@ -1361,7 +1826,9 @@ async function refreshList() {
 
     // Polled only while work is outstanding, so a stage finishing appears
     // without the list being refreshed on a timer forever.
-    const busy = next.some((i) =>
+    // A file being decoded counts: its row changes from "Importing" to a
+    // recording when the decode finishes.
+    const busy = next.some((i) => i.status === "processing" ||
       (i.stages || []).some((s) => ["queued", "running", "retrying"].includes(s.state)));
     clearTimeout(stageTimer);
     if (busy) stageTimer = setTimeout(refreshList, 2000);
@@ -1407,15 +1874,22 @@ async function refreshPrivacy() {
     }
     const leaves = [];
     if (s.summaries.enabled && s.summaries.api_key_set) leaves.push("transcripts → summariser");
-    if (s.remote_storage.enabled) leaves.push("recordings → your bucket");
+    if (s.remote_storage.enabled) leaves.push("recordings and kept originals → your bucket");
     // Configured, not merely switched on: a destination that cannot be reached
     // sends nothing, and saying it does would be the same lie in the other
     // direction.
     if (s.webhook.configured) leaves.push("transcripts → your webhook");
 
-    $("privacy").textContent = leaves.length
-      ? `Audio stays local · sent out: ${leaves.join(" · ")}`
-      : "Local storage only · nothing leaves this machine";
+    // Audio stays local only while backup is off: backup is what sends it.
+    $("privacy").textContent = !leaves.length
+      ? "Local storage only · nothing leaves this machine"
+      : s.remote_storage.enabled
+        ? `Sent out: ${leaves.join(" · ")}`
+        : `Audio stays local · sent out: ${leaves.join(" · ")}`;
+    // Brought inside the same bounds the daemon applies to a hand-edited file.
+    importLimit = s.imports
+      ? Math.min(Math.max(s.imports.max_upload_gb, 1), 64) * 1024 ** 3
+      : null;
   } catch { /* the status bar is not worth an error banner */ }
 }
 

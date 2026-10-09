@@ -1446,6 +1446,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_page_sends_what_the_import_route_reads() {
+        // The page sends a file with a hand-built request rather than through
+        // its JSON helper, so nothing else ties the header names it writes to
+        // the ones the route reads. A mismatch would refuse every import from
+        // the window while the command line went on working.
+        use crate::import::upload::{FILENAME_HEADER, KEEP_ORIGINAL_HEADER, TITLE_HEADER};
+        for header in [FILENAME_HEADER, TITLE_HEADER, KEEP_ORIGINAL_HEADER, TOKEN_HEADER] {
+            assert!(
+                INDEX_HTML.contains(&format!("\"{header}\"")),
+                "the page never sends {header}"
+            );
+        }
+        assert!(INDEX_HTML.contains("\"/api/v1/imports\""), "the page never posts an import");
+    }
+
+    #[test]
+    fn the_page_retries_an_import_through_a_stage_the_daemon_knows() {
+        // The Import chip's state is found by job name and its retry is
+        // posted by stage name; either drifting leaves a failed import with
+        // no chip, or a retry the daemon refuses as an unknown stage.
+        assert_eq!(kaseta_contracts::JobType::ImportMedia.as_str(), "import_media");
+        assert!(INDEX_HTML.contains("import: \"import_media\""));
+    }
+
+    #[test]
+    fn the_page_offers_delete_when_the_upload_is_gone() {
+        // Retrying decodes the upload again, so once it is gone the only
+        // useful action is deleting the item. The page recognises that case
+        // by the start of the daemon's message.
+        const PHRASE: &str = "the uploaded file is gone";
+        assert!(crate::import::job::UPLOAD_GONE.starts_with(PHRASE));
+        assert!(INDEX_HTML.contains(&format!("\"{PHRASE}\"")));
+    }
+
     // The routes, driven through the same router the daemon serves, with no
     // socket. The supervisor is real; nothing here starts a recording, so it
     // never touches an audio device.
