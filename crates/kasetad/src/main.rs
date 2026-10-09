@@ -2,13 +2,14 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-mod blobstore;
+// The storage and export core is the crate's library (see `lib.rs`); importing
+// it at the root keeps every `crate::blobstore::...` path in the binary valid.
+use kasetad::{blobstore, clock, export};
+
 mod capture;
 mod config;
-mod clock;
 mod db;
 mod derived;
-mod export;
 mod http;
 mod library;
 mod remote;

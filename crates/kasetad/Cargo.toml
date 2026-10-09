@@ -16,7 +16,8 @@ ulid.workspace = true
 time.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-tokio.workspace = true
+# `io-util` for the buffered async writer that stages uploads.
+tokio = { workspace = true, features = ["io-util"] }
 
 # Local API surface. The UI is a static SPA served by this same daemon, so there
 # is no second process resident when the interface is open.
