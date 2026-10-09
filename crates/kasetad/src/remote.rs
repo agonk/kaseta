@@ -315,6 +315,10 @@ struct Call<'a> {
 
 /// Sends one signed request, with its body and the body's length when it has
 /// one.
+///
+/// The length is signed along with everything else and sent as the very value
+/// that was signed, so `content-length` is always in `SignedHeaders` when
+/// there is a body.
 fn send(
     client: &Client,
     target: &RemoteTarget,
@@ -322,16 +326,21 @@ fn send(
     call: Call<'_>,
     body: Option<(Body, u64)>,
 ) -> reqwest::Result<Response> {
+    let body_len = body.as_ref().map_or(0, |(_, len)| *len);
+    let length_text = body_len.to_string();
+    let mut headers: Vec<(&str, &str)> = call.headers.to_vec();
+    if body.is_some() {
+        headers.push(("content-length", &length_text));
+    }
     let signed = sign(
         target,
         call.method.as_str(),
         key,
         call.query,
-        call.headers,
+        &headers,
         call.payload_sha256,
         time::OffsetDateTime::now_utc(),
     );
-    let body_len = body.as_ref().map_or(0, |(_, len)| *len);
     let mut request = client
         .request(call.method, &signed.url)
         .timeout(request_timeout(body_len));
@@ -926,6 +935,16 @@ pub(crate) mod fake_s3 {
             if !signed.contains(&required) {
                 return false;
             }
+        }
+        // A body's length is part of what SigV4 covers: a length sent but not
+        // signed is one a proxy could change without the signature noticing.
+        if headers.contains_key("content-length") && !signed.contains(&"content-length") {
+            return false;
+        }
+        // And sent once: a second copy beside the signed one would be a length
+        // nobody signed.
+        if headers.get_all("content-length").iter().count() > 1 {
+            return false;
         }
 
         let Some(now) = header(headers, "x-amz-date").and_then(parse_amz_date) else {
@@ -1611,6 +1630,27 @@ mod upload_tests {
         let err = put_object_file(&client().unwrap(), &target, "k", &file, &sha, 10).unwrap_err();
         assert!(format!("{err:#}").contains("SignatureDoesNotMatch"), "{err:#}");
         assert!(s3.fake().rejected_signatures > 0);
+    }
+
+    /// The fake is only worth trusting if it refuses a body whose length was
+    /// sent without being signed.
+    #[test]
+    fn the_stand_in_refuses_an_unsigned_length() {
+        let s3 = FakeS3::start();
+        let target = s3.target();
+        let body = b"twelve bytes".to_vec();
+        let sha = hex::encode(Sha256::digest(&body));
+        let signed = sign(&target, "PUT", "k", &[], &[], &sha, time::OffsetDateTime::now_utc());
+
+        let mut request = client().unwrap().put(&signed.url);
+        for (name, value) in &signed.headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        let response = request.body(body).send().unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+        assert_eq!(s3.fake().rejected_signatures, 1);
+        assert!(s3.fake().objects.is_empty());
     }
 
     /// A recording's chunks are sent under the digests its manifest recorded,
