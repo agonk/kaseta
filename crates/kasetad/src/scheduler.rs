@@ -795,16 +795,10 @@ fn finish(
             // person needs to read.
             let retryable = e.downcast_ref::<Permanent>().is_none();
             tracing::error!(?job_type, retryable, error = %message, "job failed");
-            match guard.fail_job(job_id, "job_failed", &message, retryable) {
-                // However an import ends for good, its recording ends with it:
-                // nothing else will ever move the row out of "processing".
-                Ok(JobState::FailedTerminal) if job_type == JobType::ImportMedia => {
-                    if let Err(e) = guard.fail_import_terminal(recording_id, job_id, &message) {
-                        tracing::error!(error = %format!("{e:#}"), "could not fail the import");
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => tracing::error!(error = %format!("{e:#}"), "could not record failure"),
+            // An import that ends here fails its recording inside the same
+            // call, so the job and the row can never disagree after a crash.
+            if let Err(e) = guard.fail_job(job_id, "job_failed", &message, retryable) {
+                tracing::error!(error = %format!("{e:#}"), "could not record failure");
             }
         }
     }

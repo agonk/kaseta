@@ -480,7 +480,7 @@ mod tests {
         {
             let db = served.db.lock().unwrap();
             let job = db.claim_next_job(1).unwrap().unwrap();
-            db.fail_import_terminal(id, job.id, crate::import::job::UNSUPPORTED).unwrap();
+            db.fail_job(job.id, "job_failed", crate::import::job::UNSUPPORTED, false).unwrap();
         }
         match daemon.wait(id, Duration::from_millis(10)).unwrap() {
             Outcome::Failed(reason) => assert_eq!(reason, crate::import::job::UNSUPPORTED),

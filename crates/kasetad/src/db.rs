@@ -220,6 +220,10 @@ impl Db {
         Ok(job)
     }
 
+    /// Records a failed attempt and decides whether the job gets another.
+    ///
+    /// An import that this makes terminal also fails its recording, in the
+    /// same transaction.
     pub fn fail_job(
         &self,
         id: Ulid,
@@ -252,6 +256,15 @@ impl Db {
              WHERE id = ?5",
             params![next.as_str(), code, message, delay_s, id.to_string()],
         )?;
+
+        // However an import ends for good, its recording ends with it, in the
+        // same transaction that decided it was over: nothing else will ever
+        // move the row out of "processing", and recovery only looks at jobs
+        // still running, so a crash between two commits would strand it.
+        if next == JobState::FailedTerminal && job.job_type == JobType::ImportMedia {
+            Self::fail_import_row(&tx, &job.recording_id.to_string())?;
+        }
+
         tx.commit()?;
         Ok(next)
     }
@@ -546,43 +559,6 @@ impl Db {
 
         tx.commit()?;
         Ok(true)
-    }
-
-    /// Ends an import for good: its job `failed_terminal` with `reason`, and
-    /// its recording `failed`, in one transaction.
-    ///
-    /// Callable whether the job is still running (a permanent failure found
-    /// mid-decode) or was already made terminal by an exhausted retry budget,
-    /// so every way an import can end badly arrives at the same two states. A
-    /// job that is gone means the recording was deleted, and there is nothing
-    /// left to mark.
-    pub fn fail_import_terminal(
-        &self,
-        recording_id: Ulid,
-        job_id: Ulid,
-        reason: &str,
-    ) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        let Some(mut job) = Self::load_job(&tx, &job_id.to_string())? else {
-            return Ok(());
-        };
-        anyhow::ensure!(
-            job.recording_id == recording_id && job.job_type == JobType::ImportMedia,
-            "job {job_id} is not the import of recording {recording_id}"
-        );
-        if job.state != JobState::FailedTerminal {
-            job.transition(JobState::FailedTerminal)?;
-        }
-
-        tx.execute(
-            "UPDATE jobs SET state = ?1, worker_pid = NULL, error_code = 'import_failed',
-                    error_message = ?2, next_attempt_at = NULL
-             WHERE id = ?3",
-            params![JobState::FailedTerminal.as_str(), reason, job_id.to_string()],
-        )?;
-        Self::fail_import_row(&tx, &recording_id.to_string())?;
-        tx.commit()?;
-        Ok(())
     }
 
     /// Marks an unfinished import's recording failed. Only an import still on
@@ -1438,7 +1414,10 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let (rec, job) = running_import(&db);
 
-        db.fail_import_terminal(rec, job, "This file has no audio track").unwrap();
+        assert_eq!(
+            db.fail_job(job, "job_failed", "This file has no audio track", false).unwrap(),
+            JobState::FailedTerminal
+        );
 
         let failed = db.job(job).unwrap().unwrap();
         assert_eq!(failed.state, JobState::FailedTerminal);
@@ -1447,20 +1426,38 @@ mod tests {
         assert_eq!(db.requeue_retryable().unwrap(), 0, "nothing comes back around");
     }
 
-    /// Exhausting retries marks the job terminal first; failing the recording
-    /// afterwards must still work rather than tripping over the transition.
+    /// Running out of attempts is decided in the same operation that fails the
+    /// recording, so no crash can fall between the job going terminal and the
+    /// row leaving "processing".
     #[test]
-    fn an_import_that_ran_out_of_attempts_can_still_fail_its_recording() {
+    fn an_import_that_runs_out_of_attempts_fails_its_recording_in_one_step() {
         let db = Db::open_in_memory().unwrap();
         let (rec, job) = running_import(&db);
+        db.conn
+            .execute(
+                "UPDATE jobs SET attempt = max_attempts WHERE id = ?1",
+                params![job.to_string()],
+            )
+            .unwrap();
+
         assert_eq!(
-            db.fail_job(job, "job_failed", "ffmpeg crashed", false).unwrap(),
+            db.fail_job(job, "job_failed", "ffmpeg crashed", true).unwrap(),
             JobState::FailedTerminal
         );
-
-        db.fail_import_terminal(rec, job, "ffmpeg crashed").unwrap();
         assert_eq!(db.job(job).unwrap().unwrap().state, JobState::FailedTerminal);
         assert_eq!(import_row(&db, rec).0, "failed");
+    }
+
+    #[test]
+    fn an_import_with_attempts_left_stays_processing_after_a_failure() {
+        let db = Db::open_in_memory().unwrap();
+        let (rec, job) = running_import(&db);
+
+        assert_eq!(
+            db.fail_job(job, "job_failed", "ffmpeg crashed", true).unwrap(),
+            JobState::FailedRetryable
+        );
+        assert_eq!(import_row(&db, rec).0, "processing");
     }
 
     #[test]
@@ -1469,7 +1466,7 @@ mod tests {
         let (rec, job) = running_import(&db);
         assert!(db.finalize_import_success(rec, job, &index_fields()).unwrap());
 
-        assert!(db.fail_import_terminal(rec, job, "late").is_err());
+        assert!(db.fail_job(job, "job_failed", "late", false).is_err());
         assert_eq!(import_row(&db, rec).0, "ready");
         assert_eq!(db.job(job).unwrap().unwrap().state, JobState::Succeeded);
     }
@@ -1478,7 +1475,7 @@ mod tests {
     fn retrying_a_failed_import_puts_it_back_in_the_queue() {
         let db = Db::open_in_memory().unwrap();
         let (rec, job) = running_import(&db);
-        db.fail_import_terminal(rec, job, "not enough disk space").unwrap();
+        db.fail_job(job, "job_failed", "not enough disk space", false).unwrap();
 
         let again = db.reset_import_for_retry(rec).unwrap().expect("a failed import retries");
         assert_ne!(again, job);
