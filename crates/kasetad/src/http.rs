@@ -380,14 +380,27 @@ struct ListResponse {
     items: Vec<library::LibraryItem>,
 }
 
-async fn list_recordings(State(state): State<AppState>) -> Result<Json<ListResponse>, ApiError> {
+/// Marks each failed import with whether its upload is still there.
+///
+/// This looks at storage, so it runs after the database lock is released:
+/// a slow disk here must not hold up the scheduler or every other request
+/// waiting on the same connection.
+async fn note_import_uploads(
+    state: &AppState,
+    mut items: Vec<library::LibraryItem>,
+) -> Result<Vec<library::LibraryItem>, ApiError> {
     let store = Arc::clone(&state.store);
-    let items = with_db(&state, move |db| {
-        let mut items = library::list(db).map_err(ApiError::from_anyhow)?;
+    tokio::task::spawn_blocking(move || {
         library::note_import_uploads(&*store, &mut items).map_err(ApiError::from_anyhow)?;
         Ok(items)
     })
-    .await?;
+    .await
+    .map_err(|e| ApiError::internal(format!("storage task failed: {e}")))?
+}
+
+async fn list_recordings(State(state): State<AppState>) -> Result<Json<ListResponse>, ApiError> {
+    let items = with_db(&state, |db| library::list(db).map_err(ApiError::from_anyhow)).await?;
+    let items = note_import_uploads(&state, items).await?;
     Ok(Json(ListResponse { items }))
 }
 
@@ -396,18 +409,14 @@ async fn get_recording(
     Path(id): Path<String>,
 ) -> Result<Json<library::LibraryItem>, ApiError> {
     let id = parse_id(&id)?;
-    let store = Arc::clone(&state.store);
-    with_db(&state, move |db| {
-        let item = library::get(db, id)
+    let item = with_db(&state, move |db| {
+        library::get(db, id)
             .map_err(ApiError::from_anyhow)?
-            .ok_or_else(|| ApiError::not_found("no such recording"))?;
-        let mut items = [item];
-        library::note_import_uploads(&*store, &mut items).map_err(ApiError::from_anyhow)?;
-        let [item] = items;
-        Ok(item)
+            .ok_or_else(|| ApiError::not_found("no such recording"))
     })
-    .await
-    .map(Json)
+    .await?;
+    let mut items = note_import_uploads(&state, vec![item]).await?;
+    Ok(Json(items.remove(0)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -655,7 +664,20 @@ async fn run_stage(
         other => return Err(ApiError::bad_request(format!("unknown stage: {other}"))),
     };
 
-    let store = Arc::clone(&state.store);
+    // Decoding again needs the upload, which lives in storage rather than in
+    // anything the database can vouch for. It is looked at before taking the
+    // database lock, so a slow disk does not hold up everything else.
+    if job_type == kaseta_contracts::JobType::ImportMedia {
+        let store = Arc::clone(&state.store);
+        let present = tokio::task::spawn_blocking(move || crate::import::upload_present(&*store, id))
+            .await
+            .map_err(|e| ApiError::internal(format!("storage task failed: {e}")))?
+            .map_err(ApiError::from_anyhow)?;
+        if !present {
+            return Err(ApiError::bad_request(crate::import::job::UPLOAD_GONE));
+        }
+    }
+
     let queued = with_db(&state, move |db| {
         // A recording that no longer exists must not leave work queued against
         // it: the job would fail on every attempt with nothing to act on.
@@ -664,13 +686,9 @@ async fn run_stage(
             return Err(ApiError::not_found("no such recording"));
         }
 
-        // Decoding again needs the upload, which lives in storage rather than
-        // in anything the database can vouch for, and only a failed import is
-        // waiting for another go: one still decoding already has its attempt.
+        // Only a failed import is waiting for another go: one still decoding
+        // already has its attempt.
         if job_type == kaseta_contracts::JobType::ImportMedia {
-            if !crate::import::upload_present(&*store, id).map_err(ApiError::from_anyhow)? {
-                return Err(ApiError::bad_request(crate::import::job::UPLOAD_GONE));
-            }
             return db
                 .reset_import_for_retry(id)
                 .map_err(ApiError::from_anyhow)?
@@ -778,18 +796,16 @@ async fn search(
     State(state): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<SearchQuery>,
 ) -> Result<Json<SearchResponse>, ApiError> {
-    let store = Arc::clone(&state.store);
     let items = with_db(&state, move |db| {
         let matching = library::search(db, &query.q).map_err(ApiError::from_anyhow)?;
         let all = library::list(db).map_err(ApiError::from_anyhow)?;
-        let mut found = all
+        Ok(all
             .into_iter()
             .filter(|item| matching.contains(&item.id))
-            .collect::<Vec<_>>();
-        library::note_import_uploads(&*store, &mut found).map_err(ApiError::from_anyhow)?;
-        Ok(found)
+            .collect::<Vec<_>>())
     })
     .await?;
+    let items = note_import_uploads(&state, items).await?;
     Ok(Json(SearchResponse { items }))
 }
 
