@@ -15,6 +15,7 @@ mod library;
 mod remote;
 mod retention;
 mod scheduler;
+mod sigv4;
 mod summarize;
 mod supervisor;
 mod webhook;

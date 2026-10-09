@@ -265,6 +265,32 @@ pub fn index_fields(manifest: &RecordingManifest, keys: &[BlobKey]) -> IndexFiel
     }
 }
 
+/// Whether `key` is an imported recording's kept original,
+/// `{prefix}/source/original.{ext}`.
+///
+/// Matched on the last two segments rather than on a substring, so a track or
+/// export can never be mistaken for one whatever it is named.
+pub fn is_original(key: &BlobKey) -> bool {
+    let mut segments = key.as_str().rsplit('/');
+    let name = segments.next().unwrap_or_default();
+    name.starts_with("original.") && segments.next() == Some("source")
+}
+
+/// Records that a recording's kept original is no longer held locally.
+///
+/// Called by whatever removed it, straight after: the index's flag is what
+/// the interface reads to decide between playing the original and saying it
+/// is in the bucket, and it must not outlive the file. The manifest keeps
+/// naming the original, because the bucket still holds it.
+pub fn forget_local_original(db: &Db, id: Ulid) -> Result<()> {
+    db.conn().execute(
+        "UPDATE recordings SET original_local = 0, updated_at = strftime('%s','now')
+         WHERE id = ?1",
+        params![id.to_string()],
+    )?;
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
 struct IndexedTrack {
     track_id: String,
@@ -777,6 +803,20 @@ pub fn delete(store: &dyn BlobStore, db: &Db, id: Ulid) -> Result<bool> {
 mod tests {
     use super::*;
     use time::macros::datetime;
+
+    /// Only `{prefix}/source/original.{ext}` is an original. Removing local
+    /// copies deletes what this matches, so a false positive loses audio.
+    #[test]
+    fn only_the_source_original_is_recognised_as_one() {
+        let key = |raw: &str| BlobKey::new(raw).unwrap();
+        assert!(is_original(&key("recordings/2026/10/09/x/source/original.mp4")));
+        assert!(is_original(&key("recordings/2026/10/09/x/source/original.bin")));
+        assert!(!is_original(&key("recordings/2026/10/09/x/source/intent.json")));
+        assert!(!is_original(&key("recordings/2026/10/09/x/tracks/original.flac")));
+        assert!(!is_original(&key("recordings/2026/10/09/x/exports/original.flac")));
+        assert!(!is_original(&key("recordings/2026/10/09/x/source/originals.mp4")));
+        assert!(!is_original(&key("original.mp4")));
+    }
 
     #[test]
     fn a_rename_wins_over_the_captured_title() {

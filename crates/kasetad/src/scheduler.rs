@@ -391,15 +391,16 @@ fn execute(
             let keys = store.list_prefix(prefix.root().as_str())?;
             let client = crate::remote::client()?;
 
-            let mut uploaded = 0usize;
-            let mut skipped = 0usize;
-            for key in &keys {
-                let bytes = store.get(key)?;
-                match crate::remote::put_object(&client, &target, key.as_str(), &bytes)? {
-                    crate::remote::PutResult::Uploaded => uploaded += 1,
-                    crate::remote::PutResult::AlreadyPresent => skipped += 1,
-                }
-            }
+            // Streamed from the files, never loaded: a kept original can be
+            // gigabytes. Digests the manifest already holds are reused rather
+            // than taken again from the largest objects the recording has.
+            let crate::remote::Uploaded { uploaded, skipped } = crate::remote::upload_keys(
+                store,
+                &client,
+                &target,
+                &keys,
+                &crate::remote::known_digests(&manifest),
+            )?;
             tracing::info!(%recording_id, uploaded, skipped, "backed up");
 
             // Recorded so the interface can say where a recording's audio
@@ -451,19 +452,7 @@ fn execute(
                     "keeping local audio until it has been transcribed"
                 );
             } else if may_delete_local(&settings, transcribed) {
-                for key in &keys {
-                    // Chunks only. The mixed export stays, and it is what the
-                    // player reads — there is no path that streams audio back
-                    // out of the bucket, so removing it would leave a recording
-                    // that is backed up and unplayable. That makes this reclaim
-                    // roughly half of what a recording occupies rather than all
-                    // of it, which the setting's wording should not overstate.
-                    if key.as_str().contains("/tracks/") {
-                        if let Err(e) = store.delete(key) {
-                            tracing::warn!(%key, error = %format!("{e:#}"), "could not remove local copy");
-                        }
-                    }
-                }
+                remove_local_copies(store, db, recording_id, &keys);
                 tracing::info!(%recording_id, "local audio removed after backup");
             }
             Ok(StageOutcome::Done)
@@ -572,6 +561,53 @@ fn load_manifest(
 fn may_delete_local(settings: &crate::config::Settings, transcribed: bool) -> bool {
     settings.remote_storage.delete_local_after_upload
         && (transcribed || !settings.transcription.enabled)
+}
+
+/// Removes the local copies a confirmed backup makes redundant.
+///
+/// Chunks and a kept original. The mixed export stays, and it is what the
+/// player reads: there is no path that streams audio back out of the bucket,
+/// so removing it would leave a recording that is backed up and unplayable.
+/// That makes this reclaim the chunks' share of a recording rather than all of
+/// it, which the setting's wording should not overstate. An original is
+/// different: nothing here needs it once the audio is decoded, and it is
+/// usually the largest object a recording has.
+///
+/// The index stops calling the original local only once it is actually gone,
+/// so the interface never offers to play a file that is not there and never
+/// hides one that is.
+fn remove_local_copies(
+    store: &dyn BlobStore,
+    db: &Arc<Mutex<Db>>,
+    recording_id: Ulid,
+    keys: &[kaseta_contracts::BlobKey],
+) {
+    let mut original_removed = false;
+    for key in keys {
+        let original = crate::library::is_original(key);
+        if !(original || key.as_str().contains("/tracks/")) {
+            continue;
+        }
+        match store.delete(key) {
+            Ok(()) => original_removed |= original,
+            Err(e) => {
+                tracing::warn!(%key, error = %format!("{e:#}"), "could not remove local copy")
+            }
+        }
+    }
+    if original_removed {
+        let result = db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))
+            .and_then(|guard| crate::library::forget_local_original(&guard, recording_id));
+        if let Err(e) = result {
+            tracing::warn!(
+                %recording_id,
+                error = %format!("{e:#}"),
+                "could not record the original as removed"
+            );
+        }
+    }
 }
 
 /// What a stage did, as distinct from whether it failed.
@@ -1077,6 +1113,101 @@ mod tests {
             "an untranscribed recording must keep the audio transcription needs"
         );
         assert!(may_delete_local(&settings, true));
+    }
+
+    fn original_local(db: &Arc<Mutex<Db>>, rec: Ulid) -> i64 {
+        db.lock()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT original_local FROM recordings WHERE id = ?1",
+                rusqlite::params![rec.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// After a confirmed backup the chunks and a kept original go, and the
+    /// index stops calling the original local in the same pass. The mixed
+    /// export and the metadata stay: they are what the player and the library
+    /// read, and nothing streams them back from the bucket.
+    #[test]
+    fn removing_local_copies_takes_chunks_and_the_original() {
+        let (db, rec) = db_with_recording();
+        db.lock()
+            .unwrap()
+            .conn()
+            .execute(
+                "UPDATE recordings SET origin = 'imported', original_local = 1 WHERE id = ?1",
+                rusqlite::params![rec.to_string()],
+            )
+            .unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::blobstore::LocalFsStore::new(dir.path()).unwrap();
+        let prefix = kaseta_contracts::RecordingPrefix::new(
+            rec,
+            time::OffsetDateTime::UNIX_EPOCH,
+        );
+        let chunk = kaseta_contracts::BlobKey::new(format!(
+            "{}/tracks/a_imported_01/000000.flac",
+            prefix.root()
+        ))
+        .unwrap();
+        let original = prefix.original("mp4").unwrap();
+        let mixed = prefix.export("mixed.flac").unwrap();
+        let manifest = prefix.manifest();
+        for key in [&chunk, &original, &mixed, &manifest] {
+            store.put(key, b"x").unwrap();
+        }
+        let keys = store.list_prefix(prefix.root().as_str()).unwrap();
+
+        remove_local_copies(&store, &db, rec, &keys);
+
+        assert!(!store.exists(&chunk).unwrap());
+        assert!(!store.exists(&original).unwrap());
+        assert!(store.exists(&mixed).unwrap(), "the player reads the mixed export");
+        assert!(store.exists(&manifest).unwrap());
+        assert_eq!(original_local(&db, rec), 0);
+    }
+
+    /// A captured recording has no original, and its index row is left as it
+    /// was.
+    #[test]
+    fn removing_local_copies_of_a_capture_touches_only_its_chunks() {
+        let (db, rec) = db_with_recording();
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::blobstore::LocalFsStore::new(dir.path()).unwrap();
+        let prefix = kaseta_contracts::RecordingPrefix::new(
+            rec,
+            time::OffsetDateTime::UNIX_EPOCH,
+        );
+        let chunk = kaseta_contracts::BlobKey::new(format!(
+            "{}/tracks/a_local-mic_01/000000.flac",
+            prefix.root()
+        ))
+        .unwrap();
+        let mixed = prefix.export("mixed.flac").unwrap();
+        store.put(&chunk, b"x").unwrap();
+        store.put(&mixed, b"x").unwrap();
+        let updated_before: i64 = db
+            .lock()
+            .unwrap()
+            .conn()
+            .query_row("SELECT updated_at FROM recordings", [], |r| r.get(0))
+            .unwrap();
+
+        let keys = store.list_prefix(prefix.root().as_str()).unwrap();
+        remove_local_copies(&store, &db, rec, &keys);
+
+        assert!(!store.exists(&chunk).unwrap());
+        assert!(store.exists(&mixed).unwrap());
+        let updated_after: i64 = db
+            .lock()
+            .unwrap()
+            .conn()
+            .query_row("SELECT updated_at FROM recordings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(updated_before, updated_after, "nothing about the row changed");
     }
 
     #[test]
