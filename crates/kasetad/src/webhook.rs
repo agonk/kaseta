@@ -27,23 +27,10 @@ use crate::config::WebhookSettings;
 /// mis-transcribed far more often than it is a real meeting.
 const MAX_TRANSCRIPT_CHARS: usize = 500_000;
 
-/// A failure that retrying cannot fix.
-///
-/// The scheduler treats every stage error as retryable, which is right for a
-/// missing worker or a transient read and wrong for an HTTP 4xx: a payload
-/// the receiver rejected will be rejected identically on every attempt until the
-/// attempt budget runs out, and the failure somebody needs to see is buried
-/// until then.
-#[derive(Debug)]
-pub struct Permanent(pub String);
-
-impl std::fmt::Display for Permanent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Permanent {}
+/// A failure that retrying cannot fix, such as an HTTP 4xx: a payload the
+/// receiver rejected is rejected identically on every attempt. The scheduler's
+/// own type, so one check covers every stage that can say this.
+pub use crate::scheduler::Permanent;
 
 /// A short, stable name for *this* transcript's content.
 ///

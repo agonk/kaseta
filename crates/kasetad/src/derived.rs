@@ -247,10 +247,15 @@ pub fn is_dirty(db: &Db, recording_id: Ulid) -> Result<bool> {
         != 0)
 }
 
+/// Recordings with `column` set that are ready to be worked on.
+///
+/// Ready only: an import still decoding has no manifest or audio yet, and one
+/// that failed never will. Storing or backing either up would copy a prefix
+/// that is still being written, or one that holds nothing worth keeping.
 fn flagged(db: &Db, column: &str) -> Result<Vec<(Ulid, time::OffsetDateTime)>> {
     let sql = format!(
         "SELECT id, started_at FROM recordings
-         WHERE {column} = 1 AND deleted_at IS NULL
+         WHERE {column} = 1 AND deleted_at IS NULL AND status = 'ready'
          ORDER BY started_at"
     );
     let mut stmt = db.conn().prepare(&sql)?;
@@ -806,6 +811,36 @@ mod tests {
         let settings = crate::config::Settings::default();
         assert_eq!(requeue_dirty(&db, &settings).unwrap(), 0);
         assert!(is_dirty(&db, id).unwrap(), "the flag must survive for later");
+    }
+
+    /// An import still decoding, or one that failed, is not something to back
+    /// up or store beside, whatever its flags say.
+    #[test]
+    fn an_unfinished_import_is_never_queued_for_backup_or_healed() {
+        let db = Db::open_in_memory().unwrap();
+        let mut settings = crate::config::Settings::default();
+        settings.remote_storage.enabled = true;
+
+        for status in ["processing", "failed"] {
+            let id = Ulid::new();
+            db.create_import(&crate::db::NewImport {
+                recording_id: id,
+                started_at: datetime!(2026-10-09 08:00:00 UTC),
+                title: "Lecture".into(),
+            })
+            .unwrap();
+            db.conn()
+                .execute(
+                    "UPDATE recordings SET status = ?2, derived_dirty = 1, remote_dirty = 1
+                     WHERE id = ?1",
+                    rusqlite::params![id.to_string(), status],
+                )
+                .unwrap();
+        }
+
+        assert!(dirty_recordings(&db).unwrap().is_empty());
+        assert!(remote_dirty_recordings(&db).unwrap().is_empty());
+        assert_eq!(requeue_dirty(&db, &settings).unwrap(), 0);
     }
 
     /// With backup switched off there is no upload to clear the flag, so a

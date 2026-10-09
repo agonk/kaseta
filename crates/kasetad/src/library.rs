@@ -18,7 +18,7 @@ use serde::Serialize;
 use ulid::Ulid;
 
 use crate::blobstore::BlobStore;
-use crate::db::{Db, LOCAL_OWNER_ID};
+use crate::db::{Db, IndexFields, LOCAL_OWNER_ID};
 
 /// One recording, as the interface sees it.
 #[derive(Clone, Debug, Serialize)]
@@ -160,16 +160,65 @@ pub fn reconcile(store: &dyn BlobStore, db: &Db) -> Result<usize> {
 ///
 /// Which exports exist is resolved here, once, rather than by scanning storage
 /// on every list request.
+///
+/// An import that has not finished, still decoding or failed, is left exactly
+/// as it is. Only its own finalisation declares an import ready, because only
+/// that knows the decode it belongs to is still the one wanted; a manifest
+/// found by the reconciler may be what an overtaken attempt left behind.
 pub fn index_recording(
     store: &dyn BlobStore,
     db: &Db,
     manifest: &RecordingManifest,
 ) -> Result<()> {
     let prefix = prefix_for(manifest.recording_id, manifest.started_at);
-    let exported: Vec<BlobKey> = store
-        .list_prefix(prefix.root().as_str())
-        .unwrap_or_default()
-        .into_iter()
+    let keys = store.list_prefix(prefix.root().as_str()).unwrap_or_default();
+    let fields = index_fields(manifest, &keys);
+
+    db.conn().execute(
+        "INSERT INTO recordings
+             (id, owner_id, status, title, started_at, ended_at, manifest_version,
+              clock_started_ns, duration_ms, has_mixed, tracks_json,
+              origin, source_json, original_local)
+         VALUES (?1, ?2, 'ready', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         ON CONFLICT(id) DO UPDATE SET
+             status         = excluded.status,
+             ended_at       = excluded.ended_at,
+             duration_ms    = excluded.duration_ms,
+             has_mixed      = excluded.has_mixed,
+             tracks_json    = excluded.tracks_json,
+             origin         = excluded.origin,
+             source_json    = excluded.source_json,
+             original_local = excluded.original_local,
+             updated_at     = strftime('%s','now')
+         WHERE NOT (recordings.origin = 'imported'
+                    AND recordings.status IN ('processing','failed'))",
+        params![
+            manifest.recording_id.to_string(),
+            LOCAL_OWNER_ID,
+            fields.title,
+            fields.started_at,
+            fields.ended_at,
+            fields.manifest_version,
+            fields.clock_started_ns,
+            fields.duration_ms,
+            fields.has_mixed as i64,
+            fields.tracks_json,
+            fields.origin.as_str(),
+            fields.source_json,
+            fields.original_local as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+/// What the index holds about a recording, from its manifest and the keys
+/// under its prefix.
+///
+/// Pure, so that indexing and an import's finalisation compute the same thing
+/// from the same inputs rather than two versions of it that drift apart.
+pub fn index_fields(manifest: &RecordingManifest, keys: &[BlobKey]) -> IndexFields {
+    let exported: Vec<&BlobKey> = keys
+        .iter()
         .filter(|k| k.as_str().contains("/exports/"))
         .collect();
 
@@ -189,32 +238,31 @@ pub fn index_recording(
         })
         .collect();
 
-    db.conn().execute(
-        "INSERT INTO recordings
-             (id, owner_id, status, title, started_at, ended_at, manifest_version,
-              clock_started_ns, duration_ms, has_mixed, tracks_json)
-         VALUES (?1, ?2, 'ready', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-         ON CONFLICT(id) DO UPDATE SET
-             status      = excluded.status,
-             ended_at    = excluded.ended_at,
-             duration_ms = excluded.duration_ms,
-             has_mixed   = excluded.has_mixed,
-             tracks_json = excluded.tracks_json,
-             updated_at  = strftime('%s','now')",
-        params![
-            manifest.recording_id.to_string(),
-            LOCAL_OWNER_ID,
-            manifest.notes.title,
-            manifest.started_at.unix_timestamp(),
-            manifest.ended_at.map(|t| t.unix_timestamp()),
-            manifest.manifest_version,
-            manifest.canonical_clock.started_at_ns as i64,
-            duration_ms(manifest),
-            has_mixed as i64,
-            serde_json::to_string(&tracks).unwrap_or_else(|_| "[]".into()),
-        ],
-    )?;
-    Ok(())
+    // Present only while the kept original is still in this store. The
+    // manifest goes on naming it after local copies are removed, because the
+    // bucket still holds it.
+    let original_local = manifest
+        .source
+        .as_ref()
+        .and_then(|s| s.original_key.as_ref())
+        .is_some_and(|key| keys.contains(key));
+
+    IndexFields {
+        title: manifest.notes.title.clone(),
+        started_at: manifest.started_at.unix_timestamp(),
+        ended_at: manifest.ended_at.map(|t| t.unix_timestamp()),
+        manifest_version: manifest.manifest_version.clone(),
+        clock_started_ns: manifest.canonical_clock.started_at_ns as i64,
+        duration_ms: duration_ms(manifest),
+        has_mixed,
+        tracks_json: serde_json::to_string(&tracks).unwrap_or_else(|_| "[]".into()),
+        origin: manifest.origin(),
+        source_json: manifest
+            .source
+            .as_ref()
+            .and_then(|s| serde_json::to_string(s).ok()),
+        original_local,
+    }
 }
 
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
@@ -495,6 +543,9 @@ fn describe_track(track_id: &str) -> (&'static str, &'static str) {
         ("local_mic", "You")
     } else if track_id.contains("remote-mix") {
         ("remote_mix", "Everyone else")
+    } else if track_id.starts_with("a_imported_") {
+        // One mixed track from a file, carrying every voice in it.
+        ("unattributed", "Speaker")
     } else {
         ("unknown", "Audio")
     }
@@ -766,5 +817,259 @@ mod tests {
         assert_eq!(describe_track("a_local-mic_01"), ("local_mic", "You"));
         assert_eq!(describe_track("a_remote-mix_01"), ("remote_mix", "Everyone else"));
         assert_eq!(describe_track("something_else"), ("unknown", "Audio"));
+    }
+
+    /// An imported file's one track carries every voice, so it is neither
+    /// "You" nor "Everyone else".
+    #[test]
+    fn an_imported_track_is_a_speaker() {
+        assert_eq!(
+            describe_track(kaseta_contracts::IMPORTED_TRACK_ID),
+            ("unattributed", "Speaker")
+        );
+    }
+
+    use kaseta_contracts::manifest::{ClockDomain, RecordingNotes, Timeline};
+    use kaseta_contracts::{
+        CanonicalClock, Chunk, ClockKind, ImportSource, MediaType, Origin, RecordingPrefix, Track,
+        TrackFormat, TrackId, TrackRole, TrackSource, MANIFEST_VERSION,
+    };
+
+    const STARTED: time::OffsetDateTime = datetime!(2026-10-09 08:00:00 UTC);
+
+    /// A one-track manifest: imported when `source` is given, captured
+    /// otherwise.
+    fn manifest(id: Ulid, source: Option<ImportSource>) -> RecordingManifest {
+        let imported = source.is_some();
+        let track_id = TrackId::new(if imported {
+            kaseta_contracts::IMPORTED_TRACK_ID
+        } else {
+            "a_local-mic_01"
+        })
+        .unwrap();
+        let prefix = RecordingPrefix::new(id, STARTED);
+        RecordingManifest {
+            manifest_version: MANIFEST_VERSION.into(),
+            recording_id: id,
+            started_at: STARTED,
+            ended_at: Some(STARTED + time::Duration::seconds(2)),
+            canonical_clock: CanonicalClock {
+                kind: ClockKind::BoottimeNs,
+                started_at_ns: 7_000_000_000,
+            },
+            timeline: Timeline {
+                master_track_id: track_id.clone(),
+                nominal_sample_rate_hz: 48_000,
+            },
+            tracks: vec![Track {
+                track_id: track_id.clone(),
+                media_type: MediaType::Audio,
+                role: if imported { TrackRole::Unattributed } else { TrackRole::LocalMic },
+                source: if imported {
+                    TrackSource::ImportedFile { stream_index: 1 }
+                } else {
+                    TrackSource::Microphone {
+                        node_name: "alsa_input.test".into(),
+                        display_name: "Test".into(),
+                    }
+                },
+                clock_domain: ClockDomain {
+                    source_clock: "test".into(),
+                    device_clock_id: None,
+                },
+                format: TrackFormat {
+                    container: "flac".into(),
+                    codec: "flac".into(),
+                    sample_rate_hz: Some(48_000),
+                    channels: Some(1),
+                    sample_format: Some("s16".into()),
+                },
+                chunks: vec![Chunk {
+                    seq: 0,
+                    blob: prefix.chunk(&track_id, 0, "flac"),
+                    sha256: "0".repeat(64),
+                    bytes: 1,
+                    sample_count: Some(96_000),
+                    boottime_start_ns: 7_000_000_000,
+                    boottime_end_ns: 9_000_000_000,
+                    source_pts_start_ns: None,
+                    source_pts_end_ns: None,
+                    discontinuity: false,
+                    gap_before_ns: 0,
+                    drops_before_chunk: 0,
+                }],
+            }],
+            notes: RecordingNotes {
+                title: Some("Lecture 3".into()),
+                ..RecordingNotes::default()
+            },
+            source,
+        }
+    }
+
+    fn import_source(original_key: Option<BlobKey>) -> ImportSource {
+        ImportSource {
+            original_filename: "lecture.mp4".into(),
+            original_key,
+            original_bytes: 10,
+            original_sha256: "ab".repeat(32),
+            container: "mov".into(),
+            codec: "aac".into(),
+            media_kind: MediaType::Video,
+            media_created_at: None,
+            imported_at: STARTED,
+            duration_s: 2.0,
+        }
+    }
+
+    fn keys(prefix: &RecordingPrefix, names: &[&str]) -> Vec<BlobKey> {
+        names.iter().map(|n| prefix.root().join(n).unwrap()).collect()
+    }
+
+    #[test]
+    fn a_captured_recording_is_indexed_as_one() {
+        let id = Ulid::new();
+        let prefix = RecordingPrefix::new(id, STARTED);
+        let fields = index_fields(
+            &manifest(id, None),
+            &keys(&prefix, &["manifest.json", "exports/a_local-mic_01.flac", "exports/mixed.flac"]),
+        );
+
+        assert_eq!(fields.origin, Origin::Captured);
+        assert_eq!(fields.source_json, None);
+        assert!(!fields.original_local);
+        assert!(fields.has_mixed);
+        assert_eq!(fields.duration_ms, 2_000);
+        assert_eq!(fields.clock_started_ns, 7_000_000_000);
+        assert_eq!(fields.started_at, STARTED.unix_timestamp());
+        assert_eq!(fields.title.as_deref(), Some("Lecture 3"));
+        assert_eq!(
+            fields.tracks_json,
+            r#"[{"track_id":"a_local-mic_01","role":"local_mic"}]"#
+        );
+    }
+
+    #[test]
+    fn an_imported_recording_carries_its_source_into_the_index() {
+        let id = Ulid::new();
+        let prefix = RecordingPrefix::new(id, STARTED);
+        let original = prefix.original("mp4").unwrap();
+        let m = manifest(id, Some(import_source(Some(original.clone()))));
+
+        let with_original = index_fields(
+            &m,
+            &[
+                keys(&prefix, &["exports/a_imported_01.flac", "exports/mixed.flac"]),
+                vec![original],
+            ]
+            .concat(),
+        );
+        assert_eq!(with_original.origin, Origin::Imported);
+        assert!(with_original.original_local);
+        let cached: ImportSource =
+            serde_json::from_str(with_original.source_json.as_deref().unwrap()).unwrap();
+        assert_eq!(cached, import_source(m.source.as_ref().unwrap().original_key.clone()));
+        assert_eq!(
+            with_original.tracks_json,
+            r#"[{"track_id":"a_imported_01","role":"unattributed"}]"#
+        );
+
+        // Removed locally after backup: the manifest still names it, but it
+        // is not here to play.
+        let without = index_fields(&m, &keys(&prefix, &["exports/mixed.flac"]));
+        assert!(!without.original_local);
+    }
+
+    /// The index is disposable: rebuilt from storage, an import must come
+    /// back as an import, with its source.
+    #[test]
+    fn rebuilding_the_index_restores_an_import() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::blobstore::LocalFsStore::new(dir.path()).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let id = Ulid::new();
+        let prefix = RecordingPrefix::new(id, STARTED);
+        let original = prefix.original("mp4").unwrap();
+        store.put(&original, b"original bytes").unwrap();
+        let m = manifest(id, Some(import_source(Some(original))));
+
+        index_recording(&store, &db, &m).unwrap();
+
+        let (status, origin, source_json, original_local): (String, String, Option<String>, i64) =
+            db.conn()
+                .query_row(
+                    "SELECT status, origin, source_json, original_local FROM recordings
+                     WHERE id = ?1",
+                    params![id.to_string()],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+        assert_eq!((status.as_str(), origin.as_str()), ("ready", "imported"));
+        assert!(source_json.unwrap().contains("lecture.mp4"));
+        assert_eq!(original_local, 1);
+    }
+
+    /// Only finalisation may declare an import ready. Indexing a manifest left
+    /// behind by an attempt that was overtaken must not promote a row that is
+    /// still decoding, or one that failed.
+    #[test]
+    fn indexing_never_promotes_an_unfinished_import() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::blobstore::LocalFsStore::new(dir.path()).unwrap();
+        let db = Db::open_in_memory().unwrap();
+
+        for status in ["processing", "failed"] {
+            let id = Ulid::new();
+            db.create_import(&crate::db::NewImport {
+                recording_id: id,
+                started_at: STARTED,
+                title: "Lecture 3".into(),
+            })
+            .unwrap();
+            db.conn()
+                .execute(
+                    "UPDATE recordings SET status = ?2 WHERE id = ?1",
+                    params![id.to_string(), status],
+                )
+                .unwrap();
+
+            index_recording(&store, &db, &manifest(id, Some(import_source(None)))).unwrap();
+
+            let (now, source_json): (String, Option<String>) = db
+                .conn()
+                .query_row(
+                    "SELECT status, source_json FROM recordings WHERE id = ?1",
+                    params![id.to_string()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(now, status);
+            assert_eq!(source_json, None, "the row is left exactly as it was");
+        }
+    }
+
+    /// A captured recording indexed again is refreshed as before.
+    #[test]
+    fn indexing_a_captured_recording_again_refreshes_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::blobstore::LocalFsStore::new(dir.path()).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let id = Ulid::new();
+        let mut m = manifest(id, None);
+
+        index_recording(&store, &db, &m).unwrap();
+        m.tracks[0].chunks[0].sample_count = Some(480_000);
+        index_recording(&store, &db, &m).unwrap();
+
+        let (duration, origin): (i64, String) = db
+            .conn()
+            .query_row(
+                "SELECT duration_ms, origin FROM recordings WHERE id = ?1",
+                params![id.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(duration, 10_000);
+        assert_eq!(origin, "captured");
     }
 }

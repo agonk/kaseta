@@ -43,17 +43,56 @@ const TOKEN_HEADER: &str = "x-kaseta-token";
 /// site would let it start or stop recording. The same-origin policy stops that
 /// site reading the token out of our page, so requiring it on every mutation is
 /// what makes the difference.
-fn mint_token() -> String {
-    // Derived from process-unique, time-varying values rather than a CSPRNG
-    // dependency: this only needs to be unguessable by a page that cannot read
-    // it, not to resist offline attack.
-    let seed = format!(
-        "{}-{}-{:?}",
-        std::process::id(),
-        crate::clock::boottime_ns(),
-        std::time::SystemTime::now()
-    );
-    crate::blobstore::sha256_hex(seed.as_bytes())
+///
+/// Drawn from the operating system's generator. A token derived from the PID
+/// and the clock is guessable by anyone who can estimate when the daemon
+/// started, and it now guards uploads of arbitrary size as well as recording.
+fn mint_token() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| anyhow::anyhow!("reading the system random number generator: {e}"))?;
+    Ok(hex::encode(bytes))
+}
+
+/// Whether a request's `Host` names this daemon.
+///
+/// DNS rebinding is the attack the token cannot stop: a hostile page whose
+/// name is re-pointed at 127.0.0.1 becomes same-origin with itself while
+/// talking to us, so the browser lets it read our replies, the token
+/// included. Its requests still carry its own name in `Host`, which no page
+/// script can change. Only the loopback names, on our port, are accepted.
+fn host_allowed(host: Option<&str>, port: u16) -> bool {
+    let Some(host) = host else { return false };
+    let host = host.trim().to_ascii_lowercase();
+    ["127.0.0.1", "localhost", "[::1]"].iter().any(|name| {
+        host == format!("{name}:{port}") || (port == 80 && host == *name)
+    })
+}
+
+/// Refuses every request whose `Host` is not this daemon's own.
+fn guard_host(router: Router, port: u16) -> Router {
+    router.layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| async move {
+            // HTTP/2 carries the name in the URI rather than a header.
+            let host = request
+                .headers()
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+                .or_else(|| request.uri().authority().map(|a| a.to_string()));
+            if host_allowed(host.as_deref(), port) {
+                next.run(request).await
+            } else {
+                ApiError {
+                    status: StatusCode::MISDIRECTED_REQUEST,
+                    message: "this address does not name the Kaseta daemon; open it through \
+                              127.0.0.1 or localhost"
+                        .into(),
+                }
+                .into_response()
+            }
+        },
+    ))
 }
 
 #[derive(Clone)]
@@ -72,6 +111,7 @@ pub fn router(
     store: Arc<dyn BlobStore>,
     db: Arc<Mutex<Db>>,
     token: Arc<String>,
+    port: u16,
 ) -> Router {
     let state = AppState {
         supervisor,
@@ -80,7 +120,7 @@ pub fn router(
         token,
     };
 
-    Router::new()
+    let routes = Router::new()
         .route("/", get(index))
         .route("/api/v1/status", get(status))
         .route("/api/v1/token", get(session_token))
@@ -98,7 +138,9 @@ pub fn router(
         .route("/api/v1/recordings/{id}/transcript.txt", get(transcript_text))
         .route("/api/v1/search", get(search))
         .route("/api/v1/settings", get(get_settings).put(put_settings))
-        .with_state(state)
+        .with_state(state);
+
+    guard_host(routes, port)
 }
 
 /// Serves the interface on loopback.
@@ -108,7 +150,7 @@ pub async fn serve(
     db: Arc<Mutex<Db>>,
     port: u16,
 ) -> Result<()> {
-    let token = Arc::new(mint_token());
+    let token = Arc::new(mint_token()?);
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -117,7 +159,7 @@ pub async fn serve(
     println!("Kaseta is running at http://{addr}");
     println!("Press Ctrl-C to stop.\n");
 
-    axum::serve(listener, router(supervisor, store, db, token))
+    axum::serve(listener, router(supervisor, store, db, token, port))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("serving HTTP")?;
@@ -917,10 +959,71 @@ mod tests {
     fn every_run_mints_a_different_token() {
         // A predictable token would defeat the point: a hostile page could
         // simply guess it.
-        let a = mint_token();
-        let b = mint_token();
+        let a = mint_token().unwrap();
+        let b = mint_token().unwrap();
         assert_ne!(a, b);
         assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    /// Sends one request with the given `Host` through the same guard the
+    /// daemon's router uses, and reports the status it got back.
+    async fn status_for_host(host: Option<&str>) -> StatusCode {
+        use tower::ServiceExt;
+
+        let routes = Router::new().route("/api/v1/token", get(|| async { "secret" }));
+        let app = guard_host(routes, 7777);
+        let mut request = axum::http::Request::builder().uri("/api/v1/token");
+        if let Some(host) = host {
+            request = request.header(header::HOST, host);
+        }
+        app.oneshot(request.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn the_daemon_answers_to_its_own_loopback_names() {
+        for host in ["127.0.0.1:7777", "localhost:7777", "[::1]:7777", "LocalHost:7777"] {
+            assert_eq!(status_for_host(Some(host)).await, StatusCode::OK, "{host}");
+        }
+    }
+
+    /// DNS rebinding: a hostile page whose name has been re-pointed at
+    /// 127.0.0.1 is same-origin with itself, so the browser lets it read the
+    /// reply, including the token. The `Host` it sends still names the hostile
+    /// site, and that is what is refused.
+    #[tokio::test]
+    async fn any_other_host_is_refused() {
+        for host in [
+            Some("evil.example:7777"),
+            Some("evil.example"),
+            Some("127.0.0.1.evil.example:7777"),
+            Some("localhost.evil.example:7777"),
+            // The right name on the wrong port is a different service.
+            Some("127.0.0.1:8080"),
+            Some("localhost"),
+            Some("127.0.0.1:7777.evil.example"),
+            Some("127.0.0.2:7777"),
+            Some("0.0.0.0:7777"),
+            Some(""),
+            None,
+        ] {
+            assert_eq!(
+                status_for_host(host).await,
+                StatusCode::MISDIRECTED_REQUEST,
+                "{host:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_http_port_may_be_left_out_of_the_host() {
+        // Browsers omit `:80`, so a daemon on port 80 sees a bare name.
+        assert!(host_allowed(Some("localhost"), 80));
+        assert!(host_allowed(Some("localhost:80"), 80));
+        assert!(!host_allowed(Some("localhost"), 7777));
     }
 
     #[test]

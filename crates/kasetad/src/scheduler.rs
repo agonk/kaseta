@@ -134,7 +134,8 @@ fn run(
 
         match claim(&db) {
             Ok(Some(job)) => {
-                let outcome = execute(&*store, &db, &storage_root, job.job_type, job.recording_id);
+                let outcome =
+                    execute(&*store, &db, &storage_root, job.id, job.job_type, job.recording_id);
                 finish(&db, job.id, job.job_type, job.recording_id, outcome);
             }
             Ok(None) => std::thread::sleep(IDLE_POLL),
@@ -172,6 +173,15 @@ pub fn why_not_runnable(
     recording_id: Ulid,
     job_type: JobType,
 ) -> Result<Option<String>> {
+    // An import that has not finished decoding has no manifest, no audio and
+    // nothing derived from either, so every other stage waits for it. Asked
+    // first because it is true whatever the settings say.
+    if job_type != JobType::ImportMedia {
+        if let Some(reason) = unfinished_import(db, recording_id)? {
+            return Ok(Some(reason));
+        }
+    }
+
     Ok(match job_type {
         JobType::Summarize => {
             if !settings.summaries.enabled {
@@ -218,6 +228,29 @@ pub fn why_not_runnable(
             }
         }
         JobType::FinalizeRecording | JobType::MergeTranscript => None,
+        // Whether the uploaded file is still there to decode is a question
+        // about storage, which the stage answers for itself when it runs.
+        JobType::ImportMedia => None,
+    })
+}
+
+/// Why an imported recording is not ready for anything else yet, if it is not.
+fn unfinished_import(db: &Db, recording_id: Ulid) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    let status: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT status FROM recordings WHERE id = ?1 AND origin = 'imported'",
+            rusqlite::params![recording_id.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(match status.as_deref() {
+        None | Some("ready") => None,
+        Some("failed") => {
+            Some("the file could not be imported, so there is nothing to work on".into())
+        }
+        Some(_) => Some("the recording is still being imported".into()),
     })
 }
 
@@ -225,9 +258,18 @@ fn execute(
     store: &dyn BlobStore,
     db: &Arc<Mutex<Db>>,
     storage_root: &str,
+    job_id: Ulid,
     job_type: JobType,
     recording_id: Ulid,
 ) -> Result<StageOutcome> {
+    // Decoding is what produces the manifest, so it is dispatched before one
+    // is read. It also skips the generic precondition check below: whether it
+    // can run depends on its upload still being in storage, and a missing
+    // upload is a failure to show on the recording rather than a quiet skip.
+    if job_type == JobType::ImportMedia {
+        return import_media(store, db, job_id, recording_id);
+    }
+
     let manifest = load_manifest(store, db, recording_id)?;
     let settings = crate::config::Settings::load().unwrap_or_default();
 
@@ -465,7 +507,24 @@ fn execute(
         JobType::FinalizeRecording | JobType::MergeTranscript => Ok(StageOutcome::Skipped(
             "this stage is handled elsewhere in the pipeline".into(),
         )),
+        // Dispatched above, before any manifest exists.
+        JobType::ImportMedia => Err(anyhow::anyhow!(
+            "decoding an import is dispatched before the manifest is read"
+        )),
     }
+}
+
+/// Decodes an uploaded file into a recording.
+///
+/// This build carries no decoder, so the stage ends permanently rather than
+/// spending its attempts on a failure no retry can change.
+fn import_media(
+    _store: &dyn BlobStore,
+    _db: &Arc<Mutex<Db>>,
+    _job_id: Ulid,
+    _recording_id: Ulid,
+) -> Result<StageOutcome> {
+    Err(Permanent("this build cannot decode imported files".into()).into())
 }
 
 /// Reads a recording's manifest, which every stage needs.
@@ -526,7 +585,31 @@ pub enum StageOutcome {
     Done,
     /// Nothing to do, and why — in words meant for a person.
     Skipped(String),
+    /// The stage recorded its own success, and queued what follows, in the
+    /// same transaction as its result. Only decoding an import does this: its
+    /// result and its success must not be separable by a crash, so there is
+    /// nothing left for [`finish`] to record.
+    #[allow(dead_code)]
+    Finalized,
 }
+
+/// A failure that retrying cannot fix.
+///
+/// Every stage error is retryable unless it says otherwise, which is right for
+/// a missing worker or a transient read and wrong for a statement about the
+/// input: a payload the receiver rejected, or a file with no audio in it, will
+/// fail identically on every attempt, and the reason somebody needs to read is
+/// buried until the attempt budget runs out.
+#[derive(Debug)]
+pub struct Permanent(pub String);
+
+impl std::fmt::Display for Permanent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Permanent {}
 
 /// Whether finishing this stage is the moment to send the recording.
 ///
@@ -554,7 +637,11 @@ fn next_stage(job_type: JobType) -> Option<JobType> {
         // most worth having a copy of, so it is queued at finalisation and
         // brought round again by the sweep whenever anything derived changes.
         JobType::Transcribe => Some(JobType::Summarize),
-        JobType::Summarize
+        // Decoding an import is followed by transcription and backup, but they
+        // are queued by finalisation, in the transaction that indexes the
+        // recording, rather than here.
+        JobType::ImportMedia
+        | JobType::Summarize
         | JobType::UploadRemote
         | JobType::PublishWebhook
         | JobType::FinalizeRecording
@@ -574,7 +661,26 @@ fn finish(
         return;
     };
 
+    // Deleting a recording while it is being imported takes the job with it.
+    // That is the deletion working, not a failure to report.
+    if job_type == JobType::ImportMedia {
+        match guard.job(job_id) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                tracing::info!(%recording_id, "the import's recording was deleted while it ran");
+                return;
+            }
+            Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), "could not read the import's job");
+                return;
+            }
+        }
+    }
+
     match outcome {
+        Ok(StageOutcome::Finalized) => {
+            tracing::debug!(?job_type, %recording_id, "stage recorded its own success");
+        }
         Ok(stage) => {
             if let Err(e) = guard.transition_job(job_id, JobState::Succeeded) {
                 tracing::error!(error = %format!("{e:#}"), "could not record success");
@@ -643,10 +749,18 @@ fn finish(
             // the receiver rejected will be rejected identically every time — and
             // burying those behind an attempt budget hides the one thing the
             // person needs to read.
-            let retryable = e.downcast_ref::<crate::webhook::Permanent>().is_none();
+            let retryable = e.downcast_ref::<Permanent>().is_none();
             tracing::error!(?job_type, retryable, error = %message, "job failed");
-            if let Err(e) = guard.fail_job(job_id, "job_failed", &message, retryable) {
-                tracing::error!(error = %format!("{e:#}"), "could not record failure");
+            match guard.fail_job(job_id, "job_failed", &message, retryable) {
+                // However an import ends for good, its recording ends with it:
+                // nothing else will ever move the row out of "processing".
+                Ok(JobState::FailedTerminal) if job_type == JobType::ImportMedia => {
+                    if let Err(e) = guard.fail_import_terminal(recording_id, job_id, &message) {
+                        tracing::error!(error = %format!("{e:#}"), "could not fail the import");
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => tracing::error!(error = %format!("{e:#}"), "could not record failure"),
             }
         }
     }
@@ -987,6 +1101,218 @@ mod tests {
 }
 
 #[cfg(test)]
+mod import_tests {
+    use super::*;
+    use crate::db::{IndexFields, NewImport};
+    use kaseta_contracts::Origin;
+
+    fn running_import() -> (Arc<Mutex<Db>>, Ulid, kaseta_contracts::Job) {
+        let db = Db::open_in_memory().unwrap();
+        let rec = Ulid::new();
+        db.create_import(&NewImport {
+            recording_id: rec,
+            started_at: time::macros::datetime!(2026-10-09 08:00:00 UTC),
+            title: "Lecture".into(),
+        })
+        .unwrap();
+        let db = Arc::new(Mutex::new(db));
+        let job = claim(&db).unwrap().unwrap();
+        assert_eq!(job.job_type, JobType::ImportMedia);
+        (db, rec, job)
+    }
+
+    fn status_of(db: &Arc<Mutex<Db>>, rec: Ulid) -> String {
+        db.lock()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT status FROM recordings WHERE id = ?1",
+                rusqlite::params![rec.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn fields() -> IndexFields {
+        IndexFields {
+            title: None,
+            started_at: 0,
+            ended_at: None,
+            manifest_version: kaseta_contracts::MANIFEST_VERSION.into(),
+            clock_started_ns: 1,
+            duration_ms: 1_000,
+            has_mixed: true,
+            tracks_json: "[]".into(),
+            origin: Origin::Imported,
+            source_json: None,
+            original_local: false,
+        }
+    }
+
+    /// A file with no audio in it will have none on the next attempt either,
+    /// and the person needs to read why on the recording, not on a job.
+    #[test]
+    fn a_permanent_import_failure_fails_the_recording_at_once() {
+        let (db, rec, job) = running_import();
+        finish(
+            &db,
+            job.id,
+            job.job_type,
+            rec,
+            Err(Permanent("This file has no audio track".into()).into()),
+        );
+
+        let guard = db.lock().unwrap();
+        let after = guard.job(job.id).unwrap().unwrap();
+        assert_eq!(after.state, JobState::FailedTerminal);
+        assert_eq!(after.error_message.as_deref(), Some("This file has no audio track"));
+        drop(guard);
+        assert_eq!(status_of(&db, rec), "failed");
+    }
+
+    /// Retryable failures come back around, and the recording keeps reading
+    /// "processing" while they do. Once the budget is spent it fails like any
+    /// other terminal end.
+    #[test]
+    fn an_import_that_runs_out_of_attempts_fails_the_recording() {
+        let (db, rec, mut job) = running_import();
+        for attempt in 1..=kaseta_contracts::Job::DEFAULT_MAX_ATTEMPTS {
+            finish(&db, job.id, job.job_type, rec, Err(anyhow::anyhow!("ffmpeg crashed")));
+            if attempt < kaseta_contracts::Job::DEFAULT_MAX_ATTEMPTS {
+                assert_eq!(status_of(&db, rec), "processing", "attempt {attempt}");
+                db.lock()
+                    .unwrap()
+                    .conn()
+                    .execute("UPDATE jobs SET next_attempt_at = NULL", [])
+                    .unwrap();
+                job = claim(&db).unwrap().expect("the import comes back around");
+            }
+        }
+
+        assert_eq!(status_of(&db, rec), "failed");
+        assert!(claim(&db).unwrap().is_none());
+    }
+
+    /// Finalisation already marked the job and queued what follows, inside
+    /// its own transaction. Doing either again here would fail the
+    /// transition, or queue the follow-ups twice.
+    #[test]
+    fn a_finalised_import_is_left_as_finalisation_left_it() {
+        let (db, rec, job) = running_import();
+        assert!(db
+            .lock()
+            .unwrap()
+            .finalize_import_success(rec, job.id, &fields())
+            .unwrap());
+
+        finish(&db, job.id, job.job_type, rec, Ok(StageOutcome::Finalized));
+
+        let guard = db.lock().unwrap();
+        assert_eq!(guard.job(job.id).unwrap().unwrap().state, JobState::Succeeded);
+        let queued: i64 = guard
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE recording_id = ?1 AND state = 'queued'",
+                rusqlite::params![rec.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(queued, 2, "transcription and backup, once each");
+    }
+
+    /// Deleting a recording during its import cascades the job away. The
+    /// import's own ending must then be a quiet no-op, not an error about a
+    /// job that cannot be found.
+    #[test]
+    fn an_import_whose_recording_was_deleted_finishes_quietly() {
+        for outcome in [
+            Ok(StageOutcome::Skipped("the recording was deleted".into())),
+            Err(anyhow::anyhow!("decode interrupted")),
+            Err(Permanent("This file has no audio track".into()).into()),
+        ] {
+            let (db, rec, job) = running_import();
+            db.lock()
+                .unwrap()
+                .conn()
+                .execute(
+                    "DELETE FROM recordings WHERE id = ?1",
+                    rusqlite::params![rec.to_string()],
+                )
+                .unwrap();
+
+            finish(&db, job.id, job.job_type, rec, outcome);
+
+            let guard = db.lock().unwrap();
+            assert!(guard.job(job.id).unwrap().is_none());
+            let rows: i64 = guard
+                .conn()
+                .query_row("SELECT COUNT(*) FROM recordings", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 0, "nothing may be resurrected");
+        }
+    }
+
+    /// Every other stage waits for the decode: there is no manifest, no audio
+    /// and nothing derived until it finishes.
+    #[test]
+    fn no_other_stage_runs_on_an_unfinished_import() {
+        let (db, rec, _) = running_import();
+        let mut settings = crate::config::Settings::default();
+        settings.summaries.enabled = true;
+        settings.summaries.api_key = Some("sk-or-test".into());
+
+        let guard = db.lock().unwrap();
+        for stage in [
+            JobType::Transcribe,
+            JobType::Summarize,
+            JobType::UploadRemote,
+            JobType::PublishWebhook,
+        ] {
+            let reason = why_not_runnable(&guard, &settings, rec, stage)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{stage:?} must wait for the import"));
+            assert!(reason.contains("still being imported"), "{stage:?}: {reason}");
+        }
+        assert!(why_not_runnable(&guard, &settings, rec, JobType::ImportMedia)
+            .unwrap()
+            .is_none());
+
+        guard
+            .conn()
+            .execute(
+                "UPDATE recordings SET status = 'failed' WHERE id = ?1",
+                rusqlite::params![rec.to_string()],
+            )
+            .unwrap();
+        let reason = why_not_runnable(&guard, &settings, rec, JobType::Transcribe)
+            .unwrap()
+            .unwrap();
+        assert!(reason.contains("could not be imported"), "{reason}");
+    }
+
+    #[test]
+    fn importing_chains_to_nothing_through_finish() {
+        assert_eq!(next_stage(JobType::ImportMedia), None);
+    }
+
+    /// The decode stage is what produces the manifest, so it must be reached
+    /// without reading one: a manifest-first dispatch would fail every import
+    /// with "reading the manifest".
+    #[test]
+    fn an_import_is_dispatched_before_any_manifest_is_read() {
+        let (db, rec, job) = running_import();
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::blobstore::LocalFsStore::new(dir.path()).unwrap();
+
+        let err = execute(&store, &db, "", job.id, JobType::ImportMedia, rec).unwrap_err();
+        assert!(
+            !format!("{err:#}").contains("manifest"),
+            "the import must not look for a manifest: {err:#}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod send_trigger_tests {
     use super::*;
     use crate::config::{SendWhen, WebhookSettings};
@@ -1049,9 +1375,9 @@ mod send_trigger_tests {
     #[test]
     fn a_permanent_failure_is_not_retryable() {
         let err: anyhow::Error = crate::webhook::Permanent("token expired".into()).into();
-        assert!(err.downcast_ref::<crate::webhook::Permanent>().is_some());
+        assert!(err.downcast_ref::<Permanent>().is_some(), "one type, wherever it is named");
 
         let transient = anyhow::anyhow!("connection reset");
-        assert!(transient.downcast_ref::<crate::webhook::Permanent>().is_none());
+        assert!(transient.downcast_ref::<Permanent>().is_none());
     }
 }

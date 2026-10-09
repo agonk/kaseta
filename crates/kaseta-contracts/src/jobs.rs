@@ -33,6 +33,12 @@ pub enum JobType {
     /// receiver that is down, a token that expired. Both are worth retrying
     /// without redoing anything else.
     PublishWebhook,
+    /// Decode an uploaded file into chunks, a manifest and exports, then hand
+    /// the recording to the same stages a capture gets.
+    ///
+    /// The first stage of an imported recording and the only one that can run
+    /// before a manifest exists, since producing the manifest is its job.
+    ImportMedia,
 }
 
 impl JobType {
@@ -59,7 +65,10 @@ impl JobType {
     pub fn is_fatal_to_pipeline(self) -> bool {
         matches!(
             self,
-            JobType::FinalizeRecording | JobType::Transcribe | JobType::MergeTranscript
+            JobType::FinalizeRecording
+                | JobType::Transcribe
+                | JobType::MergeTranscript
+                | JobType::ImportMedia
         )
     }
 
@@ -71,6 +80,7 @@ impl JobType {
             JobType::Summarize => "summarize",
             JobType::UploadRemote => "upload_remote",
             JobType::PublishWebhook => "publish_webhook",
+            JobType::ImportMedia => "import_media",
         }
     }
 }
@@ -227,6 +237,20 @@ mod tests {
         // A recording with no summary is still a usable recording.
         assert!(!JobType::Summarize.is_fatal_to_pipeline());
         assert!(!JobType::UploadRemote.is_fatal_to_pipeline());
+    }
+
+    /// Decoding an imported file produces the audio every stage after it reads,
+    /// so nothing can follow a failed import.
+    #[test]
+    fn importing_stops_the_pipeline_and_chains_to_nothing_by_itself() {
+        assert!(JobType::ImportMedia.is_fatal_to_pipeline());
+        assert_eq!(JobType::ImportMedia.as_str(), "import_media");
+        assert_eq!(JobType::ImportMedia.next(), None);
+        assert!(!JobType::PIPELINE.contains(&JobType::ImportMedia));
+        assert_eq!(
+            serde_json::to_string(&JobType::ImportMedia).unwrap(),
+            "\"import_media\""
+        );
     }
 
     #[test]

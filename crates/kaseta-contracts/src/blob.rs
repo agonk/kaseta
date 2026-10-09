@@ -247,6 +247,78 @@ impl RecordingPrefix {
             .join("library.json")
             .expect("literal segment is safe")
     }
+
+    /// The original file an imported recording was made from, when the
+    /// person chose to keep it.
+    ///
+    /// Under `source/` rather than beside the tracks, so that removing local
+    /// audio, which works on `tracks/`, and removing the original are separate
+    /// decisions. The extension comes from someone's filename and is reduced
+    /// to something safe; one that does not survive that becomes `bin`.
+    pub fn original(&self, extension: &str) -> Result<BlobKey, BlobKeyError> {
+        self.root()
+            .join("source")
+            .and_then(|k| k.join(&format!("original.{}", safe_extension(extension))))
+    }
+}
+
+/// Reduces a user-supplied file extension to `[a-z0-9]{1,8}`, or `bin`.
+///
+/// Rejected rather than repaired: dropping the odd character out of `tar.gz`
+/// or `m\u{00e4}4` would produce an extension that names a different format.
+fn safe_extension(raw: &str) -> String {
+    let lowered = raw.strip_prefix('.').unwrap_or(raw).to_ascii_lowercase();
+    let acceptable = (1..=8).contains(&lowered.len())
+        && lowered
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    if acceptable {
+        lowered
+    } else {
+        "bin".into()
+    }
+}
+
+/// Where an uploaded file waits until it has been decoded.
+///
+/// Outside `recordings/` on purpose. Backup copies a recording's prefix and the
+/// reconciler lists `recordings/`, so neither can mistake a file that is still
+/// arriving, or one that failed to decode, for part of a recording.
+///
+/// ```text
+/// imports/01J9S8Q4N4M7X2K6Y8A1B2C3D4/
+///     upload.mp4
+///     intent.json
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportStaging {
+    pub id: Ulid,
+}
+
+impl ImportStaging {
+    /// Keyed by the recording the upload will become.
+    pub fn new(id: Ulid) -> Self {
+        Self { id }
+    }
+
+    pub fn root(&self) -> BlobKey {
+        BlobKey::new(format!("imports/{}", self.id)).expect("a ULID is a safe segment")
+    }
+
+    /// The uploaded bytes, exactly as they arrived.
+    pub fn upload(&self, extension: &str) -> Result<BlobKey, BlobKeyError> {
+        self.root()
+            .join(&format!("upload.{}", safe_extension(extension)))
+    }
+
+    /// What the person asked for when uploading: the name, the title, whether
+    /// to keep the original. Stored beside the upload so the job that decodes
+    /// it reads its inputs from storage rather than only from the index.
+    pub fn intent(&self) -> BlobKey {
+        self.root()
+            .join("intent.json")
+            .expect("literal segment is safe")
+    }
 }
 
 /// A track identifier, e.g. `a_local-mic_01` or `v_screen_01`.
@@ -356,6 +428,64 @@ mod tests {
         let prefix = RecordingPrefix::new(Ulid::nil(), offset);
         assert_eq!(prefix.started_stamp, "20260724T221203Z");
         assert_eq!((prefix.year, prefix.month, prefix.day), (2026, 7, 24));
+    }
+
+    #[test]
+    fn a_kept_original_sits_under_the_recording_with_a_sanitised_extension() {
+        let id = Ulid::from_string("01J9S8Q4N4M7X2K6Y8A1B2C3D4").unwrap();
+        let prefix = RecordingPrefix::new(id, datetime!(2026-07-25 14:12:03 UTC));
+        let root = prefix.root().to_string();
+
+        for (ext, expected) in [
+            ("mp4", "mp4"),
+            ("MKV", "mkv"),
+            ("M4a", "m4a"),
+            (".mp3", "mp3"),
+            ("webm", "webm"),
+            ("12345678", "12345678"),
+            // Too long, empty, or carrying anything but letters and digits:
+            // the extension came from someone's filename and is not trusted.
+            ("123456789", "bin"),
+            ("", "bin"),
+            (".", "bin"),
+            ("tar.gz", "bin"),
+            ("mp 4", "bin"),
+            ("../x", "bin"),
+            ("mp4/", "bin"),
+            ("m\u{00e4}4", "bin"),
+            ("mp-4", "bin"),
+        ] {
+            let key = prefix.original(ext).unwrap();
+            assert_eq!(
+                key.as_str(),
+                format!("{root}/source/original.{expected}"),
+                "extension {ext:?}"
+            );
+        }
+    }
+
+    /// Staging sits outside `recordings/`, which is what keeps backup, which
+    /// lists only a recording's prefix, and the reconciler, which lists only
+    /// `recordings/`, from ever seeing a half-uploaded file.
+    #[test]
+    fn staging_keys_live_outside_every_recording() {
+        let id = Ulid::from_string("01J9S8Q4N4M7X2K6Y8A1B2C3D4").unwrap();
+        let staging = ImportStaging::new(id);
+
+        assert_eq!(staging.root().as_str(), "imports/01J9S8Q4N4M7X2K6Y8A1B2C3D4");
+        assert_eq!(
+            staging.upload("MP4").unwrap().as_str(),
+            "imports/01J9S8Q4N4M7X2K6Y8A1B2C3D4/upload.mp4"
+        );
+        assert_eq!(
+            staging.upload("tar.gz").unwrap().as_str(),
+            "imports/01J9S8Q4N4M7X2K6Y8A1B2C3D4/upload.bin"
+        );
+        assert_eq!(
+            staging.intent().as_str(),
+            "imports/01J9S8Q4N4M7X2K6Y8A1B2C3D4/intent.json"
+        );
+        assert!(!staging.root().as_str().starts_with("recordings"));
     }
 
     #[test]

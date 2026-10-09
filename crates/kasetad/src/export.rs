@@ -890,6 +890,7 @@ mod tests {
                 build("a_remote-mix_01", TrackRole::RemoteMix, remote),
             ],
             notes: RecordingNotes::default(),
+            source: None,
         }
     }
 

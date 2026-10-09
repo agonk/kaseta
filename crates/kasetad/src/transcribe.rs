@@ -504,6 +504,7 @@ mod tests {
             },
             tracks,
             notes: RecordingNotes::default(),
+            source: None,
         }
     }
 

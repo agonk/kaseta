@@ -340,6 +340,7 @@ impl RecordingSession {
             },
             tracks,
             notes: self.notes.clone(),
+            source: None,
         })
     }
 }

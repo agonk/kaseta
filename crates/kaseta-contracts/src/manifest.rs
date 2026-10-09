@@ -47,12 +47,104 @@ pub struct RecordingManifest {
     pub tracks: Vec<Track>,
     #[serde(default)]
     pub notes: RecordingNotes,
+    /// Where an imported recording came from. Absent for a captured one, and
+    /// omitted from its JSON rather than written as `null`, so a capture's
+    /// manifest stays byte-identical to what binaries before imports wrote.
+    ///
+    /// Kept here rather than only in the index because the index is
+    /// disposable: a library rebuilt from storage must still know that this
+    /// recording was a file, what it was called and whether its original was
+    /// kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ImportSource>,
 }
 
 impl RecordingManifest {
     pub fn track(&self, id: &TrackId) -> Option<&Track> {
         self.tracks.iter().find(|t| &t.track_id == id)
     }
+
+    /// Whether this recording was captured live or made from a file.
+    pub fn origin(&self) -> Origin {
+        if self.source.is_some() {
+            Origin::Imported
+        } else {
+            Origin::Captured
+        }
+    }
+}
+
+/// The one track an imported file becomes.
+///
+/// Deliberately free of `local-mic` and `remote-mix`: places that only see a
+/// track id still tell capture's roles apart by those words, and an import
+/// carries neither.
+pub const IMPORTED_TRACK_ID: &str = "a_imported_01";
+
+/// How a recording came to exist.
+///
+/// Decides how its lines are labelled and which summary prompt fits it. A
+/// captured meeting has a microphone and a far end to attribute lines to; an
+/// imported file is one mixed track with nobody attributed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    Captured,
+    Imported,
+}
+
+impl Origin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Origin::Captured => "captured",
+            Origin::Imported => "imported",
+        }
+    }
+
+    /// Rejects anything else rather than defaulting, for the same reason the
+    /// job parsers do: a silent fallback turns a corrupt or newer row into a
+    /// recording quietly treated as the wrong kind.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "captured" => Some(Origin::Captured),
+            "imported" => Some(Origin::Imported),
+            _ => None,
+        }
+    }
+}
+
+/// What an imported recording was made from.
+///
+/// The single home of every fact about the original file. The track records
+/// only which stream was decoded; duplicating the container or the filename
+/// there would give two places to disagree.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ImportSource {
+    /// The name the file had on the person's machine, verbatim. Shown and
+    /// offered as the download name, never used to build a key.
+    pub original_filename: String,
+    /// Where the original is kept under the recording, when the person asked
+    /// for it to be kept. `None` means only the decoded audio was retained.
+    #[serde(default)]
+    pub original_key: Option<BlobKey>,
+    pub original_bytes: u64,
+    pub original_sha256: String,
+    /// The demuxer the file was read with, e.g. `mov` or `matroska`. Decided
+    /// by probing the content rather than by trusting the extension.
+    pub container: String,
+    /// Codec of the audio stream that was decoded.
+    pub codec: String,
+    /// Whether the original carried video. An audio-only file has nothing to
+    /// show, so the interface plays the decoded audio instead.
+    pub media_kind: MediaType,
+    /// When the media says it was made, if it says. Often absent, and when
+    /// present it is the file's own claim rather than anything verified.
+    #[serde(with = "time::serde::rfc3339::option", default)]
+    pub media_created_at: Option<time::OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub imported_at: time::OffsetDateTime,
+    /// Duration of the decoded stream, in seconds.
+    pub duration_s: f64,
 }
 
 /// The clock all timestamps in this manifest are expressed against.
@@ -265,6 +357,10 @@ pub enum TrackRole {
     Application,
     /// Screen, window, or camera video.
     Visual,
+    /// One track carrying every voice, attributed to nobody: an imported file.
+    /// Unlike `RemoteMix` it does not exclude the operator, so it implies
+    /// nothing about who is speaking.
+    Unattributed,
 }
 
 /// Where the bytes came from. New variants extend capture without touching the
@@ -293,6 +389,14 @@ pub enum TrackSource {
     },
     WindowVideo {
         display_name: String,
+    },
+    /// Decoded from a file someone imported. Everything else about that file
+    /// lives in the manifest's [`ImportSource`]; this records only which of
+    /// its streams became this track.
+    ImportedFile {
+        /// ffprobe's global stream index, which is what selected the stream
+        /// for decoding.
+        stream_index: u32,
     },
 }
 
@@ -367,7 +471,7 @@ impl Chunk {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::{RecordingPrefix, TrackId};
+    use crate::blob::{BlobKey, RecordingPrefix, TrackId};
     use time::macros::datetime;
 
     fn track_with(sample_rate: u32, chunks: Vec<Chunk>) -> Track {
@@ -501,6 +605,140 @@ mod tests {
         assert_eq!(c.sample_to_boottime_ns(99_999), 2_000_000_000);
     }
 
+    fn captured_manifest() -> RecordingManifest {
+        RecordingManifest {
+            manifest_version: MANIFEST_VERSION.into(),
+            recording_id: Ulid::nil(),
+            started_at: datetime!(2026-07-25 14:12:03 UTC),
+            ended_at: Some(datetime!(2026-07-25 14:12:04 UTC)),
+            canonical_clock: CanonicalClock {
+                kind: ClockKind::BoottimeNs,
+                started_at_ns: 58_122_344_199_123,
+            },
+            timeline: Timeline {
+                master_track_id: TrackId::new("a_local-mic_01").unwrap(),
+                nominal_sample_rate_hz: 48_000,
+            },
+            tracks: vec![track_with(48_000, vec![chunk(0, 48_000, 0, 1_000_000_000)])],
+            notes: RecordingNotes {
+                title: Some("Weekly sync".into()),
+                ..RecordingNotes::default()
+            },
+            source: None,
+        }
+    }
+
+    /// What a captured recording's manifest serialised to before imports
+    /// existed. Imports only add to the schema, so a manifest written by
+    /// capture must stay byte-for-byte what an older binary wrote and reads.
+    const CAPTURED_GOLDEN: &str = r#"{"manifest_version":"recording-manifest/v1","recording_id":"00000000000000000000000000","started_at":"2026-07-25T14:12:03Z","ended_at":"2026-07-25T14:12:04Z","canonical_clock":{"kind":"boottime_ns","started_at_ns":58122344199123},"timeline":{"master_track_id":"a_local-mic_01","nominal_sample_rate_hz":48000},"tracks":[{"track_id":"a_local-mic_01","media_type":"audio","role":"local_mic","source":{"kind":"microphone","node_name":"alsa_input.test","display_name":"Test"},"clock_domain":{"source_clock":"pipewire","device_clock_id":null},"format":{"container":"flac","codec":"flac","sample_rate_hz":48000,"channels":1,"sample_format":"s16"},"chunks":[{"seq":0,"blob":"recordings/2026/07/25/20260725T141203Z_00000000000000000000000000/tracks/a_local-mic_01/000000.flac","sha256":"0000000000000000000000000000000000000000000000000000000000000000","bytes":96000,"sample_count":48000,"boottime_start_ns":0,"boottime_end_ns":1000000000,"source_pts_start_ns":null,"source_pts_end_ns":null,"discontinuity":false,"gap_before_ns":0,"drops_before_chunk":0}]}],"notes":{"headphones_expected":false,"echo_risk":"unknown","title":"Weekly sync"}}"#;
+
+    #[test]
+    fn a_captured_manifest_serialises_exactly_as_before() {
+        let json = serde_json::to_string(&captured_manifest()).unwrap();
+        assert_eq!(json, CAPTURED_GOLDEN);
+        assert!(!json.contains("\"source\":{\"original"), "no import provenance on a capture");
+
+        let back: RecordingManifest = serde_json::from_str(CAPTURED_GOLDEN).unwrap();
+        assert!(back.source.is_none());
+        assert_eq!(back.origin(), Origin::Captured);
+    }
+
+    fn imported_manifest(original_key: Option<BlobKey>) -> RecordingManifest {
+        let track_id = TrackId::new(IMPORTED_TRACK_ID).unwrap();
+        let prefix = RecordingPrefix::new(Ulid::nil(), datetime!(2026-10-09 08:00:00 UTC));
+        let mut track = track_with(48_000, vec![chunk(0, 48_000, 0, 1_000_000_000)]);
+        track.track_id = track_id.clone();
+        track.role = TrackRole::Unattributed;
+        track.source = TrackSource::ImportedFile { stream_index: 1 };
+        track.clock_domain = ClockDomain {
+            source_clock: "decoded".into(),
+            device_clock_id: None,
+        };
+        track.chunks[0].blob = prefix.chunk(&track_id, 0, "flac");
+
+        RecordingManifest {
+            manifest_version: MANIFEST_VERSION.into(),
+            recording_id: Ulid::nil(),
+            started_at: datetime!(2026-10-09 08:00:00 UTC),
+            ended_at: Some(datetime!(2026-10-09 08:00:01 UTC)),
+            canonical_clock: CanonicalClock {
+                kind: ClockKind::BoottimeNs,
+                started_at_ns: 0,
+            },
+            timeline: Timeline {
+                master_track_id: track_id,
+                nominal_sample_rate_hz: 48_000,
+            },
+            tracks: vec![track],
+            notes: RecordingNotes {
+                title: Some("Lecture".into()),
+                ..RecordingNotes::default()
+            },
+            source: Some(ImportSource {
+                original_filename: "Lecture 3 \u{00e9}t\u{00e9}.mp4".into(),
+                original_key,
+                original_bytes: 123_456_789,
+                original_sha256: "ab".repeat(32),
+                container: "mov".into(),
+                codec: "aac".into(),
+                media_kind: MediaType::Video,
+                media_created_at: Some(datetime!(2026-10-01 17:30:00 UTC)),
+                imported_at: datetime!(2026-10-09 08:00:00 UTC),
+                duration_s: 1.0,
+            }),
+        }
+    }
+
+    #[test]
+    fn an_imported_manifest_round_trips_through_json() {
+        let prefix = RecordingPrefix::new(Ulid::nil(), datetime!(2026-10-09 08:00:00 UTC));
+        let kept = prefix.original("mp4").unwrap();
+        let manifest = imported_manifest(Some(kept.clone()));
+
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(json.contains(r#""role":"unattributed""#), "{json}");
+        assert!(json.contains(r#""source":{"kind":"imported_file","stream_index":1}"#), "{json}");
+        assert!(json.contains(r#""media_kind":"video""#), "{json}");
+        assert_eq!(manifest.manifest_version, MANIFEST_VERSION, "the change is additive");
+
+        let back: RecordingManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.origin(), Origin::Imported);
+        let source = back.source.as_ref().unwrap();
+        assert_eq!(source.original_key.as_ref(), Some(&kept));
+        assert_eq!(source.original_filename, "Lecture 3 \u{00e9}t\u{00e9}.mp4");
+        assert_eq!(source.original_bytes, 123_456_789);
+        assert_eq!(source.media_kind, MediaType::Video);
+        assert_eq!(source.media_created_at, Some(datetime!(2026-10-01 17:30:00 UTC)));
+        assert_eq!(back.tracks[0].role, TrackRole::Unattributed);
+        assert_eq!(back.tracks[0].source, TrackSource::ImportedFile { stream_index: 1 });
+    }
+
+    /// An original that was not kept has no key, and a file without a
+    /// creation date has none either. Both must survive a round trip as
+    /// absent rather than turning into a default that looks real.
+    #[test]
+    fn an_import_without_a_kept_original_or_a_media_date_round_trips() {
+        let mut manifest = imported_manifest(None);
+        manifest.source.as_mut().unwrap().media_created_at = None;
+
+        let json = serde_json::to_string(&manifest).unwrap();
+        let back: RecordingManifest = serde_json::from_str(&json).unwrap();
+        let source = back.source.unwrap();
+        assert!(source.original_key.is_none());
+        assert!(source.media_created_at.is_none());
+    }
+
+    /// Nothing in an import's track id may read as one of capture's roles:
+    /// several places still tell tracks apart by the id alone.
+    #[test]
+    fn the_imported_track_id_names_no_captured_role() {
+        let id = TrackId::new(IMPORTED_TRACK_ID).unwrap();
+        assert!(id.as_str().starts_with("a_"), "it is an audio track");
+        assert!(!id.as_str().contains("local-mic"));
+        assert!(!id.as_str().contains("remote-mix"));
+    }
+
     #[test]
     fn manifest_round_trips_through_json() {
         let prefix = RecordingPrefix::new(Ulid::nil(), datetime!(2026-07-25 14:12:03 UTC));
@@ -519,6 +757,7 @@ mod tests {
             },
             tracks: vec![track_with(48_000, vec![chunk(0, 48_000, 0, 1_000_000_000)])],
             notes: RecordingNotes::default(),
+            source: None,
         };
 
         let json = serde_json::to_string(&manifest).unwrap();
