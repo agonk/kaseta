@@ -1183,7 +1183,8 @@ function stageChips(item) {
 
       // Retrying an import decodes the upload again, so once the upload is gone
       // retry can only be refused; deleting the item is what is left to do.
-      const gone = stage.key === "import" && failed && uploadGone(st);
+      // The daemon says which, having looked in storage.
+      const gone = stage.key === "import" && failed && st?.upload_present === false;
       const act = el("button", null, gone ? "delete" : failed ? "retry" : "run");
       act.type = "button";
       act.title = failed && st?.error ? st.error : `Run ${stage.name.toLowerCase()}`;
@@ -1203,12 +1204,6 @@ function stageChips(item) {
   }
   return box;
 }
-
-/// Whether an import failed because its upload no longer exists.
-///
-/// Recognised by the start of the daemon's own message for it, which a test in
-/// the daemon pins to this exact phrase.
-const uploadGone = (st) => Boolean(st?.error?.startsWith("the uploaded file is gone"));
 
 /// Asks for a stage to run, and says so on the control that was pressed.
 ///

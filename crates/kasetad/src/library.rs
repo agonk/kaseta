@@ -116,6 +116,29 @@ pub struct StageState {
     /// at all — the stage found nothing to do, and correcting whatever caused
     /// that is exactly the case where running it again is the point.
     pub retryable: bool,
+    /// For a failed import, whether the uploaded file is still in staging.
+    /// Decoding again needs it, so without it a retry can only be refused and
+    /// deleting the item is what is left. Absent for every other stage, and
+    /// for an import that has not failed. Filled in by
+    /// [`note_import_uploads`], which can see storage; the index cannot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_present: Option<bool>,
+}
+
+/// Says, on each failed import's stage, whether its upload is still there to
+/// decode again, and stops offering a retry when it is not.
+pub fn note_import_uploads(store: &dyn BlobStore, items: &mut [LibraryItem]) -> Result<()> {
+    for item in items {
+        for stage in &mut item.stages {
+            if stage.stage != kaseta_contracts::JobType::ImportMedia.as_str() || stage.state != "failed" {
+                continue;
+            }
+            let present = crate::import::upload_present(store, item.id)?;
+            stage.upload_present = Some(present);
+            stage.retryable &= present;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -552,6 +575,7 @@ fn stages_by_recording(db: &Db) -> Result<std::collections::HashMap<String, Vec<
             state: state.to_string(),
             error: error.filter(|_| state == "failed" || state == "skipped"),
             retryable,
+            upload_present: None,
         });
     }
     Ok(out)

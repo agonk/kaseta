@@ -381,7 +381,13 @@ struct ListResponse {
 }
 
 async fn list_recordings(State(state): State<AppState>) -> Result<Json<ListResponse>, ApiError> {
-    let items = with_db(&state, |db| library::list(db).map_err(ApiError::from_anyhow)).await?;
+    let store = Arc::clone(&state.store);
+    let items = with_db(&state, move |db| {
+        let mut items = library::list(db).map_err(ApiError::from_anyhow)?;
+        library::note_import_uploads(&*store, &mut items).map_err(ApiError::from_anyhow)?;
+        Ok(items)
+    })
+    .await?;
     Ok(Json(ListResponse { items }))
 }
 
@@ -390,10 +396,15 @@ async fn get_recording(
     Path(id): Path<String>,
 ) -> Result<Json<library::LibraryItem>, ApiError> {
     let id = parse_id(&id)?;
+    let store = Arc::clone(&state.store);
     with_db(&state, move |db| {
-        library::get(db, id)
+        let item = library::get(db, id)
             .map_err(ApiError::from_anyhow)?
-            .ok_or_else(|| ApiError::not_found("no such recording"))
+            .ok_or_else(|| ApiError::not_found("no such recording"))?;
+        let mut items = [item];
+        library::note_import_uploads(&*store, &mut items).map_err(ApiError::from_anyhow)?;
+        let [item] = items;
+        Ok(item)
     })
     .await
     .map(Json)
@@ -767,13 +778,16 @@ async fn search(
     State(state): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<SearchQuery>,
 ) -> Result<Json<SearchResponse>, ApiError> {
+    let store = Arc::clone(&state.store);
     let items = with_db(&state, move |db| {
         let matching = library::search(db, &query.q).map_err(ApiError::from_anyhow)?;
         let all = library::list(db).map_err(ApiError::from_anyhow)?;
-        Ok(all
+        let mut found = all
             .into_iter()
             .filter(|item| matching.contains(&item.id))
-            .collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        library::note_import_uploads(&*store, &mut found).map_err(ApiError::from_anyhow)?;
+        Ok(found)
     })
     .await?;
     Ok(Json(SearchResponse { items }))
@@ -1474,11 +1488,10 @@ mod tests {
     #[test]
     fn the_page_offers_delete_when_the_upload_is_gone() {
         // Retrying decodes the upload again, so once it is gone the only
-        // useful action is deleting the item. The page recognises that case
-        // by the start of the daemon's message.
-        const PHRASE: &str = "the uploaded file is gone";
-        assert!(crate::import::job::UPLOAD_GONE.starts_with(PHRASE));
-        assert!(INDEX_HTML.contains(&format!("\"{PHRASE}\"")));
+        // useful action is deleting the item. The page decides that from the
+        // field the daemon reports, never from the wording of an error.
+        assert!(INDEX_HTML.contains("st?.upload_present === false"));
+        assert!(!INDEX_HTML.contains("the uploaded file is gone"));
     }
 
     // The routes, driven through the same router the daemon serves, with no
@@ -1608,6 +1621,51 @@ mod tests {
         assert_eq!(item.title, "Week 3");
         assert_eq!(item.stages[0].stage, "import_media");
         assert_eq!(item.stages[0].state, "queued");
+    }
+
+    /// A failed import says whether its upload is still there to decode
+    /// again, which is what decides between offering Retry and only Delete.
+    #[tokio::test]
+    async fn a_failed_import_says_whether_its_upload_is_still_there() {
+        let app = app(ready());
+        let (status, json) = app.import(Some(3), b"abc".to_vec()).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{json}");
+        let id = Ulid::from_string(json["recording_id"].as_str().unwrap()).unwrap();
+
+        let stage = |body: &[u8]| -> serde_json::Value {
+            let item: serde_json::Value = serde_json::from_slice(body).unwrap();
+            item["stages"][0].clone()
+        };
+        let listed = |body: &[u8]| -> serde_json::Value {
+            let list: serde_json::Value = serde_json::from_slice(body).unwrap();
+            list["items"][0]["stages"][0].clone()
+        };
+
+        // Not asked while the import is still on its way.
+        let (_, _, body) = app.get(&format!("/api/v1/recordings/{id}"), None).await;
+        assert!(stage(&body).get("upload_present").is_none(), "{}", stage(&body));
+
+        {
+            let db = app.db.lock().unwrap();
+            let job = db.claim_next_job(1).unwrap().unwrap();
+            db.fail_job(job.id, "job_failed", "not enough disk space", false).unwrap();
+        }
+        let (_, _, body) = app.get(&format!("/api/v1/recordings/{id}"), None).await;
+        let failed = stage(&body);
+        assert_eq!(failed["state"], "failed");
+        assert_eq!(failed["upload_present"], true);
+        assert_eq!(failed["retryable"], true);
+        let (_, _, body) = app.get("/api/v1/recordings", None).await;
+        assert_eq!(listed(&body)["upload_present"], true);
+
+        crate::import::remove_staging(&*app.store, id).unwrap();
+        let (_, _, body) = app.get(&format!("/api/v1/recordings/{id}"), None).await;
+        let gone = stage(&body);
+        assert_eq!(gone["state"], "failed");
+        assert_eq!(gone["upload_present"], false);
+        assert_eq!(gone["retryable"], false, "a retry could only be refused");
+        let (_, _, body) = app.get("/api/v1/recordings", None).await;
+        assert_eq!(listed(&body)["upload_present"], false);
     }
 
     #[tokio::test]
