@@ -23,6 +23,9 @@ tokio = { workspace = true, features = ["io-util"] }
 # is no second process resident when the interface is open.
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs", "trace"] }
+# The frame type for streaming a file from disk as a response body, a range at
+# a time. Already part of axum's own stack.
+http-body = "1"
 
 # Single-writer embedded database. `bundled` avoids depending on the host's
 # libsqlite3 version.

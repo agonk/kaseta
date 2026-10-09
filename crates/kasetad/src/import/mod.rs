@@ -11,7 +11,10 @@
 //! - [`sandbox`] runs the tools that do that, contained.
 //! - [`job`] is the stage itself.
 //! - [`sweep`] clears staging nothing will come back for.
+//! - [`upload`] receives the file in the first place.
+//! - [`cli`] sends one from a terminal, through the same route.
 
+pub mod cli;
 #[cfg(test)]
 pub mod fixtures;
 pub mod intent;
@@ -19,8 +22,10 @@ pub mod job;
 pub mod media;
 pub mod sandbox;
 pub mod sweep;
+pub mod upload;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use kaseta_contracts::ImportStaging;
@@ -39,13 +44,18 @@ pub const DECODE_BYTES_PER_SECOND: u64 = 512 * 1024;
 /// import never leaves the disk full for everything else on the machine.
 pub const DECODE_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Whether this daemon can import, decided once at startup.
+/// Whether this daemon can import, decided once at startup, and the one slot
+/// an upload occupies while it arrives.
 ///
 /// Importing needs ffmpeg and ffprobe, and bubblewrap able to run them. Any of
 /// those missing makes importing unavailable, with a reason naming what to
 /// install, rather than an import that fails after the upload.
 pub struct ImportRuntime {
     tools: std::result::Result<Toolchain, String>,
+    uploads: Arc<upload::UploadGate>,
+    /// Reads free space on the filesystem holding a path. A field so the
+    /// upload's admission can be tested without filling a disk.
+    free_space: fn(&Path) -> Result<u64>,
 }
 
 impl ImportRuntime {
@@ -56,26 +66,49 @@ impl ImportRuntime {
             Ok(t) => tracing::info!(ffmpeg = %t.version(), "importing is available, sandboxed"),
             Err(reason) => tracing::warn!(%reason, "importing is unavailable"),
         }
-        Self { tools }
+        Self::from_tools(tools)
+    }
+
+    fn from_tools(tools: std::result::Result<Toolchain, String>) -> Self {
+        Self {
+            tools,
+            uploads: Arc::default(),
+            free_space,
+        }
     }
 
     /// A runtime that cannot import, for exercising that path.
     #[cfg(test)]
     pub fn unavailable(reason: &str) -> Self {
-        Self {
-            tools: Err(reason.to_string()),
-        }
+        Self::from_tools(Err(reason.to_string()))
     }
 
     /// A runtime with tools already found.
     #[cfg(test)]
     pub fn with(tools: Toolchain) -> Self {
-        Self { tools: Ok(tools) }
+        Self::from_tools(Ok(tools))
+    }
+
+    /// The same runtime, reading free space from `free_space` instead.
+    #[cfg(test)]
+    pub fn with_free_space(mut self, free_space: fn(&Path) -> Result<u64>) -> Self {
+        self.free_space = free_space;
+        self
     }
 
     /// The tools, or why there are none.
     pub fn toolchain(&self) -> std::result::Result<&Toolchain, &str> {
         self.tools.as_ref().map_err(String::as_str)
+    }
+
+    /// The upload slot, or `None` while another upload holds it.
+    pub fn begin_upload(&self) -> Option<upload::UploadPermit> {
+        self.uploads.try_enter()
+    }
+
+    /// Bytes free on the filesystem holding `path`.
+    pub fn free_space(&self, path: &Path) -> Result<u64> {
+        (self.free_space)(path)
     }
 }
 

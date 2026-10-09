@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 
 // The storage and export core is the crate's library (see `lib.rs`); importing
 // it at the root keeps every `crate::blobstore::...` path in the binary valid.
-use kasetad::{blobstore, clock, export};
+use kasetad::{blobstore, clock, export, staging};
 
 mod capture;
 mod config;
@@ -30,19 +30,29 @@ USAGE:
 
 COMMANDS:
     devices              List recordable audio devices and exit
-    doctor               Check that this machine can capture audio
+    doctor               Check that this machine can capture and import audio
     record [SECONDS]     Record both sides of a meeting (default 30s)
     serve [PORT]         Run the daemon and its interface (default 7777)
+    import PATH [--title TEXT] [--keep-original]
+                         Send an audio or video file to the running daemon to
+                         become a recording, and wait until it is decoded.
+                         --keep-original keeps the file itself beside it.
     export [ID]          Merge a recording's chunks into one file per track
                          (defaults to the most recent recording)
     transcribe [ID]      Transcribe a recording (defaults to the most recent)
     help                 Show this message
 
+IMPORT FORMATS:
+    MP4/MOV/M4A/3GP, MKV/WebM, MP3, WAV/W64, FLAC, Ogg/Opus, AAC, WMA/ASF,
+    AVI, MPEG-TS, MPEG-PS, CAF, AIFF, AMR, AC-3/E-AC-3, AU. Other formats are
+    rejected. An imported file is one track: its lines are not attributed to
+    anyone, and read as Speaker.
+
 ENVIRONMENT:
     KASETA_WORKER_PYTHON  Interpreter with the transcription worker installed
     KASETA_LOG   Log filter, e.g. `kasetad=debug`
     KASETA_DATA  Where recordings are written (default ./data)
-    KASETA_PORT  Port for `serve` (default 7777)
+    KASETA_PORT  Port for `serve`, and the daemon `import` sends to (default 7777)
 ";
 
 fn main() -> Result<()> {
@@ -59,14 +69,20 @@ fn main() -> Result<()> {
         Some("doctor") => cmd_doctor(),
         Some("export") => cmd_export(std::env::args().nth(2)),
         Some("transcribe") => cmd_transcribe(std::env::args().nth(2)),
+        Some("import") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            let args = import::cli::ImportArgs::parse(&args).map_err(|e| {
+                anyhow::anyhow!("{e}\nusage: kasetad import PATH [--title TEXT] [--keep-original]")
+            })?;
+            import::cli::run(&args, port_from_env()?)
+        }
         Some("serve") => {
-            let port = std::env::args()
-                .nth(2)
-                .or_else(|| std::env::var("KASETA_PORT").ok())
-                .map(|p| p.parse::<u16>())
-                .transpose()
-                .context("PORT must be a number between 1 and 65535")?
-                .unwrap_or(7777);
+            let port = match std::env::args().nth(2) {
+                Some(p) => p
+                    .parse::<u16>()
+                    .context("PORT must be a number between 1 and 65535")?,
+                None => port_from_env()?,
+            };
             cmd_serve(port)
         }
         Some("record") => {
@@ -91,6 +107,16 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// The daemon's port: `KASETA_PORT`, or 7777.
+fn port_from_env() -> Result<u16> {
+    std::env::var("KASETA_PORT")
+        .ok()
+        .map(|p| p.parse::<u16>())
+        .transpose()
+        .context("KASETA_PORT must be a number between 1 and 65535")
+        .map(|p| p.unwrap_or(7777))
 }
 
 /// Lists what this machine can record from.
@@ -199,6 +225,26 @@ fn cmd_doctor() -> Result<()> {
             println!("\nCapture is unavailable: {e:#}");
             println!("\nKaseta needs a running PipeWire session. This is expected on a");
             println!("headless server; run the daemon on the desktop machine instead.");
+        }
+    }
+
+    // Importing is independent of capture: a headless machine with no
+    // PipeWire can still turn files into transcripts.
+    println!();
+    for tool in ["ffmpeg", "ffprobe", "bwrap"] {
+        let found = import::sandbox::locate(tool);
+        let shown = found.as_deref().map_or("not found".into(), |p| p.display().to_string());
+        println!("  {:<17} {shown}", if tool == "bwrap" { "bubblewrap" } else { tool });
+    }
+    match import::sandbox::Toolchain::detect() {
+        Ok(tools) => {
+            println!("  importing         ready, decoded inside the sandbox");
+            println!("                    {}", tools.version());
+            println!("                    {}", tools.probe_version());
+        }
+        Err(reason) => {
+            println!("  importing         unavailable");
+            println!("                    {reason}");
         }
     }
 
@@ -594,7 +640,7 @@ fn cmd_serve(port: u16) -> Result<()> {
         Arc::clone(&store),
         Arc::clone(&db),
         storage_root,
-        imports,
+        Arc::clone(&imports),
     )?;
 
     // A multi-thread runtime, so one slow request cannot stall the others.
@@ -605,7 +651,7 @@ fn cmd_serve(port: u16) -> Result<()> {
         .build()
         .context("starting the async runtime")?;
 
-    runtime.block_on(http::serve(supervisor, store, db, port))
+    runtime.block_on(http::serve(supervisor, store, db, imports, port))
 }
 
 /// Transcribes a recording and stores the result.
@@ -680,16 +726,15 @@ fn print_transcript(db: &db::Db, recording_id: ulid::Ulid) -> Result<()> {
         ))
     })?;
 
+    // The same words the page and the text download use: an imported file's
+    // lines are a "Speaker", a captured meeting's are "You" and "Them".
+    let origin = library::origin(db, recording_id)?.unwrap_or(kaseta_contracts::Origin::Captured);
     for row in rows {
         let (start_ns, speaker, text) = row?;
         // Shown relative to the recording, not to system boot.
         let offset = start_ns.saturating_sub(base) / 1_000_000_000;
-        let who = match speaker.as_str() {
-            "local" => "You",
-            "remote" => "Them",
-            _ => "?",
-        };
-        println!("[{:02}:{:02}] {who:>4}  {text}", offset / 60, offset % 60);
+        let who = kaseta_contracts::speaker::display(origin, &speaker);
+        println!("[{:02}:{:02}] {who:>7}  {text}", offset / 60, offset % 60);
     }
     Ok(())
 }

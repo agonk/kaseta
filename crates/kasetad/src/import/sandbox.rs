@@ -101,6 +101,9 @@ pub struct Toolchain {
     layout: HostLayout,
     /// ffmpeg's own version line, for the log and `doctor`.
     version: String,
+    /// ffprobe's, for `doctor`: the two are separate binaries, and a
+    /// mismatched pair is worth being able to see.
+    probe_version: String,
 }
 
 /// How a tool run ended.
@@ -134,6 +137,7 @@ impl Toolchain {
             ffprobe,
             layout: HostLayout::of_host(),
             version: String::new(),
+            probe_version: String::new(),
         };
 
         let mut versions = Vec::new();
@@ -146,7 +150,8 @@ impl Toolchain {
             })?;
             versions.push(version);
         }
-        tools.version = versions.swap_remove(0);
+        tools.probe_version = versions.pop().unwrap_or_default();
+        tools.version = versions.pop().unwrap_or_default();
         Ok(tools)
     }
 
@@ -160,12 +165,18 @@ impl Toolchain {
             ffprobe,
             layout,
             version: String::new(),
+            probe_version: String::new(),
         }
     }
 
     /// ffmpeg's version line.
     pub fn version(&self) -> &str {
         &self.version
+    }
+
+    /// ffprobe's version line.
+    pub fn probe_version(&self) -> &str {
+        &self.probe_version
     }
 
     fn program(&self, tool: Tool) -> &Path {
@@ -412,6 +423,12 @@ fn find_tool(name: &str) -> std::result::Result<PathBuf, String> {
         ));
     }
     Ok(resolved)
+}
+
+/// Where `name` is on `PATH`, if anywhere. For reporting what is installed;
+/// whether it is usable is [`Toolchain::detect`]'s question.
+pub fn locate(name: &str) -> Option<PathBuf> {
+    find_in_path(name)
 }
 
 fn find_in_path(name: &str) -> Option<PathBuf> {

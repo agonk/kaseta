@@ -495,12 +495,18 @@ fn execute(
                 return Ok(StageOutcome::Skipped("the recording is gone".into()));
             };
 
+            let source = item.source.as_ref();
             let status = crate::webhook::publish(
                 &settings.webhook,
                 &crate::webhook::Recording {
                     id: recording_id,
                     title: &item.title,
-                    recorded_at: item.started_at,
+                    recorded_at: crate::webhook::recorded_at(
+                        item.started_at,
+                        source.and_then(|s| s.media_created_at),
+                    ),
+                    origin: item.origin,
+                    original_filename: source.map(|s| s.filename.as_str()),
                     transcript: &transcript,
                     summary: summary.as_ref(),
                     duration_s: (item.duration_ms > 0)
@@ -752,10 +758,9 @@ fn finish(
                 // would let a recording be published exactly once and never
                 // again — and a re-transcription, which is the whole reason to
                 // send a second time, would be the case it silently dropped.
-                let revision = crate::derived::transcript_document(&guard, recording_id)
+                let revision = crate::webhook::transcript_revision(&guard, recording_id)
                     .ok()
-                    .flatten()
-                    .map(|d| crate::webhook::revision_of(&crate::webhook::render_transcript(&d)));
+                    .flatten();
                 // Nothing to send yet is not a reason to stop: the
                 // chaining below still has to run, and an early return here
                 // would leave a transcript without its summary.

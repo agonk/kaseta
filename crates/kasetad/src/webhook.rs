@@ -15,7 +15,7 @@
 //! which is the right shape for something living on a laptop.
 
 use anyhow::{Context, Result};
-use kaseta_contracts::{SummaryDocument, TranscriptDocument};
+use kaseta_contracts::{Origin, SummaryDocument, TranscriptDocument};
 use serde::Serialize;
 use ulid::Ulid;
 
@@ -60,12 +60,33 @@ pub fn revision_of(transcript: &str) -> u32 {
     u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]])
 }
 
+/// The revision a hand-off of this recording's current transcript is queued
+/// under, or `None` while it has no transcript.
+///
+/// Taken from the text exactly as it would be sent, so it moves when what a
+/// receiver would see moves and at no other time.
+pub fn transcript_revision(db: &crate::db::Db, recording_id: Ulid) -> Result<Option<u32>> {
+    let Some(doc) = crate::derived::transcript_document(db, recording_id)? else {
+        return Ok(None);
+    };
+    let origin = crate::library::origin(db, recording_id)?.unwrap_or(Origin::Captured);
+    Ok(Some(revision_of(&render_transcript(&doc, origin))))
+}
+
 #[derive(Debug, Serialize)]
 struct Payload<'a> {
     recording_id: String,
     transcript_fingerprint: String,
     title: &'a str,
     recorded_at: String,
+    /// `capture` for a meeting recorded on this machine, `import` for a file
+    /// brought to it. A receiver reading `You` and `Them` in one and only
+    /// `Speaker` in the other deserves to know why.
+    source: &'static str,
+    /// The imported file's name, which is often the best description of what
+    /// it holds. Absent for a capture, which has no file behind it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_filename: Option<&'a str>,
     transcript: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     duration_s: Option<f64>,
@@ -79,14 +100,15 @@ struct Payload<'a> {
 /// line already knows who said it, because it is derived from which track
 /// carried it — so `you` is the person holding this machine and `them` is the
 /// far end, and a receiver can tell a commitment from a request without guessing.
-pub fn render_transcript(doc: &TranscriptDocument) -> String {
+///
+/// An imported file has no such split, and its lines read `Speaker`. The text
+/// is also what the fingerprint is taken from, so the label is decided by the
+/// recording's kind and nothing else: the same transcript always renders, and
+/// fingerprints, the same.
+pub fn render_transcript(doc: &TranscriptDocument, origin: Origin) -> String {
     let mut out = String::new();
     for line in &doc.lines {
-        let who = match line.speaker.as_str() {
-            "you" => "You",
-            "them" => "Them",
-            _ => "Unknown",
-        };
+        let who = kaseta_contracts::speaker::display(origin, &line.speaker);
         out.push_str(who);
         out.push_str(": ");
         out.push_str(line.text.trim());
@@ -102,15 +124,30 @@ pub struct Recording<'a> {
     pub title: &'a str,
     /// When the call happened, not when it is being sent. A receiver resolving
     /// "by Friday" needs the former, so a recording sent on Monday still dates
-    /// its deadlines from the call.
+    /// its deadlines from the call. See [`recorded_at`] for an import.
     pub recorded_at: time::OffsetDateTime,
+    pub origin: Origin,
+    /// The imported file's name; `None` for a capture.
+    pub original_filename: Option<&'a str>,
     pub transcript: &'a TranscriptDocument,
     pub summary: Option<&'a SummaryDocument>,
     pub duration_s: Option<f64>,
 }
 
+/// When a recording happened, for a receiver dating what was said in it.
+///
+/// A capture happened when it started. An imported file happened whenever it
+/// was made, which may be months before it was imported; the file's own claim
+/// is used when it makes one, and the import time only when it does not.
+pub fn recorded_at(
+    started_at: time::OffsetDateTime,
+    media_created_at: Option<time::OffsetDateTime>,
+) -> time::OffsetDateTime {
+    media_created_at.unwrap_or(started_at)
+}
+
 fn build(rec: &Recording<'_>) -> Result<(String, serde_json::Value)> {
-    let transcript = render_transcript(rec.transcript);
+    let transcript = render_transcript(rec.transcript, rec.origin);
     if transcript.trim().is_empty() {
         return Err(Permanent("the transcript is empty".into()).into());
     }
@@ -138,6 +175,13 @@ fn build(rec: &Recording<'_>) -> Result<(String, serde_json::Value)> {
         transcript_fingerprint: fingerprint(&transcript),
         title: rec.title,
         recorded_at,
+        source: match rec.origin {
+            Origin::Captured => "capture",
+            Origin::Imported => "import",
+        },
+        original_filename: rec
+            .original_filename
+            .filter(|_| rec.origin == Origin::Imported),
         transcript,
         duration_s: rec.duration_s,
         summary: summary_json.as_ref(),
@@ -228,21 +272,78 @@ mod tests {
 
     #[test]
     fn renders_who_said_what() {
-        let out = render_transcript(&doc(vec![
-            ("you", "I will send the report by Friday."),
-            ("them", "Thanks."),
-            ("unknown", "..."),
-        ]));
+        let out = render_transcript(
+            &doc(vec![
+                ("you", "I will send the report by Friday."),
+                ("them", "Thanks."),
+                ("unknown", "..."),
+            ]),
+            Origin::Captured,
+        );
         assert_eq!(
             out,
             "You: I will send the report by Friday.\nThem: Thanks.\nUnknown: ...\n"
         );
     }
 
+    /// An imported file's lines are a "Speaker"; "Unknown" would read as a
+    /// fault on every line of a recording that has none.
+    #[test]
+    fn an_imported_transcript_names_its_speakers_neutrally() {
+        let d = doc(vec![("unknown", "Welcome."), ("unknown", "Thank you.")]);
+        assert_eq!(
+            render_transcript(&d, Origin::Imported),
+            "Speaker: Welcome.\nSpeaker: Thank you.\n"
+        );
+    }
+
+    fn payload(origin: Origin, original_filename: Option<&str>) -> serde_json::Value {
+        let d = doc(vec![("unknown", "hello")]);
+        let rec = Recording {
+            id: Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+            title: "Lecture 3",
+            recorded_at: time::OffsetDateTime::UNIX_EPOCH,
+            origin,
+            original_filename,
+            transcript: &d,
+            summary: None,
+            duration_s: None,
+        };
+        build(&rec).unwrap().1
+    }
+
+    /// Additive fields: a receiver that ignores them sees exactly what it saw
+    /// before, and one that reads them can tell a file from a call.
+    #[test]
+    fn the_payload_says_whether_it_was_captured_or_imported() {
+        let captured = payload(Origin::Captured, None);
+        assert_eq!(captured["source"], "capture");
+        assert!(captured.get("original_filename").is_none());
+        assert_eq!(captured["transcript"], "Unknown: hello\n");
+
+        let imported = payload(Origin::Imported, Some("Lecture 3.mp4"));
+        assert_eq!(imported["source"], "import");
+        assert_eq!(imported["original_filename"], "Lecture 3.mp4");
+        assert_eq!(imported["transcript"], "Speaker: hello\n");
+
+        // A filename on a capture is a caller's mistake, not something to send.
+        assert!(payload(Origin::Captured, Some("x.mp4"))
+            .get("original_filename")
+            .is_none());
+    }
+
+    #[test]
+    fn an_import_is_dated_by_when_its_media_was_made() {
+        let imported = time::macros::datetime!(2026-10-09 08:00:00 UTC);
+        let made = time::macros::datetime!(2025-03-01 14:30:00 UTC);
+        assert_eq!(recorded_at(imported, Some(made)), made);
+        assert_eq!(recorded_at(imported, None), imported);
+    }
+
     #[test]
     fn the_same_text_fingerprints_the_same_and_different_text_does_not() {
-        let a = render_transcript(&doc(vec![("you", "hello")]));
-        let b = render_transcript(&doc(vec![("you", "hello there")]));
+        let a = render_transcript(&doc(vec![("you", "hello")]), Origin::Captured);
+        let b = render_transcript(&doc(vec![("you", "hello there")]), Origin::Captured);
         assert_eq!(fingerprint(&a), fingerprint(&a));
         assert_ne!(fingerprint(&a), fingerprint(&b));
         assert_eq!(revision_of(&a), revision_of(&a));
@@ -262,6 +363,8 @@ mod tests {
                 id: Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
                 title: "Weekly sync",
                 recorded_at: time::OffsetDateTime::UNIX_EPOCH,
+                origin: Origin::Captured,
+                original_filename: None,
                 transcript: d,
                 summary: None,
                 duration_s: Some(60.0),
@@ -286,6 +389,8 @@ mod tests {
             id: Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
             title: "t",
             recorded_at: time::OffsetDateTime::UNIX_EPOCH,
+            origin: Origin::Captured,
+            original_filename: None,
             transcript: &d,
             summary: None,
             duration_s: None,
@@ -302,6 +407,8 @@ mod tests {
             id: Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
             title: "t",
             recorded_at: time::OffsetDateTime::UNIX_EPOCH,
+            origin: Origin::Captured,
+            original_filename: None,
             transcript: &d,
             summary: None,
             duration_s: None,

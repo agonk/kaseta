@@ -111,6 +111,36 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
     warn "The launcher works regardless; only the kasetad command needs it."
 fi
 
+# Importing a file needs ffmpeg and ffprobe to read it, and bubblewrap to run
+# them in a sandbox. Neither is needed to record, so their absence is a
+# warning rather than a failure: importing is simply unavailable, and the
+# window says why.
+install_hint() {
+    local ids=""
+    if [ -r /etc/os-release ]; then
+        ids="$(. /etc/os-release && echo "${ID:-} ${ID_LIKE:-}")"
+    fi
+    case " $ids " in
+        *" arch "*) echo "sudo pacman -S --needed $1" ;;
+        *" debian "* | *" ubuntu "*) echo "sudo apt install $1" ;;
+        *" fedora "* | *" rhel "*) echo "sudo dnf install $1" ;;
+        *) echo "install $1 with your package manager" ;;
+    esac
+}
+MISSING_FOR_IMPORT=0
+if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+    warn "Importing files needs ffmpeg, which is not installed: $(install_hint ffmpeg)"
+    MISSING_FOR_IMPORT=1
+fi
+if ! command -v bwrap >/dev/null 2>&1; then
+    warn "Importing files needs bubblewrap, which is not installed: $(install_hint bubblewrap)"
+    MISSING_FOR_IMPORT=1
+fi
+if [ "$MISSING_FOR_IMPORT" -eq 1 ]; then
+    warn "Recording works without them. After installing, restart the recorder:"
+    warn "  systemctl --user restart kaseta.service"
+fi
+
 if [ "$ACTIVATED" -eq 0 ]; then
     warn "No systemd user session was reachable, so the recorder was not started."
     warn "Run this from your desktop session, or start it yourself:"

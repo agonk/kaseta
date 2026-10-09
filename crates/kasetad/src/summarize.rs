@@ -17,6 +17,8 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use kaseta_contracts::Origin;
+
 use crate::db::Db;
 use crate::library::{Transcript, TranscriptLine};
 
@@ -120,14 +122,18 @@ impl SummarizeConfig {
 ///
 /// Speaker labels are kept: knowing who said what is most of what makes a
 /// summary useful, and it costs almost nothing to include.
-pub fn render(lines: &[TranscriptLine]) -> String {
+///
+/// A captured meeting is rendered from the recorder's point of view, `Me`
+/// and `Them`, because that is the framing its prompt explains. An imported
+/// file attributes nobody, so its lines carry the same neutral `Speaker` a
+/// person sees, and its prompt says what that means.
+pub fn render(origin: Origin, lines: &[TranscriptLine]) -> String {
     lines
         .iter()
         .map(|line| {
-            let who = match line.speaker.as_str() {
-                "you" => "Me",
-                "them" => "Them",
-                _ => "Unknown",
+            let who = match (origin, line.speaker.as_str()) {
+                (Origin::Captured, "you") => "Me",
+                (_, speaker) => kaseta_contracts::speaker::display(origin, speaker),
             };
             let minutes = (line.at_s / 60.0) as u64;
             let seconds = (line.at_s % 60.0) as u64;
@@ -228,13 +234,54 @@ Reply with JSON only, matching exactly:
 {\"overview\": string, \"decisions\": [string], \
 \"action_items\": [{\"what\": string, \"owner\": string|null}], \"topics\": [string]}";
 
+/// The prompt for an imported file.
+///
+/// Nothing in an imported file says who is speaking: one mixed track carries
+/// every voice. Explaining `Me` and `Them` would invite the model to guess at
+/// a split the transcript does not contain, and a file may as well be a talk
+/// or a lecture as a meeting, so it is not told it is reading one.
+const IMPORTED_SYSTEM_PROMPT: &str = "\
+You summarise transcripts of recordings of one or more speakers whose lines \
+are not attributed: every line is labelled `Speaker`, whoever said it. The \
+recording may be a meeting, a talk, a lecture or an interview. Do not try to \
+tell the speakers apart or guess who said what.
+
+Report only what the transcript supports. Transcripts contain recognition \
+errors, so if something is unclear, leave it out rather than guessing. If \
+there were no decisions or no action items, return empty lists rather than \
+inventing them to fill space. Give an action item an owner only when a name \
+for that person appears in the transcript; otherwise its owner is null.
+
+Reply with JSON only, matching exactly:
+{\"overview\": string, \"decisions\": [string], \
+\"action_items\": [{\"what\": string, \"owner\": string|null}], \"topics\": [string]}";
+
+/// The system prompt for a recording of this kind.
+fn system_prompt(origin: Origin) -> &'static str {
+    match origin {
+        Origin::Captured => SYSTEM_PROMPT,
+        Origin::Imported => IMPORTED_SYSTEM_PROMPT,
+    }
+}
+
+/// What the request asks for, naming the material the way its prompt does.
+fn instruction(origin: Origin, partial: bool) -> &'static str {
+    match (origin, partial) {
+        (Origin::Captured, true) => "Summarise this section of a longer meeting.",
+        (Origin::Captured, false) => "Summarise this meeting.",
+        (Origin::Imported, true) => "Summarise this section of a longer recording.",
+        (Origin::Imported, false) => "Summarise this recording.",
+    }
+}
+
 /// Summarises a transcript, in as many passes as its length requires.
 pub fn summarize(config: &SummarizeConfig, transcript: &Transcript) -> Result<Summary> {
     if transcript.lines.is_empty() {
         bail!("this recording has no transcript to summarise");
     }
 
-    let rendered = render(&transcript.lines);
+    let origin = transcript.origin;
+    let rendered = render(origin, &transcript.lines);
     let mut sections = split_into_sections(&rendered, SECTION_CHARS);
 
     if sections.len() > MAX_SECTIONS {
@@ -247,7 +294,8 @@ pub fn summarize(config: &SummarizeConfig, transcript: &Transcript) -> Result<Su
     }
 
     if sections.len() <= 1 {
-        return request(config, sections.first().map(String::as_str).unwrap_or(&rendered), false);
+        let text = sections.first().map(String::as_str).unwrap_or(&rendered);
+        return request(config, origin, text, false);
     }
 
     // Condense each section, then summarise the condensations together. The
@@ -256,7 +304,7 @@ pub fn summarize(config: &SummarizeConfig, transcript: &Transcript) -> Result<Su
     tracing::info!(sections = sections.len(), "summarising in passes");
     let mut condensed = Vec::with_capacity(sections.len());
     for (i, section) in sections.iter().enumerate() {
-        let partial = request(config, section, true)
+        let partial = request(config, origin, section, true)
             .with_context(|| format!("summarising section {} of {}", i + 1, sections.len()))?;
         condensed.push(format!(
             "Section {}:\n{}\nDecisions: {}\nActions: {}",
@@ -272,7 +320,7 @@ pub fn summarize(config: &SummarizeConfig, transcript: &Transcript) -> Result<Su
         ));
     }
 
-    request(config, &condensed.join("\n\n"), false)
+    request(config, origin, &condensed.join("\n\n"), false)
 }
 
 #[derive(Serialize)]
@@ -339,24 +387,18 @@ struct ResponseMessage {
     content: String,
 }
 
-fn request(config: &SummarizeConfig, transcript: &str, partial: bool) -> Result<Summary> {
-    let instruction = if partial {
-        "Summarise this section of a longer meeting."
-    } else {
-        "Summarise this meeting."
-    };
-    let user = format!("{instruction}\n\n{transcript}");
-
-    let body = ChatRequest {
-        model: &config.model,
+/// The request body for one summarisation call.
+fn chat_request<'a>(model: &'a str, origin: Origin, user: &'a str) -> ChatRequest<'a> {
+    ChatRequest {
+        model,
         messages: vec![
             ChatMessage {
                 role: "system",
-                content: SYSTEM_PROMPT,
+                content: system_prompt(origin),
             },
             ChatMessage {
                 role: "user",
-                content: &user,
+                content: user,
             },
         ],
         response_format: ResponseFormat {
@@ -366,7 +408,17 @@ fn request(config: &SummarizeConfig, transcript: &str, partial: bool) -> Result<
         // helps, and reproducibility makes a bad summary diagnosable.
         temperature: 0.2,
         provider: ProviderPolicy::default(),
-    };
+    }
+}
+
+fn request(
+    config: &SummarizeConfig,
+    origin: Origin,
+    transcript: &str,
+    partial: bool,
+) -> Result<Summary> {
+    let user = format!("{}\n\n{transcript}", instruction(origin, partial));
+    let body = chat_request(&config.model, origin, &user);
 
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(180))
@@ -488,6 +540,7 @@ mod tests {
         TranscriptLine {
             at_s,
             speaker: speaker.into(),
+            label: kaseta_contracts::speaker::display(Origin::Captured, speaker).into(),
             text: text.into(),
         }
     }
@@ -496,7 +549,7 @@ mod tests {
     fn the_rendered_transcript_keeps_who_said_what() {
         // Attribution is most of what makes a summary useful, and the model
         // cannot recover it if the rendering drops it.
-        let rendered = render(&[
+        let rendered = render(Origin::Captured, &[
             line(0.0, "you", "shall we ship on friday"),
             line(4.0, "them", "yes, if the tests pass"),
         ]);
@@ -507,9 +560,60 @@ mod tests {
         assert!(rendered.contains("[00:04]"));
     }
 
+    /// A captured meeting keeps the framing its prompt explains, including
+    /// "Unknown" for a line the recorder genuinely could not place.
+    #[test]
+    fn a_captured_meeting_is_rendered_as_me_and_them() {
+        let rendered = render(
+            Origin::Captured,
+            &[line(0.0, "you", "a"), line(1.0, "them", "b"), line(2.0, "unknown", "c")],
+        );
+        assert_eq!(rendered, "[00:00] Me: a\n[00:01] Them: b\n[00:02] Unknown: c");
+    }
+
+    /// An imported file attributes nobody. Its lines are a "Speaker", never
+    /// "Unknown", which would read as a fault on every line.
+    #[test]
+    fn an_imported_recording_is_rendered_with_neutral_speakers() {
+        let rendered = render(
+            Origin::Imported,
+            &[line(0.0, "unknown", "welcome to the lecture"), line(3.0, "unknown", "today")],
+        );
+        assert_eq!(
+            rendered,
+            "[00:00] Speaker: welcome to the lecture\n[00:03] Speaker: today"
+        );
+        assert!(!rendered.contains("Unknown") && !rendered.contains("Me:"));
+    }
+
+    /// Each kind of recording is summarised under the prompt that explains
+    /// its labels, and an import is never framed as the recorder against
+    /// everyone else.
+    #[test]
+    fn the_prompt_follows_the_kind_of_recording() {
+        let captured = chat_request("m", Origin::Captured, "x");
+        assert_eq!(captured.messages[0].content, SYSTEM_PROMPT);
+        assert!(SYSTEM_PROMPT.contains("`Me`"));
+
+        let imported = chat_request("m", Origin::Imported, "x");
+        let prompt = imported.messages[0].content;
+        assert_eq!(prompt, IMPORTED_SYSTEM_PROMPT);
+        assert!(prompt.contains("`Speaker`"));
+        for word in ["`Me`", "`Them`", "recorded the meeting"] {
+            assert!(!prompt.contains(word), "the import prompt mentions {word}");
+        }
+        // The same reply shape, so one parser serves both.
+        let shape = |p: &str| p[p.find("Reply with JSON").unwrap()..].to_string();
+        assert_eq!(shape(prompt), shape(SYSTEM_PROMPT));
+
+        assert_eq!(instruction(Origin::Captured, false), "Summarise this meeting.");
+        assert_eq!(instruction(Origin::Imported, false), "Summarise this recording.");
+        assert!(instruction(Origin::Imported, true).contains("longer recording"));
+    }
+
     #[test]
     fn timestamps_render_past_a_minute() {
-        let rendered = render(&[line(605.0, "you", "still here")]);
+        let rendered = render(Origin::Captured, &[line(605.0, "you", "still here")]);
         assert!(rendered.contains("[10:05]"), "got {rendered}");
     }
 

@@ -68,6 +68,16 @@ impl ImportSettings {
         self.max_duration_hours
             .clamp(1, Self::MAX_DURATION_HOURS_CEILING)
     }
+
+    /// The upload limit in gigabytes, brought inside the bounds the same way.
+    pub fn max_upload_gb(&self) -> u32 {
+        self.max_upload_gb.clamp(1, Self::MAX_UPLOAD_GB_CEILING)
+    }
+
+    /// The upload limit in bytes.
+    pub fn max_upload_bytes(&self) -> u64 {
+        u64::from(self.max_upload_gb()) << 30
+    }
 }
 
 impl Default for ImportSettings {
@@ -679,6 +689,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(edited.imports.max_duration_hours(), 24);
+        assert_eq!(edited.imports.max_upload_gb(), 1);
+        assert_eq!(edited.imports.max_upload_bytes(), 1 << 30);
+        assert_eq!(ImportSettings::default().max_upload_bytes(), 8 << 30);
     }
 
     #[test]

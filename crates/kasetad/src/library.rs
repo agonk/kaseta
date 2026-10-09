@@ -12,7 +12,7 @@
 use std::collections::HashSet;
 
 use anyhow::{Context, Result};
-use kaseta_contracts::{BlobKey, RecordingManifest};
+use kaseta_contracts::{BlobKey, ImportSource, MediaType, Origin, RecordingManifest};
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 use ulid::Ulid;
@@ -49,6 +49,52 @@ pub struct LibraryItem {
     /// Present once a mixed export exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mixed_audio_url: Option<String>,
+    /// `captured` for a meeting recorded here, `imported` for a file someone
+    /// brought. Decides how unattributed lines are named, among other things.
+    pub origin: Origin,
+    /// What an imported recording was made from. Absent for captured ones,
+    /// and for an import still being decoded, whose file has not been looked
+    /// at yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<ImportedFrom>,
+    /// The original file, when the person asked for it to be kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original: Option<KeptOriginal>,
+}
+
+/// Where an imported recording came from, as the interface shows it.
+#[derive(Clone, Debug, Serialize)]
+pub struct ImportedFrom {
+    /// The file's name on the person's machine.
+    pub filename: String,
+    /// `video` or `audio`.
+    pub media_kind: MediaType,
+    /// When the file says it was made, if it says.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub media_created_at: Option<time::OffsetDateTime>,
+    /// The file's size as uploaded.
+    pub bytes: u64,
+}
+
+/// A kept original file.
+///
+/// The manifest goes on naming it after the local copy is removed, because
+/// the bucket still holds it; `local` says whether this machine can serve it.
+#[derive(Clone, Debug, Serialize)]
+pub struct KeptOriginal {
+    pub filename: String,
+    pub media_kind: MediaType,
+    /// What it is served as, decided from its content when it was imported.
+    pub content_type: String,
+    pub bytes: u64,
+    pub local: bool,
+    /// Plays the file. Present only while it is on this machine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Saves the file under its original name. Present only while it is on
+    /// this machine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_url: Option<String>,
 }
 
 /// One pipeline stage's state for a recording.
@@ -391,7 +437,8 @@ pub fn purge_pending(store: &dyn BlobStore, db: &Db) -> Result<usize> {
 pub fn list(db: &Db) -> Result<Vec<LibraryItem>> {
     let mut stmt = db.conn().prepare(
         "SELECT id, title, title_override, status, started_at, ended_at,
-                duration_ms, has_mixed, tracks_json, uploaded_at
+                duration_ms, has_mixed, tracks_json, uploaded_at,
+                origin, source_json, original_local
          FROM recordings
          WHERE owner_id = ?1 AND deleted_at IS NULL
          ORDER BY started_at DESC",
@@ -409,6 +456,9 @@ pub fn list(db: &Db) -> Result<Vec<LibraryItem>> {
             has_mixed: r.get::<_, i64>(7)? != 0,
             tracks_json: r.get(8)?,
             uploaded_at: r.get(9)?,
+            origin: r.get(10)?,
+            source_json: r.get(11)?,
+            original_local: r.get::<_, i64>(12)? != 0,
         })
     })?;
 
@@ -518,12 +568,38 @@ struct Row {
     has_mixed: bool,
     tracks_json: Option<String>,
     uploaded_at: Option<i64>,
+    origin: String,
+    source_json: Option<String>,
+    original_local: bool,
 }
 
 fn into_item(row: Row) -> Result<LibraryItem> {
     let id = Ulid::from_string(&row.id).context("recording id is not a valid ULID")?;
     let started_at = time::OffsetDateTime::from_unix_timestamp(row.started_at)
         .context("recording has an invalid start time")?;
+    let origin = Origin::parse(&row.origin)
+        .with_context(|| format!("recording {id} has an unknown origin {:?}", row.origin))?;
+
+    // A cache of the manifest's field. One that no longer parses costs the
+    // provenance line, not the recording, so it is logged and left out.
+    let source: Option<ImportSource> = row.source_json.as_deref().and_then(|json| {
+        serde_json::from_str(json)
+            .map_err(|e| tracing::warn!(%id, %e, "unreadable import source in the index"))
+            .ok()
+    });
+    let original = source.as_ref().and_then(|s| {
+        s.original_key.as_ref()?;
+        let url = format!("/api/v1/recordings/{id}/original");
+        Some(KeptOriginal {
+            filename: s.original_filename.clone(),
+            media_kind: s.media_kind,
+            content_type: s.content_type.clone(),
+            bytes: s.original_bytes,
+            local: row.original_local,
+            download_url: row.original_local.then(|| format!("{url}?download=1")),
+            url: row.original_local.then_some(url),
+        })
+    });
 
     let indexed: Vec<IndexedTrack> = row
         .tracks_json
@@ -557,8 +633,32 @@ fn into_item(row: Row) -> Result<LibraryItem> {
         mixed_audio_url: row
             .has_mixed
             .then(|| format!("/api/v1/recordings/{id}/audio/mixed.flac")),
+        origin,
+        source: source.map(|s| ImportedFrom {
+            filename: s.original_filename,
+            media_kind: s.media_kind,
+            media_created_at: s.media_created_at,
+            bytes: s.original_bytes,
+        }),
+        original,
         id,
     })
+}
+
+/// Whether a recording was captured here or imported, from the index.
+///
+/// `None` for a recording the index does not hold.
+pub fn origin(db: &Db, id: Ulid) -> Result<Option<Origin>> {
+    let raw: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT origin FROM recordings WHERE id = ?1",
+            params![id.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    raw.map(|o| Origin::parse(&o).with_context(|| format!("recording {id} has an unknown origin {o:?}")))
+        .transpose()
 }
 
 pub fn get(db: &Db, id: Ulid) -> Result<Option<LibraryItem>> {
@@ -612,16 +712,38 @@ fn describe_track(track_id: &str) -> (&'static str, &'static str) {
 pub struct TranscriptLine {
     /// Seconds from the start of the recording, for seeking playback.
     pub at_s: f64,
-    /// Who said it: `you`, `them`, or `unknown`.
+    /// Who said it: `you`, `them`, or `unknown`. The stored attribution,
+    /// for anything that styles or filters by it.
     pub speaker: String,
+    /// Who said it, in the words a person reads: `You`, `Them`, `Unknown`,
+    /// or `Speaker` in an imported recording. Decided here so the interface
+    /// never keeps a mapping of its own that could disagree with the rest.
+    pub label: String,
     pub text: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Transcript {
+    /// What kind of recording this came from, which is what decides how a
+    /// line nobody attributed is named, here and in a summary.
+    pub origin: Origin,
     pub engine: Option<String>,
     pub language: Option<String>,
     pub lines: Vec<TranscriptLine>,
+}
+
+/// A transcript as plain text, one line per turn with its time and speaker.
+pub fn plain_text(transcript: &Transcript) -> String {
+    transcript
+        .lines
+        .iter()
+        .map(|line| {
+            let minutes = (line.at_s / 60.0) as u64;
+            let seconds = (line.at_s % 60.0) as u64;
+            format!("[{minutes:02}:{seconds:02}] {}: {}", line.label, line.text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Reads a recording's transcript as a conversation.
@@ -629,24 +751,26 @@ pub struct Transcript {
 /// Times are rebased from the canonical clock, which counts from system boot,
 /// onto the recording itself — the only frame of reference a listener has.
 pub fn transcript(db: &Db, id: Ulid) -> Result<Option<Transcript>> {
-    let header: Option<(String, Option<String>, Option<String>, Option<i64>)> = db
+    type Header = (String, Option<String>, Option<String>, Option<i64>, String);
+    let header: Option<Header> = db
         .conn()
         .query_row(
-            "SELECT t.id, t.engine_model, t.language, r.clock_started_ns
+            "SELECT t.id, t.engine_model, t.language, r.clock_started_ns, r.origin
              FROM transcripts t
              JOIN recordings r ON r.id = t.recording_id
              WHERE t.recording_id = ?1
              ORDER BY t.revision DESC
              LIMIT 1",
             params![id.to_string()],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
 
-    let Some((transcript_id, engine, language, clock_started_ns)) = header else {
+    let Some((transcript_id, engine, language, clock_started_ns, origin)) = header else {
         return Ok(None);
     };
-
+    let origin = Origin::parse(&origin)
+        .with_context(|| format!("recording {id} has an unknown origin {origin:?}"))?;
 
     let mut stmt = db.conn().prepare(
         "SELECT start_boottime_ns, speaker_hint, text
@@ -667,25 +791,30 @@ pub fn transcript(db: &Db, id: Ulid) -> Result<Option<Transcript>> {
     // Capture's clock origin is the right reference. Falling back to the first
     // segment keeps a recording readable if that origin was never indexed,
     // at the cost of the transcript appearing to start at zero.
-    let origin = match clock_started_ns {
+    let clock_origin = match clock_started_ns {
         Some(ns) if ns > 0 => ns as u64,
         _ => raw.first().map(|(t, _, _)| *t).unwrap_or(0),
     };
 
     let lines = raw
         .into_iter()
-        .map(|(start_ns, hint, text)| TranscriptLine {
-            at_s: start_ns.saturating_sub(origin) as f64 / 1e9,
-            speaker: match hint.as_deref() {
-                Some("local") => "you".into(),
-                Some("remote") => "them".into(),
-                _ => "unknown".into(),
-            },
-            text,
+        .map(|(start_ns, hint, text)| {
+            let speaker = match hint.as_deref() {
+                Some("local") => "you",
+                Some("remote") => "them",
+                _ => "unknown",
+            };
+            TranscriptLine {
+                at_s: start_ns.saturating_sub(clock_origin) as f64 / 1e9,
+                speaker: speaker.into(),
+                label: kaseta_contracts::speaker::display(origin, speaker).into(),
+                text,
+            }
         })
         .collect();
 
     Ok(Some(Transcript {
+        origin,
         engine,
         language,
         lines,
@@ -1266,6 +1395,147 @@ mod tests {
         db.conn().execute("UPDATE jobs SET state = 'queued'", []).unwrap();
         assert_eq!(purge_pending(&store, &db).unwrap(), 1);
         assert!(!staging.exists());
+    }
+
+    /// Gives `id` a transcript of one line per `(hint, text)`, a second apart
+    /// from the recording's clock origin.
+    fn transcribe(db: &Db, id: Ulid, lines: &[(&str, &str)]) {
+        let transcript_id = Ulid::new().to_string();
+        db.conn()
+            .execute(
+                "INSERT INTO transcripts (id, recording_id, revision, engine_name, engine_model,
+                                          language)
+                 VALUES (?1, ?2, 1, 'parakeet', 'tdt-0.6b', 'en')",
+                params![transcript_id, id.to_string()],
+            )
+            .unwrap();
+        for (i, (hint, text)) in lines.iter().enumerate() {
+            let start = 7_000_000_000 + i as i64 * 1_000_000_000;
+            db.conn()
+                .execute(
+                    "INSERT INTO transcript_segments
+                         (id, transcript_id, track_id, seq, start_boottime_ns, end_boottime_ns,
+                          speaker_hint, text)
+                     VALUES (?1, ?2, 'a_track', ?3, ?4, ?5, ?6, ?7)",
+                    params![Ulid::new().to_string(), transcript_id, i as i64, start, start + 1, hint, text],
+                )
+                .unwrap();
+        }
+    }
+
+    /// The interface shows the label it is given and keeps no mapping of its
+    /// own, so the label is where captured and imported part ways.
+    #[test]
+    fn transcript_lines_carry_the_label_a_person_reads() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::blobstore::LocalFsStore::new(dir.path()).unwrap();
+        let db = Db::open_in_memory().unwrap();
+
+        let captured = Ulid::new();
+        index_recording(&store, &db, &manifest(captured, None)).unwrap();
+        transcribe(&db, captured, &[("local", "hi"), ("remote", "hello"), ("unknown", "...")]);
+
+        let t = transcript(&db, captured).unwrap().unwrap();
+        assert_eq!(t.origin, Origin::Captured);
+        let pairs: Vec<(&str, &str)> =
+            t.lines.iter().map(|l| (l.speaker.as_str(), l.label.as_str())).collect();
+        assert_eq!(pairs, [("you", "You"), ("them", "Them"), ("unknown", "Unknown")]);
+        assert_eq!(t.lines[1].at_s, 1.0);
+        assert_eq!(plain_text(&t), "[00:00] You: hi\n[00:01] Them: hello\n[00:02] Unknown: ...");
+
+        let imported = Ulid::new();
+        index_recording(&store, &db, &manifest(imported, Some(import_source(None)))).unwrap();
+        transcribe(&db, imported, &[("unknown", "welcome"), ("unknown", "to the lecture")]);
+
+        let t = transcript(&db, imported).unwrap().unwrap();
+        assert_eq!(t.origin, Origin::Imported);
+        // The stored attribution is untouched; only the word shown differs.
+        assert!(t.lines.iter().all(|l| l.speaker == "unknown" && l.label == "Speaker"));
+        assert_eq!(
+            plain_text(&t),
+            "[00:00] Speaker: welcome\n[00:01] Speaker: to the lecture"
+        );
+
+        let json = serde_json::to_value(&t).unwrap();
+        assert_eq!(json["origin"], "imported");
+        assert_eq!(json["lines"][0]["label"], "Speaker");
+        assert_eq!(json["lines"][0]["speaker"], "unknown");
+    }
+
+    /// A captured recording looks exactly as it did: no provenance, no
+    /// original.
+    #[test]
+    fn a_captured_item_has_no_source() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::blobstore::LocalFsStore::new(dir.path()).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let id = Ulid::new();
+        index_recording(&store, &db, &manifest(id, None)).unwrap();
+
+        let item = get(&db, id).unwrap().unwrap();
+        assert_eq!(item.origin, Origin::Captured);
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(json["origin"], "captured");
+        assert!(json.get("source").is_none());
+        assert!(json.get("original").is_none());
+        assert_eq!(origin(&db, id).unwrap(), Some(Origin::Captured));
+        assert_eq!(origin(&db, Ulid::new()).unwrap(), None);
+    }
+
+    /// An import says where it came from, and offers its kept original only
+    /// while this machine holds it.
+    #[test]
+    fn an_imported_item_describes_its_file_and_kept_original() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::blobstore::LocalFsStore::new(dir.path()).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let id = Ulid::new();
+        let prefix = RecordingPrefix::new(id, STARTED);
+        let original = prefix.original("mp4").unwrap();
+        store.put(&original, b"original bytes").unwrap();
+        store.put(&prefix.export("a_imported_01.flac").unwrap(), b"flac").unwrap();
+        let mut source = import_source(Some(original.clone()));
+        source.media_created_at = Some(datetime!(2025-03-01 14:30:00 UTC));
+        index_recording(&store, &db, &manifest(id, Some(source))).unwrap();
+
+        let item = get(&db, id).unwrap().unwrap();
+        assert_eq!(item.origin, Origin::Imported);
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(json["origin"], "imported");
+        assert_eq!(json["source"]["filename"], "lecture.mp4");
+        assert_eq!(json["source"]["media_kind"], "video");
+        assert_eq!(json["source"]["media_created_at"], "2025-03-01T14:30:00Z");
+        assert_eq!(json["source"]["bytes"], 10);
+        assert_eq!(json["original"]["content_type"], "video/mp4");
+        assert_eq!(json["original"]["local"], true);
+        assert_eq!(json["original"]["url"], format!("/api/v1/recordings/{id}/original"));
+        assert_eq!(
+            json["original"]["download_url"],
+            format!("/api/v1/recordings/{id}/original?download=1")
+        );
+        assert_eq!(item.tracks[0].label, "Speaker");
+
+        // Removed after backup: still named, no longer playable here.
+        forget_local_original(&db, id).unwrap();
+        let json = serde_json::to_value(get(&db, id).unwrap().unwrap()).unwrap();
+        assert_eq!(json["original"]["local"], false);
+        assert!(json["original"].get("url").is_none());
+        assert!(json["original"].get("download_url").is_none());
+    }
+
+    /// Not keeping the original leaves the provenance and nothing to offer.
+    #[test]
+    fn an_import_without_its_original_offers_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::blobstore::LocalFsStore::new(dir.path()).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let id = Ulid::new();
+        index_recording(&store, &db, &manifest(id, Some(import_source(None)))).unwrap();
+
+        let json = serde_json::to_value(get(&db, id).unwrap().unwrap()).unwrap();
+        assert_eq!(json["source"]["filename"], "lecture.mp4");
+        assert!(json["source"]["media_created_at"].is_null());
+        assert!(json.get("original").is_none());
     }
 
     /// A captured recording indexed again is refreshed as before.
